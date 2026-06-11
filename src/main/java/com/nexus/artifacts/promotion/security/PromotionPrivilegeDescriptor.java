@@ -22,7 +22,7 @@ public class PromotionPrivilegeDescriptor extends ApplicationPrivilegeDescriptor
 
   public static final String PRIVILEGE_TYPE = ApplicationPrivilegeDescriptor.TYPE;
 
-  public static final String PERMISSION_PREFIX = "nexus-artifacts-promotion";
+  public static final String PERMISSION_PREFIX = "nexus:artifacts-promotion";
 
   public static final String ACTION_PROMOTE = "promote";
 

@@ -33,6 +33,45 @@ print_usage() {
     echo "  NEXUS_HOME      Nexus installation directory (default: /opt/sonatype/nexus)"
 }
 
+generate_rapture_bundle() {
+    echo "Generating Rapture bundle JS files..."
+    local JS_SRC="src/main/resources/static/rapture/NX/artifactsPromotion/app/PluginConfig.js"
+    local PROD_OUT="src/main/resources/static/rapture/nexus-artifacts-promotion-plugin-prod.js"
+    local DEBUG_OUT="src/main/resources/static/rapture/nexus-artifacts-promotion-plugin-debug.js"
+
+    if [ ! -f "$JS_SRC" ]; then
+        echo "Warning: PluginConfig.js not found, skipping bundle generation"
+        return
+    fi
+
+    # Generate prod.js using Python minification
+    python3 -c "
+import re, sys
+with open('${JS_SRC}', 'r') as f:
+    js = f.read()
+# Remove comments
+js = re.sub(r'/\*.*?\*/', '', js, flags=re.DOTALL)
+js = re.sub(r'(?<!:)//.*?$', '', js, flags=re.MULTILINE)
+# Collapse whitespace
+js = re.sub(r'\s+', ' ', js)
+# Remove spaces around operators
+js = re.sub(r' *([=+\-*/{}();,:\[\]<>!&|?]) *', r'\1', js)
+# Restore keyword spaces
+for kw in ['var','let','const','return','function','new','if','else','for','while','throw','try','catch','typeof','instanceof','in','of']:
+    js = re.sub(r'\b' + kw + r'\(', kw + ' (', js)
+    js = re.sub(r'\b' + kw + r'\{', kw + ' {', js)
+with open('${PROD_OUT}', 'w') as f:
+    f.write(js.strip())
+print('Generated prod.js: ' + str(len(js.strip())) + ' bytes')
+" 2>&1
+
+    # Generate debug.js (source with header)
+    echo "/* Nexus Artifacts Promotion Plugin */" > "$DEBUG_OUT"
+    cat "$JS_SRC" >> "$DEBUG_OUT"
+
+    echo "Rapture bundle generated successfully"
+}
+
 clean() {
     echo "Cleaning build artifacts..."
     mvn clean
@@ -45,6 +84,10 @@ build() {
 
 package() {
     echo "Packaging $PROJECT_NAME v${PROJECT_VERSION}..."
+
+    # Generate prod.js and debug.js from PluginConfig.js
+    generate_rapture_bundle
+
     mvn package $MVN_OPTS ${VERBOSE:+"-X"}
 
     JAR_FILE=$(find target -name "${PROJECT_NAME}-${PROJECT_VERSION}.jar" ! -name "*-sources" ! -name "*-javadoc" | head -1)

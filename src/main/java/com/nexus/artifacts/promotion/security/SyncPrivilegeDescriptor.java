@@ -22,7 +22,7 @@ public class SyncPrivilegeDescriptor extends ApplicationPrivilegeDescriptor {
 
   public static final String PRIVILEGE_TYPE = ApplicationPrivilegeDescriptor.TYPE;
 
-  public static final String PERMISSION_DOMAIN = "nexus-artifacts-sync";
+  public static final String PERMISSION_DOMAIN = "nexus:artifacts-sync";
 
   public static final String ACTION_SYNC = "sync";
 

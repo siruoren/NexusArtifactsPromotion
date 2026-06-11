@@ -1,3 +1,6 @@
+/*
+ * Nexus Artifacts Promotion Plugin
+ */
 /**
  * Nexus Artifacts Promotion Plugin - Plugin Configuration
  *
