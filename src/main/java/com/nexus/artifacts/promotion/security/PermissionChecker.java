@@ -12,7 +12,12 @@ import org.slf4j.LoggerFactory;
 /**
  * Enterprise-grade permission checker for promotion and sync operations.
  * Validates user permissions at both UI and API levels.
- * Prevents privilege escalation and ensures consistent security enforcement.
+ *
+ * Permission format follows Shiro WildcardPermission:
+ *   domain:action
+ *
+ * Wildcard: nexus-artifacts-promotion:promote  (all repos)
+ * Specific: nexus-artifacts-promotion-{repoName}-{format}:promote
  */
 @Named
 @Singleton
@@ -26,10 +31,6 @@ public class PermissionChecker {
 
   /**
    * Check if the current user has promotion permission for the given repository.
-   *
-   * @param repositoryName the source repository name
-   * @param format         the repository format (maven2, npm, docker, etc.)
-   * @return true if the user has promotion permission
    */
   public boolean hasPromotionPermission(final String repositoryName, final String format) {
     Subject subject = SecurityUtils.getSubject();
@@ -39,9 +40,10 @@ public class PermissionChecker {
     }
 
     // Check specific repository permission first
-    String specificPermission = PromotionPrivilegeDescriptor.PERMISSION_PREFIX
-        + ":" + sanitize(repositoryName)
-        + ":" + sanitize(format);
+    // domain = "nexus-artifacts-promotion-{repoName}-{format}", action = "promote"
+    String specificPermission = "nexus-artifacts-promotion-"
+        + sanitize(repositoryName) + "-" + sanitize(format)
+        + ":" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
 
     if (subject.isPermitted(specificPermission)) {
       log.debug("User '{}' has specific promotion permission for repo '{}', format '{}'",
@@ -49,10 +51,17 @@ public class PermissionChecker {
       return true;
     }
 
-    // Check wildcard permission
-    String wildcardPermission = PromotionPrivilegeDescriptor.PERMISSION_PREFIX + ":*";
+    // Check wildcard permission: "nexus-artifacts-promotion:promote"
+    String wildcardPermission = "nexus-artifacts-promotion:" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
     if (subject.isPermitted(wildcardPermission)) {
       log.debug("User '{}' has wildcard promotion permission", subject.getPrincipal());
+      return true;
+    }
+
+    // Also check the old wildcard format for backward compatibility
+    String oldWildcardPermission = "nexus-artifacts-promotion:*";
+    if (subject.isPermitted(oldWildcardPermission)) {
+      log.debug("User '{}' has old wildcard promotion permission", subject.getPrincipal());
       return true;
     }
 
@@ -63,10 +72,6 @@ public class PermissionChecker {
 
   /**
    * Check if the current user has sync permission for the given repository.
-   *
-   * @param repositoryName the remote repository name
-   * @param format         the repository format
-   * @return true if the user has sync permission
    */
   public boolean hasSyncPermission(final String repositoryName, final String format) {
     Subject subject = SecurityUtils.getSubject();
@@ -75,9 +80,10 @@ public class PermissionChecker {
       return false;
     }
 
-    String specificPermission = SyncPrivilegeDescriptor.PERMISSION_DOMAIN
-        + ":" + sanitize(repositoryName)
-        + ":" + sanitize(format);
+    // Check specific repository permission
+    String specificPermission = "nexus-artifacts-sync-"
+        + sanitize(repositoryName) + "-" + sanitize(format)
+        + ":" + SyncPrivilegeDescriptor.ACTION_SYNC;
 
     if (subject.isPermitted(specificPermission)) {
       log.debug("User '{}' has specific sync permission for repo '{}', format '{}'",
@@ -85,9 +91,16 @@ public class PermissionChecker {
       return true;
     }
 
-    String wildcardPermission = SyncPrivilegeDescriptor.PERMISSION_DOMAIN + ":*";
+    // Check wildcard permission
+    String wildcardPermission = "nexus-artifacts-sync:" + SyncPrivilegeDescriptor.ACTION_SYNC;
     if (subject.isPermitted(wildcardPermission)) {
       log.debug("User '{}' has wildcard sync permission", subject.getPrincipal());
+      return true;
+    }
+
+    String oldWildcardPermission = "nexus-artifacts-sync:*";
+    if (subject.isPermitted(oldWildcardPermission)) {
+      log.debug("User '{}' has old wildcard sync permission", subject.getPrincipal());
       return true;
     }
 
@@ -98,11 +111,6 @@ public class PermissionChecker {
 
   /**
    * Check if the current user has promotion permission for a target repository.
-   *
-   * @param sourceRepository the source repository name
-   * @param targetRepository the target repository name
-   * @param format           the repository format
-   * @return true if the user has promotion permission for both source and target
    */
   public boolean hasPromotionPermissionForTarget(final String sourceRepository,
                                                   final String targetRepository,
@@ -123,7 +131,7 @@ public class PermissionChecker {
   }
 
   /**
-   * Assert promotion permission for both source and target, throwing exception if not authorized.
+   * Assert promotion permission for both source and target.
    */
   public void checkPromotionPermissionForTarget(final String sourceRepository,
                                                   final String targetRepository,
@@ -156,14 +164,10 @@ public class PermissionChecker {
     return "anonymous";
   }
 
-  /**
-   * Sanitize input to prevent injection attacks.
-   */
   private String sanitize(final String input) {
     if (input == null || input.isEmpty()) {
       return "*";
     }
-    // Remove any characters that could be used for injection
-    return input.replaceAll("[^a-zA-Z0-9_\\-.:/]", "_");
+    return input.replaceAll("[^a-zA-Z0-9_\\-.]", "_");
   }
 }
