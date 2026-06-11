@@ -52,6 +52,7 @@ public class PromotionResource implements Resource {
   {
     this.promotionService = promotionService;
     this.permissionChecker = permissionChecker;
+    log.info("PromotionResource initialized successfully");
   }
 
   /**
