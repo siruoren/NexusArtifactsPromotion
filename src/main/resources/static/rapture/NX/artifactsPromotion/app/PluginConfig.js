@@ -1,0 +1,783 @@
+/**
+ * Nexus Artifacts Promotion Plugin - Plugin Configuration
+ *
+ * Registers UI extensions using Nexus Rapture (ExtJS) framework:
+ * - Promotion button on artifact details
+ * - Sync button on remote repository artifact details
+ * - Sync Queue menu under Browse
+ *
+ * i18n: Uses dot-format keys with en/zh bundles.
+ */
+/*global Ext, NX*/
+
+Ext.define('NX.artifactsPromotion.app.PluginConfig', {
+  '@aggregate_priority': 100,
+
+  namespaces: [
+    'NX.artifactsPromotion'
+  ],
+
+  controllers: [
+    {
+      id: 'NX.artifactsPromotion.controller.Promotion',
+      active: function () {
+        return NX.app.Application.bundleActive('nexus-artifacts-promotion-plugin');
+      }
+    }
+  ]
+});
+
+// ==================== i18n ====================
+
+Ext.define('NX.artifactsPromotion.I18n', {
+  singleton: true,
+
+  bundles: {},
+
+  currentLocale: 'en',
+
+  en: {
+    "promotion.button.text": "Promote Artifact",
+    "promotion.modal.title": "Promote Artifact",
+    "promotion.modal.targetRepository": "Target Repository:",
+    "promotion.modal.filesToPromote": "Files to Promote:",
+    "promotion.modal.cancel": "Cancel",
+    "promotion.modal.promote": "Promote",
+    "promotion.modal.promoting": "Promoting...",
+    "promotion.modal.action.new": "NEW",
+    "promotion.modal.action.update": "UPDATE",
+    "promotion.result.title.success": "Promotion Success",
+    "promotion.result.title.failed": "Promotion Failed",
+    "promotion.result.targetRepository": "Target Repository:",
+    "promotion.result.status": "Status:",
+    "promotion.result.error": "Error:",
+    "promotion.result.items": "Promoted Items:",
+    "promotion.result.close": "Close",
+    "promotion.permission.denied": "You do not have promotion permission for this repository.",
+    "promotion.permission.denied.admin": "You do not have promotion permission. Please contact your administrator.",
+    "promotion.noTargets.title": "No Target Repositories",
+    "promotion.noTargets.message": "No available target repositories with the same format and your promotion permission.",
+    "promotion.preview.failed": "Preview Failed",
+    "promotion.execute.failed": "Promotion Failed",
+
+    "sync.button.text": "Sync",
+    "sync.permission.denied": "You do not have sync permission for this repository.",
+    "sync.permission.denied.admin": "You do not have sync permission. Please contact your administrator.",
+    "sync.execute.failed": "Sync Failed",
+    "sync.queue.created.title": "Sync Queue Created",
+    "sync.queue.created.queueId": "Queue ID:",
+    "sync.queue.created.repository": "Repository:",
+    "sync.queue.created.path": "Path:",
+    "sync.queue.created.message": "Sync task has been submitted to the queue.",
+    "sync.queue.created.viewQueue": "View Queue",
+    "sync.queue.created.close": "Close",
+
+    "sync.queue.page.title": "Sync Queue",
+    "sync.queue.page.loginRequired": "Please log in to view sync queue.",
+    "sync.queue.page.loading": "Loading sync tasks...",
+    "sync.queue.page.noTasks": "No sync tasks found.",
+    "sync.queue.page.loadFailed": "Failed to load sync tasks:",
+    "sync.queue.table.queueId": "Queue ID",
+    "sync.queue.table.sourceRepository": "Source Repository",
+    "sync.queue.table.targetRepository": "Target Repository",
+    "sync.queue.table.path": "Path",
+    "sync.queue.table.fileDetails": "File Details",
+    "sync.queue.table.status": "Status",
+    "sync.queue.table.startTime": "Start Time",
+    "sync.queue.table.endTime": "End Time",
+    "sync.queue.table.username": "User",
+    "sync.queue.table.result": "Result",
+    "sync.queue.table.items": "items",
+    "sync.queue.table.refresh": "Refresh",
+
+    "common.noPermission": "No Permission",
+    "common.error": "Error",
+    "common.ok": "OK"
+  },
+
+  zh: {
+    "promotion.button.text": "\u664b\u7ea7\u5de5\u4ef6",
+    "promotion.modal.title": "\u664b\u7ea7\u5de5\u4ef6",
+    "promotion.modal.targetRepository": "\u76ee\u6807\u4ed3\u5e93\uff1a",
+    "promotion.modal.filesToPromote": "\u5f85\u664b\u7ea7\u6587\u4ef6\uff1a",
+    "promotion.modal.cancel": "\u53d6\u6d88",
+    "promotion.modal.promote": "\u664b\u7ea7",
+    "promotion.modal.promoting": "\u664b\u7ea7\u4e2d...",
+    "promotion.modal.action.new": "\u65b0\u589e",
+    "promotion.modal.action.update": "\u66f4\u65b0",
+    "promotion.result.title.success": "\u664b\u7ea7\u6210\u529f",
+    "promotion.result.title.failed": "\u664b\u7ea7\u5931\u8d25",
+    "promotion.result.targetRepository": "\u76ee\u6807\u4ed3\u5e93\uff1a",
+    "promotion.result.status": "\u72b6\u6001\uff1a",
+    "promotion.result.error": "\u9519\u8bef\uff1a",
+    "promotion.result.items": "\u664b\u7ea7\u9879\u76ee\uff1a",
+    "promotion.result.close": "\u5173\u95ed",
+    "promotion.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u664b\u7ea7\u6743\u9650\u3002",
+    "promotion.permission.denied.admin": "\u60a8\u6ca1\u6709\u664b\u7ea7\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
+    "promotion.noTargets.title": "\u65e0\u53ef\u7528\u76ee\u6807\u4ed3\u5e93",
+    "promotion.noTargets.message": "\u6ca1\u6709\u76f8\u540c\u683c\u5f0f\u4e14\u60a8\u62e5\u6709\u664b\u7ea7\u6743\u9650\u7684\u76ee\u6807\u4ed3\u5e93\u3002",
+    "promotion.preview.failed": "\u9884\u89c8\u5931\u8d25",
+    "promotion.execute.failed": "\u664b\u7ea7\u5931\u8d25",
+
+    "sync.button.text": "\u540c\u6b65",
+    "sync.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u540c\u6b65\u6743\u9650\u3002",
+    "sync.permission.denied.admin": "\u60a8\u6ca1\u6709\u540c\u6b65\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
+    "sync.execute.failed": "\u540c\u6b65\u5931\u8d25",
+    "sync.queue.created.title": "\u540c\u6b65\u961f\u5217\u5df2\u521b\u5efa",
+    "sync.queue.created.queueId": "\u961f\u5217ID\uff1a",
+    "sync.queue.created.repository": "\u4ed3\u5e93\uff1a",
+    "sync.queue.created.path": "\u8def\u5f84\uff1a",
+    "sync.queue.created.message": "\u540c\u6b65\u4efb\u52a1\u5df2\u63d0\u4ea4\u5230\u961f\u5217\u3002",
+    "sync.queue.created.viewQueue": "\u67e5\u770b\u961f\u5217",
+    "sync.queue.created.close": "\u5173\u95ed",
+
+    "sync.queue.page.title": "\u540c\u6b65\u961f\u5217",
+    "sync.queue.page.loginRequired": "\u8bf7\u767b\u5f55\u540e\u67e5\u770b\u540c\u6b65\u961f\u5217\u3002",
+    "sync.queue.page.loading": "\u52a0\u8f7d\u540c\u6b65\u4efb\u52a1\u4e2d...",
+    "sync.queue.page.noTasks": "\u6682\u65e0\u540c\u6b65\u4efb\u52a1\u3002",
+    "sync.queue.page.loadFailed": "\u52a0\u8f7d\u540c\u6b65\u4efb\u52a1\u5931\u8d25\uff1a",
+    "sync.queue.table.queueId": "\u961f\u5217ID",
+    "sync.queue.table.sourceRepository": "\u6e90\u4ed3\u5e93",
+    "sync.queue.table.targetRepository": "\u76ee\u6807\u4ed3\u5e93",
+    "sync.queue.table.path": "\u8def\u5f84",
+    "sync.queue.table.fileDetails": "\u6587\u4ef6\u8be6\u60c5",
+    "sync.queue.table.status": "\u72b6\u6001",
+    "sync.queue.table.startTime": "\u5f00\u59cb\u65f6\u95f4",
+    "sync.queue.table.endTime": "\u7ed3\u675f\u65f6\u95f4",
+    "sync.queue.table.username": "\u7528\u6237",
+    "sync.queue.table.result": "\u7ed3\u679c",
+    "sync.queue.table.items": "\u9879",
+    "sync.queue.table.refresh": "\u5237\u65b0",
+
+    "common.noPermission": "\u65e0\u6743\u9650",
+    "common.error": "\u9519\u8bef",
+    "common.ok": "\u786e\u5b9a"
+  },
+
+  constructor: function () {
+    this.bundles['en'] = this.en;
+    this.bundles['zh'] = this.zh;
+    this.currentLocale = this.detectLocale();
+  },
+
+  detectLocale: function () {
+    if (NX && NX.State && NX.State.getValue) {
+      try {
+        var locale = NX.State.getValue('locale');
+        if (locale) {
+          return locale.startsWith('zh') ? 'zh' : 'en';
+        }
+      } catch (e) { /* ignore */ }
+    }
+    var nav = navigator.language || navigator.userLanguage || 'en';
+    return nav.startsWith('zh') ? 'zh' : 'en';
+  },
+
+  t: function (key) {
+    var bundle = this.bundles[this.currentLocale] || this.bundles['en'];
+    if (bundle && bundle.hasOwnProperty(key)) {
+      return bundle[key];
+    }
+    var enBundle = this.bundles['en'];
+    if (enBundle && enBundle.hasOwnProperty(key)) {
+      return enBundle[key];
+    }
+    return key;
+  }
+});
+
+// Shorthand
+function _t(key) {
+  return NX.artifactsPromotion.I18n.t(key);
+}
+
+// ==================== Utility ====================
+
+function sanitize(str) {
+  if (str === null || str === undefined) return '';
+  var div = document.createElement('div');
+  div.appendChild(document.createTextNode(String(str)));
+  return div.innerHTML;
+}
+
+function apiRequest(method, path, data) {
+  var opts = {
+    method: method,
+    headers: {
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    credentials: 'same-origin'
+  };
+  if (data) {
+    opts.body = JSON.stringify(data);
+  }
+  return fetch('/service/rest/v1' + path, opts)
+    .then(function (response) {
+      if (response.status === 401) {
+        throw new Error('401 Authentication required');
+      }
+      if (response.status === 403) {
+        throw new Error('No permission');
+      }
+      if (!response.ok) {
+        return response.json().then(function (err) {
+          throw new Error(err.error || 'Request failed');
+        });
+      }
+      return response.json();
+    });
+}
+
+// ==================== Permission Check ====================
+
+function checkPromotionPermission(repository, format) {
+  return apiRequest('GET', '/promotion/permission?repository=' +
+    encodeURIComponent(repository) + '&format=' + encodeURIComponent(format))
+    .then(function (result) { return result.hasPermission === true; })
+    .catch(function () { return false; });
+}
+
+function checkSyncPermission(repository, format) {
+  return apiRequest('GET', '/sync/permission?repository=' +
+    encodeURIComponent(repository) + '&format=' + encodeURIComponent(format))
+    .then(function (result) { return result.hasPermission === true; })
+    .catch(function () { return false; });
+}
+
+// ==================== Dialog Helpers ====================
+
+function showAlertDialog(title, message) {
+  if (NX && NX.Dialogs && NX.Dialogs.showAlert) {
+    NX.Dialogs.showAlert(title, message);
+    return;
+  }
+  alert(title + '\n' + message);
+}
+
+// ==================== Promotion Controller ====================
+
+Ext.define('NX.artifactsPromotion.controller.Promotion', {
+  extend: 'Ext.app.Controller',
+
+  refs: [
+    { ref: 'featureBrowser', selector: 'nx-coreui-feature-browser' }
+  ],
+
+  init: function () {
+    var me = this;
+
+    // Register Browse menu item for Sync Queue
+    me.listen({
+      component: {
+        'nx-coreui-feature-browser': {
+          afterrender: me.onBrowserRender
+        }
+      }
+    });
+
+    // Register menu item for Sync Queue
+    me.addEvents();
+
+    // Listen for asset detail panel render to add buttons
+    me.control({
+      'nx-coreui-componentassetinfo': {
+        afterrender: me.onAssetInfoRender
+      }
+    });
+  },
+
+  onBrowserRender: function () {
+    var me = this;
+    // Add Sync Queue menu item
+    me.addSyncQueueMenu();
+  },
+
+  addSyncQueueMenu: function () {
+    var me = this;
+    // Check if user is logged in
+    if (!NX.State.getValue('user')) {
+      return;
+    }
+
+    // Check if menu already added
+    if (document.getElementById('sync-queue-menu-item')) {
+      return;
+    }
+
+    // Use NX.ext.registerPoint to add menu
+    try {
+      NX.ext.registerPoint('coreui:menu:browse', {
+        text: _t('sync.queue.page.title'),
+        iconName: 'sync-queue',
+        view: 'NX.artifactsPromotion.view.SyncQueue',
+        weight: 200
+      });
+    } catch (e) {
+      // Fallback: add menu via DOM
+      me.addSyncQueueMenuFallback();
+    }
+  },
+
+  addSyncQueueMenuFallback: function () {
+    // Will be handled by the sync queue page rendering
+  },
+
+  onAssetInfoRender: function (panel) {
+    var me = this;
+    // Add promotion and sync buttons to the asset detail panel
+    me.addButtonsToPanel(panel);
+  },
+
+  addButtonsToPanel: function (panel) {
+    var me = this;
+    try {
+      var repoName = me.getRepositoryName(panel);
+      var path = me.getAssetPath(panel);
+      var format = me.getAssetFormat(panel);
+      var isProxy = me.isProxyRepository(repoName);
+
+      if (!repoName || !path) return;
+
+      // Add promotion button for all repository types
+      me.addPromotionButton(panel, repoName, path, format);
+
+      // Add sync button for proxy repositories
+      if (isProxy) {
+        me.addSyncButton(panel, repoName, path, format);
+      }
+    } catch (e) {
+      // Silently fail - don't break the UI
+    }
+  },
+
+  getRepositoryName: function (panel) {
+    try {
+      var record = panel.getRecord ? panel.getRecord() : null;
+      if (record) {
+        return record.get('repositoryName') || record.get('repository');
+      }
+      // Try to get from panel data
+      var data = panel.initialConfig && panel.initialConfig.data;
+      return data && (data.repositoryName || data.repository);
+    } catch (e) { return null; }
+  },
+
+  getAssetPath: function (panel) {
+    try {
+      var record = panel.getRecord ? panel.getRecord() : null;
+      if (record) {
+        return record.get('name') || record.get('path');
+      }
+      var data = panel.initialConfig && panel.initialConfig.data;
+      return data && (data.name || data.path);
+    } catch (e) { return null; }
+  },
+
+  getAssetFormat: function (panel) {
+    try {
+      var record = panel.getRecord ? panel.getRecord() : null;
+      if (record) {
+        return record.get('format');
+      }
+      var data = panel.initialConfig && panel.initialConfig.data;
+      return data && data.format;
+    } catch (e) { return null; }
+  },
+
+  isProxyRepository: function (repoName) {
+    try {
+      var repo = NX.State.getValue('repositories');
+      if (repo) {
+        for (var i = 0; i < repo.length; i++) {
+          if (repo[i].name === repoName) {
+            return repo[i].type === 'proxy';
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return false;
+  },
+
+  addPromotionButton: function (panel, repoName, path, format) {
+    var me = this;
+    var isDirectory = path && path.endsWith('/');
+
+    var btn = Ext.create('Ext.button.Button', {
+      text: _t('promotion.button.text'),
+      iconCls: 'x-fa fa-arrow-up',
+      cls: 'promotion-btn',
+      handler: function () {
+        me.handlePromotionClick(repoName, path, isDirectory, format);
+      }
+    });
+
+    // Add button to panel toolbar
+    var toolbar = panel.down('toolbar');
+    if (toolbar) {
+      toolbar.add(btn);
+    } else {
+      panel.addDocked({
+        xtype: 'toolbar',
+        dock: 'top',
+        items: [btn]
+      });
+    }
+  },
+
+  addSyncButton: function (panel, repoName, path, format) {
+    var me = this;
+    var isDirectory = path && path.endsWith('/');
+
+    var btn = Ext.create('Ext.button.Button', {
+      text: _t('sync.button.text'),
+      iconCls: 'x-fa fa-sync',
+      cls: 'sync-btn',
+      handler: function () {
+        me.handleSyncClick(repoName, path, isDirectory, format);
+      }
+    });
+
+    var toolbar = panel.down('toolbar');
+    if (toolbar) {
+      toolbar.add(btn);
+    }
+  },
+
+  handlePromotionClick: function (repoName, path, isDirectory, format) {
+    var me = this;
+    checkPromotionPermission(repoName, format).then(function (hasPermission) {
+      if (!hasPermission) {
+        showAlertDialog(_t('common.noPermission'), _t('promotion.permission.denied'));
+        return;
+      }
+      me.showPromotionModal(repoName, path, isDirectory, format);
+    });
+  },
+
+  handleSyncClick: function (repoName, path, isDirectory, format) {
+    checkSyncPermission(repoName, format).then(function (hasPermission) {
+      if (!hasPermission) {
+        showAlertDialog(_t('common.noPermission'), _t('sync.permission.denied'));
+        return;
+      }
+      apiRequest('POST', '/sync/execute', {
+        repository: repoName,
+        path: path,
+        isDirectory: isDirectory,
+        format: format
+      })
+      .then(function (result) {
+        showSyncQueueCreatedDialog(result);
+      })
+      .catch(function (err) {
+        showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
+      });
+    });
+  },
+
+  showPromotionModal: function (repoName, path, isDirectory, format) {
+    var me = this;
+    apiRequest('GET', '/promotion/targets?sourceRepository=' +
+      encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format))
+      .then(function (data) {
+        if (!data.repositories || data.repositories.length === 0) {
+          showAlertDialog(_t('promotion.noTargets.title'), _t('promotion.noTargets.message'));
+          return;
+        }
+        var previewReq = {
+          sourceRepository: repoName,
+          targetRepository: data.repositories[0].name,
+          path: path,
+          isDirectory: isDirectory,
+          format: format
+        };
+        apiRequest('POST', '/promotion/preview', previewReq)
+          .then(function (preview) {
+            me.renderPromotionModal(data.repositories, previewReq, preview);
+          })
+          .catch(function (err) {
+            showAlertDialog(_t('promotion.preview.failed'), sanitize(err.message));
+          });
+      })
+      .catch(function (err) {
+        showAlertDialog(_t('common.error'), sanitize(err.message));
+      });
+  },
+
+  renderPromotionModal: function (targetRepos, request, preview) {
+    var me = this;
+    var targetOptions = [];
+    Ext.each(targetRepos, function (repo) {
+      targetOptions.push({ text: repo.name + ' (' + repo.format + ' - ' + repo.type + ')', value: repo.name });
+    });
+
+    var fileStore = Ext.create('Ext.data.Store', {
+      fields: ['path', 'type', 'size', 'existsInTarget'],
+      data: preview && preview.files ? preview.files : []
+    });
+
+    var win = Ext.create('Ext.window.Window', {
+      title: _t('promotion.modal.title'),
+      width: 600,
+      height: 500,
+      modal: true,
+      layout: 'fit',
+      items: [{
+        xtype: 'panel',
+        layout: {
+          type: 'vbox',
+          align: 'stretch'
+        },
+        items: [
+          {
+            xtype: 'combobox',
+            fieldLabel: _t('promotion.modal.targetRepository'),
+            store: Ext.create('Ext.data.Store', { fields: ['text', 'value'], data: targetOptions }),
+            displayField: 'text',
+            valueField: 'value',
+            value: targetOptions.length > 0 ? targetOptions[0].value : null,
+            queryMode: 'local',
+            editable: false,
+            itemId: 'targetCombo'
+          },
+          {
+            xtype: 'gridpanel',
+            title: _t('promotion.modal.filesToPromote'),
+            flex: 1,
+            store: fileStore,
+            columns: [
+              { text: 'Path', dataIndex: 'path', flex: 2 },
+              { text: 'Type', dataIndex: 'type', width: 80 },
+              {
+                text: 'Action', dataIndex: 'existsInTarget', width: 80,
+                renderer: function (val) {
+                  return val
+                    ? '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.modal.action.update') + '</span>'
+                    : '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.modal.action.new') + '</span>';
+                }
+              }
+            ]
+          }
+        ]
+      }],
+      buttons: [
+        {
+          text: _t('promotion.modal.cancel'),
+          handler: function () { win.close(); }
+        },
+        {
+          text: _t('promotion.modal.promote'),
+          itemId: 'promoteBtn',
+          handler: function () {
+            var targetRepo = win.down('#targetCombo').getValue();
+            if (!targetRepo) return;
+
+            checkPromotionPermission(request.sourceRepository, request.format).then(function (hasPermission) {
+              if (!hasPermission) {
+                showAlertDialog(_t('common.noPermission'), _t('promotion.permission.denied.admin'));
+                return;
+              }
+              var btn = win.down('#promoteBtn');
+              btn.setText(_t('promotion.modal.promoting'));
+              btn.disable();
+
+              apiRequest('POST', '/promotion/execute', {
+                sourceRepository: request.sourceRepository,
+                targetRepository: targetRepo,
+                path: request.path,
+                isDirectory: request.isDirectory,
+                format: request.format
+              })
+              .then(function (result) {
+                win.close();
+                me.pollPromotionTask(result.taskId, targetRepo);
+              })
+              .catch(function (err) {
+                btn.setText(_t('promotion.modal.promote'));
+                btn.enable();
+                showAlertDialog(_t('promotion.execute.failed'), sanitize(err.message));
+              });
+            });
+          }
+        }
+      ]
+    });
+    win.show();
+  },
+
+  pollPromotionTask: function (taskId, targetRepo) {
+    var me = this;
+    var task = {
+      run: function () {
+        apiRequest('GET', '/promotion/task/' + encodeURIComponent(taskId))
+          .then(function (result) {
+            if (result.status === 'completed' || result.status === 'failed') {
+              Ext.TaskManager.stop(task);
+              me.showPromotionResult(result, targetRepo);
+            }
+          })
+          .catch(function () { /* continue polling */ });
+      },
+      interval: 2000
+    };
+    Ext.TaskManager.start(task);
+  },
+
+  showPromotionResult: function (result, targetRepo) {
+    var isSuccess = result.status === 'completed';
+    var titleKey = isSuccess ? 'promotion.result.title.success' : 'promotion.result.title.failed';
+
+    var items = [];
+    if (result.items && result.items.length > 0) {
+      Ext.each(result.items, function (item) {
+        var actionLabel = item.action === 'CREATED' ? _t('promotion.modal.action.new') : _t('promotion.modal.action.update');
+        items.push({ path: item.path, type: item.type, action: actionLabel });
+      });
+    }
+
+    var store = Ext.create('Ext.data.Store', {
+      fields: ['path', 'type', 'action'],
+      data: items
+    });
+
+    var win = Ext.create('Ext.window.Window', {
+      title: _t(titleKey),
+      width: 600,
+      height: 400,
+      modal: true,
+      layout: 'fit',
+      items: [
+        {
+          xtype: 'panel',
+          layout: { type: 'vbox', align: 'stretch' },
+          items: [
+            {
+              xtype: 'displayfield',
+              fieldLabel: _t('promotion.result.targetRepository'),
+              value: targetRepo
+            },
+            {
+              xtype: 'displayfield',
+              fieldLabel: _t('promotion.result.status'),
+              value: '<span style="color:' + (isSuccess ? '#5cb85c' : '#d9534f') + ';">' +
+                (isSuccess ? 'Success' : 'Failed') + '</span>'
+            },
+            result.errorMessage ? {
+              xtype: 'displayfield',
+              fieldLabel: _t('promotion.result.error'),
+              value: '<span style="color:#d9534f;">' + sanitize(result.errorMessage) + '</span>'
+            } : null,
+            {
+              xtype: 'gridpanel',
+              title: _t('promotion.result.items'),
+              flex: 1,
+              store: store,
+              columns: [
+                { text: 'Path', dataIndex: 'path', flex: 2 },
+                { text: 'Type', dataIndex: 'type', width: 80 },
+                { text: 'Action', dataIndex: 'action', width: 80 }
+              ]
+            }
+          ].filter(Boolean)
+        }
+      ],
+      buttons: [
+        {
+          text: _t('promotion.result.close'),
+          handler: function () { win.close(); }
+        }
+      ]
+    });
+    win.show();
+  }
+});
+
+// ==================== Sync Queue Created Dialog ====================
+
+function showSyncQueueCreatedDialog(result) {
+  var win = Ext.create('Ext.window.Window', {
+    title: _t('sync.queue.created.title'),
+    width: 400,
+    modal: true,
+    layout: 'fit',
+    items: [{
+      xtype: 'panel',
+      bodyPadding: 15,
+      items: [
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.queueId'), value: sanitize(result.queueId || '') },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.repository'), value: sanitize(result.repository || '') },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.path'), value: sanitize(result.path || '') },
+        { xtype: 'displayfield', value: _t('sync.queue.created.message') }
+      ]
+    }],
+    buttons: [
+      {
+        text: _t('sync.queue.created.viewQueue'),
+        handler: function () {
+          win.close();
+          // Navigate to sync queue page
+          if (NX && NX.Bookmarks && NX.Bookmarks.navigateTo) {
+            NX.Bookmarks.navigateTo('browse/sync-queue');
+          }
+        }
+      },
+      {
+        text: _t('sync.queue.created.close'),
+        handler: function () { win.close(); }
+      }
+    ]
+  });
+  win.show();
+}
+
+// ==================== Sync Queue View ====================
+
+Ext.define('NX.artifactsPromotion.view.SyncQueue', {
+  extend: 'Ext.panel.Panel',
+  alias: 'widget.nx-artifacts-promotion-syncqueue',
+
+  title: _t('sync.queue.page.title'),
+  layout: 'fit',
+
+  initComponent: function () {
+    var me = this;
+
+    me.store = Ext.create('Ext.data.Store', {
+      fields: ['queueId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+        'status', 'startTime', 'endTime', 'username', 'result'],
+      proxy: {
+        type: 'ajax',
+        url: '/service/rest/v1/sync/queue',
+        reader: { type: 'json', rootProperty: 'tasks' }
+      },
+      autoLoad: true
+    });
+
+    Ext.apply(me, {
+      items: [{
+        xtype: 'gridpanel',
+        store: me.store,
+        columns: [
+          { text: _t('sync.queue.table.queueId'), dataIndex: 'queueId', width: 120 },
+          { text: _t('sync.queue.table.sourceRepository'), dataIndex: 'sourceRepository', flex: 1 },
+          { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1 },
+          { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100 },
+          { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150 },
+          { text: _t('sync.queue.table.endTime'), dataIndex: 'endTime', width: 150 },
+          { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100 },
+          { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1 }
+        ],
+        tbar: [
+          {
+            text: _t('sync.queue.table.refresh'),
+            iconCls: 'x-fa fa-refresh',
+            handler: function () { me.store.reload(); }
+          }
+        ]
+      }]
+    });
+
+    me.callParent(arguments);
+  }
+});

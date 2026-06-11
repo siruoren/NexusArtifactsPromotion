@@ -1,0 +1,77 @@
+package com.nexus.artifacts.promotion.config;
+
+import java.util.Map;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.sonatype.nexus.capability.CapabilitySupport;
+
+import com.nexus.artifacts.promotion.service.TaskExecutorService;
+
+import static com.nexus.artifacts.promotion.config.SyncCapabilityDescriptor.*;
+
+/**
+ * Sync management capability for Nexus system settings.
+ * Allows administrators to configure:
+ * - Sync thread pool size
+ * - Max sync queue size
+ */
+@Named(SyncCapabilityDescriptor.TYPE_ID)
+public class SyncCapability extends CapabilitySupport<Map<String, String>> {
+
+  private static final Logger log = LoggerFactory.getLogger(SyncCapability.class);
+
+  private final TaskExecutorService taskExecutor;
+
+  @Inject
+  public SyncCapability(final TaskExecutorService taskExecutor) {
+    this.taskExecutor = taskExecutor;
+  }
+
+  @Override
+  protected Map<String, String> createConfig(final Map<String, String> properties) throws Exception {
+    return properties;
+  }
+
+  @Override
+  protected void onActivate(final Map<String, String> props) throws Exception {
+    String poolSizeStr = props.get(PROP_SYNC_POOL_SIZE);
+    if (poolSizeStr != null) {
+      try {
+        int poolSize = Integer.parseInt(poolSizeStr);
+        taskExecutor.updateSyncPoolSize(poolSize);
+        log.info("Sync pool size set to {} from capability configuration", poolSize);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid sync pool size value: {}", poolSizeStr);
+      }
+    }
+
+    String maxQueueStr = props.get(PROP_MAX_SYNC_QUEUE_SIZE);
+    if (maxQueueStr != null) {
+      try {
+        int maxQueue = Integer.parseInt(maxQueueStr);
+        taskExecutor.updateMaxSyncQueueSize(maxQueue);
+        log.info("Max sync queue size set to {} from capability configuration", maxQueue);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid max sync queue size value: {}", maxQueueStr);
+      }
+    }
+
+    log.info("Sync capability activated");
+  }
+
+  @Override
+  protected void onUpdate(final Map<String, String> props) throws Exception {
+    onActivate(props);
+  }
+
+  @Override
+  protected void onPassivate(final Map<String, String> props) throws Exception {
+    log.info("Sync capability passivated");
+  }
+}
