@@ -10,8 +10,6 @@ import org.sonatype.nexus.common.event.EventBus;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryCreatedEvent;
 import org.sonatype.nexus.repository.manager.RepositoryDeletedEvent;
-import org.sonatype.nexus.security.config.CPrivilege;
-import org.sonatype.nexus.security.config.SecurityConfigurationManager;
 
 import com.google.common.eventbus.AllowConcurrentEvents;
 import com.google.common.eventbus.Subscribe;
@@ -23,8 +21,8 @@ import org.slf4j.LoggerFactory;
  * Listens for repository creation/deletion events and automatically
  * adds/removes corresponding promotion and sync privilege entries.
  *
- * This ensures that when a new repository is created, administrators
- * can immediately assign promotion/sync permissions for it.
+ * Uses PrivilegeInitializer to persist privileges through
+ * SecurityConfigurationManager so they appear in role management UI.
  */
 @Named
 @Singleton
@@ -32,19 +30,21 @@ public class RepositoryPrivilegeListener
 {
   private static final Logger log = LoggerFactory.getLogger(RepositoryPrivilegeListener.class);
 
-  private final SecurityConfigurationManager securityConfigManager;
+  private final PrivilegeInitializer privilegeInitializer;
   private final EventBus eventBus;
 
   @Inject
-  public RepositoryPrivilegeListener(final SecurityConfigurationManager securityConfigManager,
+  public RepositoryPrivilegeListener(final PrivilegeInitializer privilegeInitializer,
                                       final EventBus eventBus) {
-    this.securityConfigManager = securityConfigManager;
+    this.privilegeInitializer = privilegeInitializer;
     this.eventBus = eventBus;
   }
 
   @PostConstruct
   public void init() {
     eventBus.register(this);
+    // Initialize privileges for existing repositories
+    privilegeInitializer.ensureInitialized();
     log.info("RepositoryPrivilegeListener registered with EventBus");
   }
 
@@ -70,23 +70,8 @@ public class RepositoryPrivilegeListener
 
     log.info("Repository created: {} (format: {}), adding promotion/sync privileges", repoName, format);
 
-    try {
-      CPrivilege promoPrivilege = PromotionSecurityContributor.createPromotionPrivilege(repoName, format);
-      securityConfigManager.createPrivilege(promoPrivilege);
-      log.info("Created promotion privilege for repository: {}", repoName);
-    }
-    catch (Exception e) {
-      log.debug("Could not create promotion privilege for {}: {}", repoName, e.getMessage());
-    }
-
-    try {
-      CPrivilege syncPrivilege = SyncSecurityContributor.createSyncPrivilege(repoName, format);
-      securityConfigManager.createPrivilege(syncPrivilege);
-      log.info("Created sync privilege for repository: {}", repoName);
-    }
-    catch (Exception e) {
-      log.debug("Could not create sync privilege for {}: {}", repoName, e.getMessage());
-    }
+    privilegeInitializer.createPromotionPrivilege(repoName, format);
+    privilegeInitializer.createSyncPrivilege(repoName, format);
   }
 
   /**
@@ -101,22 +86,7 @@ public class RepositoryPrivilegeListener
 
     log.info("Repository deleted: {} (format: {}), removing promotion/sync privileges", repoName, format);
 
-    try {
-      String promoPrivilegeId = PromotionSecurityContributor.getPrivilegeId(repoName, format);
-      securityConfigManager.deletePrivilege(promoPrivilegeId);
-      log.info("Deleted promotion privilege for repository: {}", repoName);
-    }
-    catch (Exception e) {
-      log.debug("Could not delete promotion privilege for {}: {}", repoName, e.getMessage());
-    }
-
-    try {
-      String syncPrivilegeId = SyncSecurityContributor.getPrivilegeId(repoName, format);
-      securityConfigManager.deletePrivilege(syncPrivilegeId);
-      log.info("Deleted sync privilege for repository: {}", repoName);
-    }
-    catch (Exception e) {
-      log.debug("Could not delete sync privilege for {}: {}", repoName, e.getMessage());
-    }
+    privilegeInitializer.deletePromotionPrivilege(repoName, format);
+    privilegeInitializer.deleteSyncPrivilege(repoName, format);
   }
 }

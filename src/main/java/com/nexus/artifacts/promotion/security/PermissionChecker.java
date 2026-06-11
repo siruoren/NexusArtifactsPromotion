@@ -40,8 +40,9 @@ public class PermissionChecker {
     }
 
     // Check specific repository permission first
+    // ApplicationPermission generates: nexus:{domain}:{actions}
     // domain = "nexus-artifacts-promotion-{repoName}-{format}", action = "promote"
-    String specificPermission = "nexus-artifacts-promotion-"
+    String specificPermission = "nexus:nexus-artifacts-promotion-"
         + sanitize(repositoryName) + "-" + sanitize(format)
         + ":" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
 
@@ -51,17 +52,10 @@ public class PermissionChecker {
       return true;
     }
 
-    // Check wildcard permission: "nexus-artifacts-promotion:promote"
-    String wildcardPermission = "nexus-artifacts-promotion:" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
+    // Check wildcard permission: "nexus:nexus-artifacts-promotion:promote"
+    String wildcardPermission = "nexus:nexus-artifacts-promotion:" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
     if (subject.isPermitted(wildcardPermission)) {
       log.debug("User '{}' has wildcard promotion permission", subject.getPrincipal());
-      return true;
-    }
-
-    // Also check the old wildcard format for backward compatibility
-    String oldWildcardPermission = "nexus-artifacts-promotion:*";
-    if (subject.isPermitted(oldWildcardPermission)) {
-      log.debug("User '{}' has old wildcard promotion permission", subject.getPrincipal());
       return true;
     }
 
@@ -81,7 +75,8 @@ public class PermissionChecker {
     }
 
     // Check specific repository permission
-    String specificPermission = "nexus-artifacts-sync-"
+    // ApplicationPermission generates: nexus:{domain}:{actions}
+    String specificPermission = "nexus:nexus-artifacts-sync-"
         + sanitize(repositoryName) + "-" + sanitize(format)
         + ":" + SyncPrivilegeDescriptor.ACTION_SYNC;
 
@@ -92,15 +87,9 @@ public class PermissionChecker {
     }
 
     // Check wildcard permission
-    String wildcardPermission = "nexus-artifacts-sync:" + SyncPrivilegeDescriptor.ACTION_SYNC;
+    String wildcardPermission = "nexus:nexus-artifacts-sync:" + SyncPrivilegeDescriptor.ACTION_SYNC;
     if (subject.isPermitted(wildcardPermission)) {
       log.debug("User '{}' has wildcard sync permission", subject.getPrincipal());
-      return true;
-    }
-
-    String oldWildcardPermission = "nexus-artifacts-sync:*";
-    if (subject.isPermitted(oldWildcardPermission)) {
-      log.debug("User '{}' has old wildcard sync permission", subject.getPrincipal());
       return true;
     }
 

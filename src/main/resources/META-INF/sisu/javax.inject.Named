@@ -10,11 +10,10 @@ com.nexus.artifacts.promotion.resource.SyncQueueResource
 com.nexus.artifacts.promotion.resource.SyncResource
 com.nexus.artifacts.promotion.resource.SystemConfigResource
 com.nexus.artifacts.promotion.security.PermissionChecker
+com.nexus.artifacts.promotion.security.PrivilegeInitializer
 com.nexus.artifacts.promotion.security.PromotionPrivilegeDescriptor
-com.nexus.artifacts.promotion.security.PromotionSecurityContributor
 com.nexus.artifacts.promotion.security.RepositoryPrivilegeListener
 com.nexus.artifacts.promotion.security.SyncPrivilegeDescriptor
-com.nexus.artifacts.promotion.security.SyncSecurityContributor
 com.nexus.artifacts.promotion.service.PromotionService
 com.nexus.artifacts.promotion.service.SyncService
 com.nexus.artifacts.promotion.service.TaskCacheManager

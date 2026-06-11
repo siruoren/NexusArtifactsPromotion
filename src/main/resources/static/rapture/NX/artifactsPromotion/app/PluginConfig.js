@@ -221,11 +221,23 @@ function sanitize(str) {
 
 function apiRequest(method, path, data) {
   return new Ext.Promise(function (resolve, reject) {
+    // Get CSRF token from cookie (Nexus uses NX-ANTI-CSRF-TOKEN)
+    var csrfToken = null;
+    var cookies = document.cookie.split(';');
+    for (var i = 0; i < cookies.length; i++) {
+      var cookie = cookies[i].trim();
+      if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
+        csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
+        break;
+      }
+    }
+
     var opts = {
       method: method,
       url: '/service/rest/v1' + path,
       headers: {
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'X-Nexus-UI': 'true'
       },
       success: function (response) {
         var status = response.status;
@@ -243,7 +255,8 @@ function apiRequest(method, path, data) {
       failure: function (response) {
         var status = response.status;
         if (status === 401) {
-          reject(new Error('401 Authentication required'));
+          // CSRF token mismatch or session expired
+          reject(new Error('Authentication required, please refresh the page and try again'));
           return;
         }
         if (status === 403) {
@@ -262,6 +275,9 @@ function apiRequest(method, path, data) {
     if (data) {
       opts.jsonData = data;
       opts.headers['Content-Type'] = 'application/json';
+    }
+    if (csrfToken) {
+      opts.headers['NX-ANTI-CSRF-TOKEN'] = csrfToken;
     }
     Ext.Ajax.request(opts);
   });
@@ -509,8 +525,29 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var folderModel = panel.folderModel;
       if (!folderModel) return;
 
-      var repoName = folderModel.repositoryName;
-      var path = folderModel.path;
+      // folderModel may be an Ext.data.Model or a plain object
+      // Try both direct property access and get() method
+      var repoName = folderModel.repositoryName || (folderModel.get && folderModel.get('repositoryName'));
+      var path = folderModel.path || (folderModel.get && folderModel.get('path'));
+
+      if (!repoName || !path) {
+        // Fallback: try to get repository name from the tree panel's store
+        var treePanel = panel.up('nx-coreui-component-asset-tree');
+        if (treePanel) {
+          var tree = treePanel.down('treepanel');
+          if (tree) {
+            var selected = tree.getSelectionModel().getSelection()[0];
+            if (selected) {
+              if (!repoName) {
+                repoName = selected.get('repositoryName') || selected.get('text');
+              }
+              if (!path) {
+                path = selected.get('id') || selected.get('text');
+              }
+            }
+          }
+        }
+      }
 
       if (!repoName || !path) return;
 
