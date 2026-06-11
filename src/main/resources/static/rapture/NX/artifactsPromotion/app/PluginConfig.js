@@ -594,6 +594,49 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         }
       }
     } catch (e) { /* ignore */ }
+    try {
+      // Fallback: try folderModel format
+      if (this._currentFolderPanel && this._currentFolderPanel.folderModel) {
+        var fm = this._currentFolderPanel.folderModel;
+        var fmt = fm.format || (fm.get && fm.get('format'));
+        if (fmt) return fmt;
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      // Fallback: try assetModel format
+      if (this._currentAssetPanel && this._currentAssetPanel.assetModel) {
+        var am = this._currentAssetPanel.assetModel;
+        var afmt = am.format || (am.get && am.get('format'));
+        if (afmt) return afmt;
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      // Fallback: try componentModel format
+      if (this._currentAssetPanel && this._currentAssetPanel.componentModel) {
+        var cm = this._currentAssetPanel.componentModel;
+        var cfmt = cm.format || (cm.get && cm.get('format'));
+        if (cfmt) return cfmt;
+      }
+    } catch (e) { /* ignore */ }
+    // Last resort: try to guess format from repository name patterns
+    if (repoName) {
+      if (repoName.indexOf('maven') >= 0 || repoName.indexOf('Maven') >= 0) return 'maven2';
+      if (repoName.indexOf('npm') >= 0 || repoName.indexOf('NPM') >= 0) return 'npm';
+      if (repoName.indexOf('nuget') >= 0 || repoName.indexOf('NuGet') >= 0) return 'nuget';
+      if (repoName.indexOf('pypi') >= 0 || repoName.indexOf('PyPI') >= 0) return 'pypi';
+      if (repoName.indexOf('docker') >= 0 || repoName.indexOf('Docker') >= 0) return 'docker';
+      if (repoName.indexOf('raw') >= 0 || repoName.indexOf('Raw') >= 0) return 'raw';
+      if (repoName.indexOf('yum') >= 0 || repoName.indexOf('Yum') >= 0) return 'yum';
+      if (repoName.indexOf('apt') >= 0 || repoName.indexOf('APT') >= 0) return 'apt';
+      if (repoName.indexOf('go') >= 0 || repoName.indexOf('Go') >= 0) return 'go';
+      if (repoName.indexOf('conda') >= 0 || repoName.indexOf('Conda') >= 0) return 'conda';
+      if (repoName.indexOf('rubygems') >= 0 || repoName.indexOf('RubyGems') >= 0) return 'rubygems';
+      if (repoName.indexOf('helm') >= 0 || repoName.indexOf('Helm') >= 0) return 'helm';
+      if (repoName.indexOf('gitlfs') >= 0 || repoName.indexOf('GitLFS') >= 0) return 'gitlfs';
+      if (repoName.indexOf('r') >= 0 || repoName.indexOf('R') >= 0) return 'r';
+      // Default to raw if we can't determine
+      return 'raw';
+    }
     return null;
   },
 

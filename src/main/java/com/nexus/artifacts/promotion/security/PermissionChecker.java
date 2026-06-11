@@ -39,16 +39,18 @@ public class PermissionChecker {
       return false;
     }
 
+    String fmt = (format != null && !format.isEmpty()) ? format : "raw";
+
     // Check specific repository permission first
     // ApplicationPermission generates: nexus:{domain}:{actions}
     // domain = "nexus-artifacts-promotion-{repoName}-{format}", action = "promote"
     String specificPermission = "nexus:nexus-artifacts-promotion-"
-        + sanitize(repositoryName) + "-" + sanitize(format)
+        + sanitize(repositoryName) + "-" + sanitize(fmt)
         + ":" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
 
     if (subject.isPermitted(specificPermission)) {
       log.debug("User '{}' has specific promotion permission for repo '{}', format '{}'",
-          subject.getPrincipal(), repositoryName, format);
+          subject.getPrincipal(), repositoryName, fmt);
       return true;
     }
 
@@ -60,7 +62,7 @@ public class PermissionChecker {
     }
 
     log.warn("User '{}' lacks promotion permission for repo '{}', format '{}'",
-        subject.getPrincipal(), repositoryName, format);
+        subject.getPrincipal(), repositoryName, fmt);
     return false;
   }
 
@@ -74,15 +76,17 @@ public class PermissionChecker {
       return false;
     }
 
+    String fmt = (format != null && !format.isEmpty()) ? format : "raw";
+
     // Check specific repository permission
     // ApplicationPermission generates: nexus:{domain}:{actions}
     String specificPermission = "nexus:nexus-artifacts-sync-"
-        + sanitize(repositoryName) + "-" + sanitize(format)
+        + sanitize(repositoryName) + "-" + sanitize(fmt)
         + ":" + SyncPrivilegeDescriptor.ACTION_SYNC;
 
     if (subject.isPermitted(specificPermission)) {
       log.debug("User '{}' has specific sync permission for repo '{}', format '{}'",
-          subject.getPrincipal(), repositoryName, format);
+          subject.getPrincipal(), repositoryName, fmt);
       return true;
     }
 
@@ -94,7 +98,7 @@ public class PermissionChecker {
     }
 
     log.warn("User '{}' lacks sync permission for repo '{}', format '{}'",
-        subject.getPrincipal(), repositoryName, format);
+        subject.getPrincipal(), repositoryName, fmt);
     return false;
   }
 
@@ -155,7 +159,7 @@ public class PermissionChecker {
 
   private String sanitize(final String input) {
     if (input == null || input.isEmpty()) {
-      return "*";
+      return "_";
     }
     return input.replaceAll("[^a-zA-Z0-9_\\-.]", "_");
   }

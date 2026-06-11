@@ -43,8 +43,14 @@ public class RepositoryPrivilegeListener
   @PostConstruct
   public void init() {
     eventBus.register(this);
-    // Initialize privileges for existing repositories
-    privilegeInitializer.ensureInitialized();
+    // Defer privilege initialization to avoid blocking startup
+    // if SecurityConfigurationManager is not yet available
+    try {
+      privilegeInitializer.ensureInitialized();
+    }
+    catch (Exception e) {
+      log.warn("Deferred privilege initialization: {}", e.getMessage());
+    }
     log.info("RepositoryPrivilegeListener registered with EventBus");
   }
 

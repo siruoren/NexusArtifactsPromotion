@@ -12,6 +12,7 @@ import org.sonatype.nexus.repository.manager.RepositoryManager;
 import org.sonatype.nexus.security.config.CPrivilege;
 import org.sonatype.nexus.security.config.CPrivilegeBuilder;
 import org.sonatype.nexus.security.config.SecurityConfigurationManager;
+import org.sonatype.nexus.security.privilege.NoSuchPrivilegeException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,16 +31,16 @@ public class PrivilegeInitializer
   private static final Logger log = LoggerFactory.getLogger(PrivilegeInitializer.class);
 
   private final Provider<RepositoryManager> repositoryManagerProvider;
-  private final SecurityConfigurationManager securityConfigManager;
+  private final Provider<SecurityConfigurationManager> securityConfigManagerProvider;
 
   private volatile boolean initialized = false;
 
   @Inject
   public PrivilegeInitializer(final Provider<RepositoryManager> repositoryManagerProvider,
-                               final SecurityConfigurationManager securityConfigManager)
+                               final Provider<SecurityConfigurationManager> securityConfigManagerProvider)
   {
     this.repositoryManagerProvider = repositoryManagerProvider;
-    this.securityConfigManager = securityConfigManager;
+    this.securityConfigManagerProvider = securityConfigManagerProvider;
   }
 
   /**
@@ -57,7 +58,7 @@ public class PrivilegeInitializer
       // Create wildcard promotion privilege if not exists
       createPrivilegeIfMissing(
           "nexus-artifacts-promotion-promote",
-          "nx-artifacts-promotion-all",
+          "允许交付到所有仓库",
           "Full promotion permission for all repositories",
           "nexus-artifacts-promotion",
           "promote"
@@ -66,7 +67,7 @@ public class PrivilegeInitializer
       // Create wildcard sync privilege if not exists
       createPrivilegeIfMissing(
           "nexus-artifacts-sync-sync",
-          "nx-artifacts-sync-all",
+          "允许同步所有仓库",
           "Full sync permission for all repositories",
           "nexus-artifacts-sync",
           "sync"
@@ -85,28 +86,7 @@ public class PrivilegeInitializer
           String repoName = repo.getName();
           String format = repo.getFormat().getValue();
 
-          // Create promotion privilege
-          String promoDomain = "nexus-artifacts-promotion-" + sanitize(repoName) + "-" + sanitize(format);
-          String promoId = promoDomain + "-promote";
-          createPrivilegeIfMissing(
-              promoId,
-              "Deliver to " + repoName + " (" + format + ")",
-              "Permission to deliver artifacts to repository " + repoName + " with format " + format,
-              promoDomain,
-              "promote"
-          );
-
-          // Create sync privilege
-          String syncDomain = "nexus-artifacts-sync-" + sanitize(repoName) + "-" + sanitize(format);
-          String syncId = syncDomain + "-sync";
-          createPrivilegeIfMissing(
-              syncId,
-              "Sync " + repoName + " (" + format + ")",
-              "Permission to sync artifacts from remote repository " + repoName + " with format " + format,
-              syncDomain,
-              "sync"
-          );
-
+          createRepositoryPrivileges(repoName, format);
           count++;
         }
         catch (Exception e) {
@@ -121,7 +101,36 @@ public class PrivilegeInitializer
   }
 
   /**
+   * Create promotion and sync privileges for a specific repository.
+   */
+  private void createRepositoryPrivileges(final String repoName, final String format)
+  {
+    // Create promotion privilege: "允许交付到xxx仓库"
+    String promoDomain = "nexus-artifacts-promotion-" + sanitize(repoName) + "-" + sanitize(format);
+    String promoId = promoDomain + "-promote";
+    createPrivilegeIfMissing(
+        promoId,
+        "允许交付到" + repoName + "仓库",
+        "Permission to deliver artifacts to repository " + repoName + " with format " + format,
+        promoDomain,
+        "promote"
+    );
+
+    // Create sync privilege
+    String syncDomain = "nexus-artifacts-sync-" + sanitize(repoName) + "-" + sanitize(format);
+    String syncId = syncDomain + "-sync";
+    createPrivilegeIfMissing(
+        syncId,
+        "允许同步" + repoName + "仓库",
+        "Permission to sync artifacts from remote repository " + repoName + " with format " + format,
+        syncDomain,
+        "sync"
+    );
+  }
+
+  /**
    * Create a privilege if it does not already exist.
+   * If the privilege exists but is read-only, update it to be writable.
    */
   private void createPrivilegeIfMissing(final String id,
                                          final String name,
@@ -130,16 +139,35 @@ public class PrivilegeInitializer
                                          final String actions)
   {
     try {
-      // Check if privilege already exists
-      CPrivilege existing = securityConfigManager.readPrivilege(id);
+      CPrivilege existing = securityConfigManagerProvider.get().readPrivilege(id);
       if (existing != null) {
-        log.debug("Privilege already exists: {}", id);
+        // Privilege exists - check if it's read-only
+        if (existing.isReadOnly()) {
+          // Update the existing read-only privilege to be writable
+          try {
+            existing.setName(name);
+            existing.setDescription(description);
+            existing.setReadOnly(false);
+            securityConfigManagerProvider.get().updatePrivilege(existing);
+            log.info("Updated read-only privilege to writable: id={}, name={}", id, name);
+          }
+          catch (Exception updateEx) {
+            // Read-only privileges from SecurityContributor may not be updatable
+            // Try creating a new one with a different approach
+            log.debug("Could not update read-only privilege {}: {}", id, updateEx.getMessage());
+          }
+        }
+        else {
+          log.debug("Privilege already exists and is writable: {}", id);
+        }
         return;
       }
     }
+    catch (NoSuchPrivilegeException e) {
+      // Privilege doesn't exist - proceed to create it
+    }
     catch (Exception e) {
-      // readPrivilege may throw if not found, which is expected
-      log.debug("Privilege {} not found, will create it", id);
+      log.debug("Error checking privilege {}: {}", id, e.getMessage());
     }
 
     try {
@@ -153,10 +181,11 @@ public class PrivilegeInitializer
       privilege.setDescription(description);
       privilege.setReadOnly(false);
 
-      securityConfigManager.createPrivilege(privilege);
+      securityConfigManagerProvider.get().createPrivilege(privilege);
       log.info("Created privilege: id={}, name={}", id, name);
     }
     catch (Exception e) {
+      // DuplicatePrivilegeException or other error
       log.debug("Could not create privilege {}: {}", id, e.getMessage());
     }
   }
@@ -172,7 +201,7 @@ public class PrivilegeInitializer
     String id = domain + "-promote";
     createPrivilegeIfMissing(
         id,
-        "Deliver to " + repositoryName + " (" + format + ")",
+        "允许交付到" + repositoryName + "仓库",
         "Permission to deliver artifacts to repository " + repositoryName + " with format " + format,
         domain,
         "promote"
@@ -190,7 +219,7 @@ public class PrivilegeInitializer
     String id = domain + "-sync";
     createPrivilegeIfMissing(
         id,
-        "Sync " + repositoryName + " (" + format + ")",
+        "允许同步" + repositoryName + "仓库",
         "Permission to sync artifacts from remote repository " + repositoryName + " with format " + format,
         domain,
         "sync"
@@ -205,7 +234,7 @@ public class PrivilegeInitializer
     String domain = "nexus-artifacts-promotion-" + sanitize(repositoryName) + "-" + sanitize(format);
     String id = domain + "-promote";
     try {
-      securityConfigManager.deletePrivilege(id);
+      securityConfigManagerProvider.get().deletePrivilege(id);
       log.info("Deleted promotion privilege: {}", id);
     }
     catch (Exception e) {
@@ -221,7 +250,7 @@ public class PrivilegeInitializer
     String domain = "nexus-artifacts-sync-" + sanitize(repositoryName) + "-" + sanitize(format);
     String id = domain + "-sync";
     try {
-      securityConfigManager.deletePrivilege(id);
+      securityConfigManagerProvider.get().deletePrivilege(id);
       log.info("Deleted sync privilege: {}", id);
     }
     catch (Exception e) {
