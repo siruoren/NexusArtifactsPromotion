@@ -3,7 +3,6 @@ package com.nexus.artifacts.promotion.resource;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.validation.Valid;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.GET;
 import javax.ws.rs.POST;
@@ -130,7 +129,7 @@ public class PromotionResource implements Resource {
       @ApiResponse(code = 400, message = "Invalid request"),
       @ApiResponse(code = 403, message = "No promotion permission")
   })
-  public Response preview(@Valid final PromotionRequest request)
+  public Response preview(final PromotionRequest request)
   {
     try {
       request.validate();
@@ -170,7 +169,7 @@ public class PromotionResource implements Resource {
       @ApiResponse(code = 400, message = "Invalid request"),
       @ApiResponse(code = 403, message = "No promotion permission")
   })
-  public Response execute(@Valid final PromotionRequest request)
+  public Response execute(final PromotionRequest request)
   {
     try {
       request.validate();

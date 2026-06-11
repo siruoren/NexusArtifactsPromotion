@@ -3,7 +3,6 @@ package com.nexus.artifacts.promotion.resource;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.validation.Valid;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.GET;
 import javax.ws.rs.POST;
@@ -91,7 +90,7 @@ public class SyncResource implements Resource {
       @ApiResponse(code = 403, message = "No sync permission"),
       @ApiResponse(code = 503, message = "Sync queue full")
   })
-  public Response execute(@Valid final SyncRequest request)
+  public Response execute(final SyncRequest request)
   {
     try {
       request.validate();

@@ -167,14 +167,6 @@
       <scope>provided</scope>
     </dependency>
 
-    <!-- Validation -->
-    <dependency>
-      <groupId>javax.validation</groupId>
-      <artifactId>validation-api</artifactId>
-      <version>1.1.0.Final</version>
-      <scope>provided</scope>
-    </dependency>
-
     <!-- Swagger Annotations -->
     <dependency>
       <groupId>io.swagger</groupId>
@@ -229,7 +221,6 @@
               javax.inject;version="[1,2)",
               javax.servlet;version="[3,5)";resolution:=optional,
               javax.annotation;version="[1,2)",
-              javax.validation;version="[1,2)";resolution:=optional,
               org.slf4j;version="[1.7,2)",
               org.sonatype.nexus.*;version="[3.45,4)",
               com.google.inject;version="[1,5)",
