@@ -220,7 +220,7 @@ public class PromotionService {
         result.setStatus(TaskStatus.RUNNING.getValue());
 
         // Put initial result so frontend can poll immediately
-        taskResults.put(taskId, result);
+        taskResults.put(taskId, copyResult(result));
 
         List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
 
@@ -250,7 +250,7 @@ public class PromotionService {
           result.setEndTime(System.currentTimeMillis());
         }
 
-        taskResults.put(taskId, result);
+        taskResults.put(taskId, copyResult(result));
 
         return new TaskExecutorService.PromotionTaskCallback() {
           @Override public String getTaskId() { return taskId; }
@@ -816,16 +816,46 @@ public class PromotionService {
   }
 
   /**
+   * Create a deep copy of a PromotionTaskResult for thread-safe publishing.
+   * Each put into taskResults must use a copy so that the task thread's
+   * subsequent mutations don't affect the snapshot seen by polling threads.
+   */
+  private PromotionTaskResult copyResult(PromotionTaskResult src) {
+    if (src == null) return null;
+    PromotionTaskResult copy = new PromotionTaskResult();
+    copy.setTaskId(src.getTaskId());
+    copy.setSourceRepository(src.getSourceRepository());
+    copy.setTargetRepository(src.getTargetRepository());
+    copy.setStatus(src.getStatus());
+    copy.setUsername(src.getUsername());
+    copy.setStartTime(src.getStartTime());
+    copy.setEndTime(src.getEndTime());
+    copy.setErrorMessage(src.getErrorMessage());
+    if (src.getItems() != null) {
+      List<PromotionTaskResult.FileItem> itemsCopy = new ArrayList<>();
+      for (PromotionTaskResult.FileItem item : src.getItems()) {
+        PromotionTaskResult.FileItem itemCopy = new PromotionTaskResult.FileItem();
+        itemCopy.setPath(item.getPath());
+        itemCopy.setType(item.getType());
+        itemCopy.setStatus(item.getStatus());
+        itemCopy.setErrorMessage(item.getErrorMessage());
+        itemsCopy.add(itemCopy);
+      }
+      copy.setItems(itemsCopy);
+    }
+    return copy;
+  }
+
+  /**
    * Update task result with current progress (for polling).
    */
   private void updateTaskProgress(final PromotionTaskResult taskResult,
                                    final List<PromotionTaskResult.FileItem> items) {
     if (taskResult != null) {
-      taskResult.setItems(new ArrayList<>(items)); // Copy for thread safety
-      // Also update taskResults map so frontend can poll progress during task execution
+      taskResult.setItems(new ArrayList<>(items));
       String tid = taskResult.getTaskId();
       if (tid != null) {
-        taskResults.put(tid, taskResult);
+        taskResults.put(tid, copyResult(taskResult));
       }
     }
   }

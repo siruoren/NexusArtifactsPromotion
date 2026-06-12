@@ -1102,7 +1102,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               cancelBtn.setText(_t('promotion.result.close'));
               cancelBtn.enable();
               cancelBtn.setHandler(function () {
-                if (win._pollInterval) { clearInterval(win._pollInterval); }
+                if (win._pollInterval) {
+                  clearInterval(win._pollInterval);
+                  win._pollInterval = null;
+                }
                 win.close();
               });
 
@@ -1132,11 +1135,20 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
   startPollingInWindow: function (win, taskId, fileList, totalFiles) {
     var isFinished = false;
+    var pollCount = 0;
+    var MAX_POLLS = 400; // ~10 minutes at 1.5s interval
+
+    var stopPolling = function () {
+      if (win._pollInterval) {
+        clearInterval(win._pollInterval);
+        win._pollInterval = null;
+      }
+    };
 
     var finishProgress = function (result) {
       if (isFinished) return;
       isFinished = true;
-      if (win._pollInterval) { clearInterval(win._pollInterval); }
+      stopPolling();
 
       var grid = win.down('#fileGrid');
       var progressBar = win.down('#overallProgress');
@@ -1188,15 +1200,29 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     };
 
     var doPoll = function () {
+      if (isFinished || win.destroyed) {
+        stopPolling();
+        return;
+      }
+
+      pollCount++;
+      if (pollCount > MAX_POLLS) {
+        finishProgress({ status: 'FAILED', error: 'Polling timeout' });
+        return;
+      }
+
       apiRequest('GET', '/promotion/task/' + encodeURIComponent(taskId))
         .then(function (result) {
-          if (isFinished || win.destroyed) return;
+          if (isFinished || win.destroyed) {
+            stopPolling();
+            return;
+          }
 
           var grid = win.down('#fileGrid');
           var progressBar = win.down('#overallProgress');
 
           if (!grid || !progressBar || win.destroyed) {
-            if (win._pollInterval) { clearInterval(win._pollInterval); }
+            stopPolling();
             return;
           }
 
@@ -1237,6 +1263,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             var pct = total > 0 ? (processedCount / total) : 0;
             progressBar.setValue(pct);
             progressBar.setText(_t('promotion.progress.completed', processedCount, total));
+
+            // Also check: if all items in store have final status, task is done
+            if (processedCount >= total && total > 0) {
+              finishProgress({ status: 'COMPLETED' });
+              return;
+            }
           }
 
           // Check if task is done (handle both uppercase and lowercase status values)
@@ -1255,13 +1287,6 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     // Initial poll after short delay
     setTimeout(doPoll, 500);
-
-    // Timeout safety: 15 minutes max
-    setTimeout(function () {
-      if (!isFinished) {
-        finishProgress({ status: 'FAILED', error: 'Timeout waiting for promotion' });
-      }
-    }, 900000);
   },
 
   showPromotionResult: function (result, targetRepo) {
