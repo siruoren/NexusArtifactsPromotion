@@ -9,6 +9,9 @@ import org.apache.shiro.subject.Subject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.sonatype.nexus.repository.Repository;
+import org.sonatype.nexus.repository.manager.RepositoryManager;
+
 import com.nexus.artifacts.promotion.exception.PermissionDeniedException;
 
 /**
@@ -25,8 +28,24 @@ public class PermissionChecker {
 
   private static final Logger log = LoggerFactory.getLogger(PermissionChecker.class);
 
+  private final RepositoryManager repositoryManager;
+
   @Inject
-  public PermissionChecker() {
+  public PermissionChecker(final RepositoryManager repositoryManager) {
+    this.repositoryManager = repositoryManager;
+  }
+
+  /**
+   * Check if the current user has write (edit) permission on a repository.
+   * Reads the format from the repository directly, avoiding frontend format mismatch.
+   */
+  public boolean hasRepositoryWritePermission(final String repositoryName) {
+    Repository repo = repositoryManager.get(repositoryName);
+    if (repo == null) {
+      log.warn("Repository not found for write permission check: {}", repositoryName);
+      return false;
+    }
+    return hasRepositoryWritePermission(repositoryName, repo.getFormat().getValue());
   }
 
   /**
@@ -88,6 +107,17 @@ public class PermissionChecker {
   {
     return hasRepositoryReadPermission(sourceRepository, format)
         && hasRepositoryWritePermission(targetRepository, format);
+  }
+
+  /**
+   * Assert write permission on target repository, throwing exception if not authorized.
+   * Reads the format from the repository directly.
+   */
+  public void checkTargetWritePermission(final String targetRepository) {
+    if (!hasRepositoryWritePermission(targetRepository)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("edit", username, targetRepository);
+    }
   }
 
   /**

@@ -240,6 +240,42 @@ public class PromotionResource implements Resource {
   }
 
   /**
+   * Debug endpoint for collecting frontend instrumentation logs.
+   * Only active during debugging - remove before production release.
+   */
+  @GET
+  @Path("/_debug")
+  @Produces(MediaType.TEXT_PLAIN)
+  public Response debugLog(@QueryParam("event") final String event,
+                            @QueryParam("method") final String method,
+                            @QueryParam("path") final String path,
+                            @QueryParam("defaultHeaderKeys") final String defaultHeaderKeys,
+                            @QueryParam("csrfSource") final String csrfSource,
+                            @QueryParam("hasCsrf") final String hasCsrf,
+                            @QueryParam("cookieCount") final String cookieCount,
+                            @QueryParam("hasNXcoreui") final String hasNXcoreui,
+                            @QueryParam("hasNXview") final String hasNXview,
+                            @QueryParam("hasNXcomponent") final String hasNXcomponent,
+                            @QueryParam("hasFolderInfo") final String hasFolderInfo,
+                            @QueryParam("hasFolderProto") final String hasFolderProto,
+                            @QueryParam("xtype") final String xtype,
+                            @QueryParam("hasFolderModel") final String hasFolderModel,
+                            @QueryParam("overrideDone") final String overrideDone,
+                            @QueryParam("fmKeys") final String fmKeys,
+                            @QueryParam("folderKeys") final String folderKeys,
+                            @QueryParam("repoName") final String repoName,
+                            @QueryParam("path") final String pathVal)
+  {
+    log.info("[DEBUG-LOG] event={} method={} path={} headers={} csrf={} hasCsrf={} cookies={} " +
+             "coreui={} view={} component={} folderInfo={} folderProto={} " +
+             "xtype={} folderModel={} overrideDone={} fmKeys={} fKeys={} repoName={}",
+        event, method, path, defaultHeaderKeys, csrfSource, hasCsrf, cookieCount,
+        hasNXcoreui, hasNXview, hasNXcomponent, hasFolderInfo, hasFolderProto,
+        xtype, hasFolderModel, overrideDone, fmKeys, folderKeys, repoName);
+    return Response.ok().entity("ok").build();
+  }
+
+  /**
    * Sanitize output to prevent XSS.
    */
   private String sanitize(final String input) {

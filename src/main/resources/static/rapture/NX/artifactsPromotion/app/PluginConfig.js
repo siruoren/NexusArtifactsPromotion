@@ -20,7 +20,13 @@ Ext.define('NX.artifactsPromotion.app.PluginConfig', {
     {
       id: 'NX.artifactsPromotion.controller.Promotion',
       active: function () {
-        return NX.app.Application.bundleActive('nexus-artifacts-promotion-plugin');
+        try {
+          return NX.app.Application.bundleActive('nexus-artifacts-promotion-plugin');
+        }
+        catch (e) {
+          console.error('Promotion plugin load failed', e);
+          return false;
+        }
       }
     }
   ]
@@ -223,14 +229,28 @@ function sanitize(str) {
 
 function apiRequest(method, path, data) {
   return new Ext.Promise(function (resolve, reject) {
-    // Get CSRF token from cookie (Nexus uses NX-ANTI-CSRF-TOKEN)
+    // Build request options - inherit from Ext.Ajax defaultHeaders to get
+    // Nexus-native auth/CSRF tokens already configured by the framework
+    var defaultHeaders = Ext.Ajax.defaultHeaders || {};
     var csrfToken = null;
-    var cookies = document.cookie.split(';');
-    for (var i = 0; i < cookies.length; i++) {
-      var cookie = cookies[i].trim();
-      if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
-        csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
-        break;
+    var csrfSource = 'none';
+
+    // Try multiple sources for CSRF token (Nexus version dependent)
+    // Source 1: Already set in Ext.Ajax.defaultHeaders
+    if (defaultHeaders['NX-ANTI-CSRF-TOKEN']) {
+      csrfToken = defaultHeaders['NX-ANTI-CSRF-TOKEN'];
+      csrfSource = 'defaultHeaders';
+    }
+    // Source 2: Cookie (older Nexus versions)
+    if (!csrfToken) {
+      var cookies = document.cookie.split(';');
+      for (var i = 0; i < cookies.length; i++) {
+        var cookie = cookies[i].trim();
+        if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
+          csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
+          csrfSource = 'cookie';
+          break;
+        }
       }
     }
 
@@ -240,6 +260,7 @@ function apiRequest(method, path, data) {
       headers: {
         'Accept': 'application/json',
         'X-Nexus-UI': 'true'
+        // CSRF token added below if available
       },
       success: function (response) {
         var status = response.status;
@@ -257,12 +278,10 @@ function apiRequest(method, path, data) {
       failure: function (response) {
         var status = response.status;
         if (status === 401) {
-          // CSRF token mismatch or session expired
-          reject(new Error('Authentication required, please refresh the page and try again'));
+          reject(new Error('Authentication required (401): please refresh the page and try again'));
           return;
         }
         if (status === 403) {
-          // Try to parse the response body for username and repository info
           try {
             var errBody = Ext.decode(response.responseText);
             var permErr = new Error(errBody.error || 'No permission');
@@ -284,13 +303,19 @@ function apiRequest(method, path, data) {
         }
       }
     };
+
+    // Merge any existing default headers (auth, session, etc.)
+    Ext.applyIf(opts.headers, defaultHeaders);
+
     if (data) {
       opts.jsonData = data;
       opts.headers['Content-Type'] = 'application/json';
     }
+    // Always add CSRF token if found (overrides default)
     if (csrfToken) {
       opts.headers['NX-ANTI-CSRF-TOKEN'] = csrfToken;
     }
+
     Ext.Ajax.request(opts);
   });
 }
@@ -495,14 +520,36 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     // ComponentFolderInfo does not fire events on setModel,
     // so we override setModel to fire a custom 'folderupdated' event
-    // and store the folder model on the panel for later access
-    var origSetModel = NX.coreui.view.component.ComponentFolderInfo.prototype.setModel;
-    NX.coreui.view.component.ComponentFolderInfo.prototype.setModel = function (folder) {
-      origSetModel.call(this, folder);
-      // Store folder model on the panel instance for tryAddFolderButtons
-      this.folderModel = folder;
-      this.fireEvent('folderupdated', this, folder);
-    };
+    // and store the folder model on the panel for later access.
+    //
+    // Safe check for Nexus 3.45-3.70 compatibility.
+    // In some versions, ComponentFolderInfo may not exist at init time
+    // or may be under a different namespace, so we also add a fallback
+    // that polls for folderModel in onFolderInfoRender.
+    var folderProtoOverrideDone = false;
+    try {
+      if (NX.coreui && NX.coreui.view && NX.coreui.view.component &&
+          NX.coreui.view.component.ComponentFolderInfo &&
+          NX.coreui.view.component.ComponentFolderInfo.prototype &&
+          typeof NX.coreui.view.component.ComponentFolderInfo.prototype.setModel === 'function') {
+        var origSetModel = NX.coreui.view.component.ComponentFolderInfo.prototype.setModel;
+        NX.coreui.view.component.ComponentFolderInfo.prototype.setModel = function (folder) {
+          origSetModel.call(this, folder);
+          this.folderModel = folder;
+          this.fireEvent('folderupdated', this, folder);
+        };
+        folderProtoOverrideDone = true;
+        console.log('[Promotion] ComponentFolderInfo.setModel overridden successfully');
+      }
+      else {
+        console.warn('[Promotion] ComponentFolderInfo not available at init time, will use fallback');
+      }
+    } catch (e) {
+      console.warn('[Promotion] ComponentFolderInfo override failed:', e);
+    }
+
+    // Store flag for fallback detection
+    me._folderProtoOverrideDone = folderProtoOverrideDone;
 
     // Now listen for the custom event
     me.control({
@@ -526,36 +573,56 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   onFolderInfoRender: function (panel) {
     var me = this;
     me._currentFolderPanel = panel;
-    me.tryAddFolderButtons(panel);
-  },
 
-  onFolderInfoUpdated: function (panel, folder) {
-    var me = this;
-    // Ensure folderModel is set on the panel
-    if (folder) {
-      panel.folderModel = folder;
+    // Try immediately first
+    if (me.tryAddFolderButtons(panel)) {
+      return; // Success, no need to retry
     }
-    me.tryAddFolderButtons(panel);
+
+    // If prototype override failed (folderModel not set yet), retry with delay.
+    // setModel may be called afterrender in some Nexus versions.
+    var retryCount = 0;
+    var maxRetries = 8;
+    var retryInterval = 250; // ms
+
+    var doRetry = function () {
+      retryCount++;
+      if (me.tryAddFolderButtons(panel)) {
+        return; // Success
+      }
+      if (retryCount < maxRetries) {
+        Ext.defer(doRetry, retryInterval);
+      }
+      else {
+        console.warn('[Promotion] Folder buttons not added after', maxRetries, 'retries');
+      }
+    };
+    Ext.defer(doRetry, retryInterval);
   },
 
+  /**
+   * Try to add promotion/sync buttons to a folder info panel.
+   * @param {Object} panel The ComponentFolderInfo panel
+   * @return {boolean} true if buttons were added (or already exist), false if folderModel was missing
+   */
   tryAddFolderButtons: function (panel) {
     var me = this;
     try {
       var folderModel = panel.folderModel;
-      if (!folderModel) return;
+
+      if (!folderModel) return false;
 
       // folderModel may be an Ext.data.Model or a plain object
-      // Try both direct property access and get() method
-      var repoName = folderModel.repositoryName || (folderModel.get && folderModel.get('repositoryName'));
-      var path = folderModel.path || (folderModel.get && folderModel.get('path'));
+      // Nexus 3.60+ changed property names - use robust fallback chain
+      var repoName = folderModel.repositoryName
+        || folderModel.repository
+        || (folderModel.get && folderModel.get('repositoryName'))
+        || (folderModel.get && folderModel.get('repository'));
 
-      // Additional fallback: try common property names in Nexus folder models
-      if (!repoName) {
-        repoName = folderModel.repository || (folderModel.get && folderModel.get('repository'));
-      }
-      if (!path) {
-        path = folderModel.id || (folderModel.get && folderModel.get('id'));
-      }
+      var path = folderModel.path
+        || folderModel.name
+        || (folderModel.get && folderModel.get('path'))
+        || (folderModel.get && folderModel.get('name'));
 
       if (!repoName || !path) {
         // Fallback: try to get info from the panel's display fields
@@ -589,7 +656,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         }
       }
 
-      if (!repoName || !path) return;
+      if (!repoName || !path) return false;
 
       // Remove existing buttons to avoid duplicates
       var existingBtns = panel.query('button[cls=promotion-btn], button[cls=sync-btn]');
@@ -597,7 +664,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
       // Get format from repository state
       var format = me.getRepositoryFormat(repoName);
-      if (!format) return;
+      if (!format) return false;
 
       // Add promotion button for directory
       me.addPromotionButton(panel, repoName, path, format, true);
@@ -607,8 +674,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (isProxy) {
         me.addSyncButton(panel, repoName, path, format, true);
       }
+      return true;
     } catch (e) {
       // Silently fail
+      return false;
     }
   },
 

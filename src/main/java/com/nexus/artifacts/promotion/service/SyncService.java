@@ -21,6 +21,10 @@ import org.sonatype.nexus.repository.storage.StorageFacet;
 import org.sonatype.nexus.repository.storage.StorageTx;
 import org.sonatype.nexus.transaction.UnitOfWork;
 
+import org.apache.shiro.subject.Subject;
+import org.apache.shiro.subject.support.SubjectThreadState;
+import org.sonatype.nexus.security.SecurityHelper;
+
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
@@ -45,6 +49,7 @@ public class SyncService {
   private final TaskExecutorService taskExecutor;
   private final TaskCacheManager cacheManager;
   private final PermissionChecker permissionChecker;
+  private final SecurityHelper securityHelper;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -52,12 +57,14 @@ public class SyncService {
   public SyncService(final RepositoryManager repositoryManager,
                       final TaskExecutorService taskExecutor,
                       final TaskCacheManager cacheManager,
-                      final PermissionChecker permissionChecker)
+                      final PermissionChecker permissionChecker,
+                      final SecurityHelper securityHelper)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
+    this.securityHelper = securityHelper;
   }
 
   /**
@@ -80,71 +87,85 @@ public class SyncService {
 
     String username = permissionChecker.getCurrentUsername();
 
+    // Capture current Shiro subject before submitting to thread pool
+    Subject subject = securityHelper.subject();
+    final SubjectThreadState threadState = (subject != null && subject.isAuthenticated())
+        ? new SubjectThreadState(subject) : null;
+
     // Submit to thread pool with dedup handling
     String taskId = taskExecutor.submitSyncTask(() -> {
-      SyncTaskInfo taskInfo = new SyncTaskInfo();
-      taskInfo.setSourceRepository(request.getRepositoryName());
-      taskInfo.setPath(request.getPath());
-      taskInfo.setDirectory(request.isDirectory());
-      taskInfo.setFormat(request.getFormat());
-      taskInfo.setUsername(username);
-      taskInfo.setStartTime(System.currentTimeMillis());
-      taskInfo.setStatus(TaskStatus.RUNNING);
-
+      // Bind Shiro subject to this thread to preserve security context
+      if (threadState != null) {
+        threadState.bind();
+      }
       try {
-        // Re-check permission inside the task
-        if (!permissionChecker.hasSyncPermission(request.getRepositoryName(), request.getFormat())) {
-          throw new SecurityException("User no longer has sync permission for repository: " + request.getRepositoryName());
+        SyncTaskInfo taskInfo = new SyncTaskInfo();
+        taskInfo.setSourceRepository(request.getRepositoryName());
+        taskInfo.setPath(request.getPath());
+        taskInfo.setDirectory(request.isDirectory());
+        taskInfo.setFormat(request.getFormat());
+        taskInfo.setUsername(username);
+        taskInfo.setStartTime(System.currentTimeMillis());
+        taskInfo.setStatus(TaskStatus.RUNNING);
+
+        try {
+          // No need to re-check permission here - already checked at REST layer
+
+          Repository repo = repositoryManager.get(request.getRepositoryName());
+          if (repo == null) {
+            throw new IllegalArgumentException("Repository not found: " + request.getRepositoryName());
+          }
+
+          // Determine target repository (local cache of the proxy repo)
+          String targetRepo = determineLocalCacheRepo(repo);
+          taskInfo.setTargetRepository(targetRepo);
+
+          // Create task cache
+          cacheManager.createTaskCache("sync-" + System.currentTimeMillis());
+
+          // Execute sync
+          List<SyncTaskInfo.SyncFileDetail> syncedFiles;
+          if (request.isDirectory()) {
+            syncedFiles = syncDirectory(repo, request.getPath());
+          }
+          else {
+            syncedFiles = syncFile(repo, request.getPath());
+          }
+
+          taskInfo.setFileDetails(syncedFiles);
+          taskInfo.setStatus(TaskStatus.COMPLETED);
+          taskInfo.setEndTime(System.currentTimeMillis());
+          taskInfo.setResult("Synced " + syncedFiles.size() + " items");
+
+          log.info("Sync task completed: {} items synced from {}:{}",
+              syncedFiles.size(), request.getRepositoryName(), request.getPath());
+
+        }
+        catch (Exception e) {
+          log.error("Sync task failed: {}", e.getMessage(), e);
+          taskInfo.setStatus(TaskStatus.FAILED);
+          taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          taskInfo.setEndTime(System.currentTimeMillis());
+          taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
         }
 
-        Repository repo = repositoryManager.get(request.getRepositoryName());
-        if (repo == null) {
-          throw new IllegalArgumentException("Repository not found: " + request.getRepositoryName());
-        }
+        taskInfos.put(taskInfo.getTaskId(), taskInfo);
 
-        // Determine target repository (local cache of the proxy repo)
-        String targetRepo = determineLocalCacheRepo(repo);
-        taskInfo.setTargetRepository(targetRepo);
-
-        // Create task cache
-        cacheManager.createTaskCache("sync-" + System.currentTimeMillis());
-
-        // Execute sync
-        List<SyncTaskInfo.SyncFileDetail> syncedFiles;
-        if (request.isDirectory()) {
-          syncedFiles = syncDirectory(repo, request.getPath());
-        }
-        else {
-          syncedFiles = syncFile(repo, request.getPath());
-        }
-
-        taskInfo.setFileDetails(syncedFiles);
-        taskInfo.setStatus(TaskStatus.COMPLETED);
-        taskInfo.setEndTime(System.currentTimeMillis());
-        taskInfo.setResult("Synced " + syncedFiles.size() + " items");
-
-        log.info("Sync task completed: {} items synced from {}:{}",
-            syncedFiles.size(), request.getRepositoryName(), request.getPath());
-
+        return new TaskExecutorService.SyncTaskCallback() {
+          @Override
+          public String getTaskId() { return taskInfo.getTaskId(); }
+          @Override
+          public TaskStatus getStatus() { return taskInfo.getStatus(); }
+          @Override
+          public String getErrorMessage() { return taskInfo.getErrorMessage(); }
+        };
       }
-      catch (Exception e) {
-        log.error("Sync task failed: {}", e.getMessage(), e);
-        taskInfo.setStatus(TaskStatus.FAILED);
-        taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-        taskInfo.setEndTime(System.currentTimeMillis());
-        taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
+      finally {
+        // Clean up thread-local Shiro state
+        if (threadState != null) {
+          threadState.clear();
+        }
       }
-
-      taskInfos.put(taskInfo.getTaskId(), taskInfo);
-
-      return new TaskExecutorService.SyncTaskCallback() {
-        @Override
-        public String getTaskId() { return taskInfo.getTaskId(); }
-        @Override
-        public TaskStatus getStatus() { return taskInfo.getStatus(); }
-        @Override
-        public String getErrorMessage() { return taskInfo.getErrorMessage(); }
-      };
     }, String.format("Sync %s from %s", request.getPath(), request.getRepositoryName()),
         request.getRepositoryName(), request.getPath());
 

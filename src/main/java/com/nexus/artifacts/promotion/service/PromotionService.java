@@ -29,6 +29,10 @@ import org.sonatype.nexus.repository.storage.StorageTx;
 import org.sonatype.nexus.repository.view.Content;
 import org.sonatype.nexus.transaction.UnitOfWork;
 
+import org.apache.shiro.subject.Subject;
+import org.apache.shiro.subject.support.SubjectThreadState;
+import org.sonatype.nexus.security.SecurityHelper;
+
 import com.google.common.collect.ImmutableList;
 import com.nexus.artifacts.promotion.model.FilePreviewResponse;
 import com.nexus.artifacts.promotion.model.PromotionRequest;
@@ -52,6 +56,7 @@ public class PromotionService {
   private final TaskExecutorService taskExecutor;
   private final TaskCacheManager cacheManager;
   private final PermissionChecker permissionChecker;
+  private final SecurityHelper securityHelper;
 
   private final Map<String, PromotionTaskResult> taskResults = new ConcurrentHashMap<>();
 
@@ -59,23 +64,34 @@ public class PromotionService {
   public PromotionService(final RepositoryManager repositoryManager,
                            final TaskExecutorService taskExecutor,
                            final TaskCacheManager cacheManager,
-                           final PermissionChecker permissionChecker)
+                           final PermissionChecker permissionChecker,
+                           final SecurityHelper securityHelper)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
+    this.securityHelper = securityHelper;
   }
 
   /**
    * List target repositories where the current user has write permission,
    * filtered by same format as the source repository.
    * No special permission required on source repo - if user can see it, they can promote from it.
+   * Format is read from the source repository, not trusted from frontend input.
    */
   public TargetRepositoryList listTargetRepositories(final String sourceRepository, final String format) {
+    Repository sourceRepo = repositoryManager.get(sourceRepository);
+    if (sourceRepo == null) {
+      throw new IllegalArgumentException("Source repository not found: " + sourceRepository);
+    }
+
+    // Use actual format from source repository, not the frontend-provided format
+    String actualFormat = sourceRepo.getFormat().getValue();
+
     TargetRepositoryList result = new TargetRepositoryList();
     result.setSourceRepository(sourceRepository);
-    result.setFormat(format);
+    result.setFormat(actualFormat);
 
     List<TargetRepositoryList.TargetRepository> targets = new ArrayList<>();
 
@@ -83,11 +99,11 @@ public class PromotionService {
       if (repo.getName().equals(sourceRepository)) {
         continue;
       }
-      if (!repo.getFormat().getValue().equals(format)) {
+      if (!actualFormat.equals(repo.getFormat().getValue())) {
         continue;
       }
       // Only include repos where the current user has write (edit) permission
-      if (!permissionChecker.hasRepositoryWritePermission(repo.getName(), format)) {
+      if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) {
         continue;
       }
 
@@ -109,7 +125,7 @@ public class PromotionService {
   public FilePreviewResponse previewPromotion(final PromotionRequest request) {
     request.validate();
     // Only check write permission on target repo for preview
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository(), request.getFormat());
+    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
 
     Repository sourceRepo = repositoryManager.get(request.getSourceRepository());
     if (sourceRepo == null) {
@@ -168,79 +184,95 @@ public class PromotionService {
   /**
    * Execute artifact promotion.
    * Returns task ID for tracking.
+   * Permission is checked at REST layer; the async task binds the Shiro subject
+   * to avoid losing security context in the thread pool.
    */
   public String promote(final PromotionRequest request) {
     request.validate();
 
-    // Check write permission on target repository
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository(), request.getFormat());
+    // Check write permission on target repository at REST layer
+    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
 
+    // Capture current Shiro subject before submitting to thread pool
+    Subject subject = securityHelper.subject();
+    final SubjectThreadState threadState = (subject != null && subject.isAuthenticated())
+        ? new SubjectThreadState(subject) : null;
+
     return taskExecutor.submitPromotionTask(() -> {
-      String taskId = null;
-      PromotionTaskResult result = new PromotionTaskResult();
-      result.setSourceRepository(request.getSourceRepository());
-      result.setTargetRepository(request.getTargetRepository());
-      result.setUsername(username);
-      result.setStartTime(System.currentTimeMillis());
-
+      // Bind Shiro subject to this thread to preserve security context
+      if (threadState != null) {
+        threadState.bind();
+      }
       try {
-        taskId = cacheManager.createTaskCache("promo-" + System.currentTimeMillis()).getFileName().toString();
-        result.setTaskId(taskId);
+        String taskId = null;
+        PromotionTaskResult result = new PromotionTaskResult();
+        result.setSourceRepository(request.getSourceRepository());
+        result.setTargetRepository(request.getTargetRepository());
+        result.setUsername(username);
+        result.setStartTime(System.currentTimeMillis());
 
-        Repository sourceRepo = repositoryManager.get(request.getSourceRepository());
-        Repository targetRepo = repositoryManager.get(request.getTargetRepository());
+        try {
+          taskId = cacheManager.createTaskCache("promo-" + System.currentTimeMillis()).getFileName().toString();
+          result.setTaskId(taskId);
 
-        if (sourceRepo == null) {
-          throw new IllegalArgumentException("Source repository not found: " + request.getSourceRepository());
+          Repository sourceRepo = repositoryManager.get(request.getSourceRepository());
+          Repository targetRepo = repositoryManager.get(request.getTargetRepository());
+
+          if (sourceRepo == null) {
+            throw new IllegalArgumentException("Source repository not found: " + request.getSourceRepository());
+          }
+          if (targetRepo == null) {
+            throw new IllegalArgumentException("Target repository not found: " + request.getTargetRepository());
+          }
+
+          // No need to re-check permission here - already checked at REST layer
+
+          List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
+
+          if (request.isDirectory()) {
+            promotedItems = promoteDirectory(sourceRepo, targetRepo, request.getPath());
+          }
+          else {
+            promotedItems = promoteFile(sourceRepo, targetRepo, request.getPath());
+          }
+
+          result.setItems(promotedItems);
+          result.setStatus(TaskStatus.COMPLETED);
+          result.setEndTime(System.currentTimeMillis());
+
+          log.info("Promotion task {} completed: {} items promoted from {} to {}",
+              taskId, promotedItems.size(), request.getSourceRepository(), request.getTargetRepository());
+
         }
-        if (targetRepo == null) {
-          throw new IllegalArgumentException("Target repository not found: " + request.getTargetRepository());
+        catch (Exception e) {
+          log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
+          result.setStatus(TaskStatus.FAILED);
+          result.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          result.setEndTime(System.currentTimeMillis());
         }
 
-        // Re-check write permission inside the task
-        if (!permissionChecker.hasRepositoryWritePermission(request.getTargetRepository(), request.getFormat())) {
-          throw new SecurityException("User '" + username + "' no longer has write permission for repository: " + request.getTargetRepository());
+        if (taskId != null) {
+          taskResults.put(taskId, result);
         }
 
-        List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
-
-        if (request.isDirectory()) {
-          promotedItems = promoteDirectory(sourceRepo, targetRepo, request.getPath());
-        }
-        else {
-          promotedItems = promoteFile(sourceRepo, targetRepo, request.getPath());
-        }
-
-        result.setItems(promotedItems);
-        result.setStatus(TaskStatus.COMPLETED);
-        result.setEndTime(System.currentTimeMillis());
-
-        log.info("Promotion task {} completed: {} items promoted from {} to {}",
-            taskId, promotedItems.size(), request.getSourceRepository(), request.getTargetRepository());
-
+        final String finalTaskId = taskId;
+        return new TaskExecutorService.PromotionTaskCallback() {
+          @Override
+          public String getTaskId() { return finalTaskId; }
+          @Override
+          public TaskStatus getStatus() { return result.getStatus(); }
+          @Override
+          public String getErrorMessage() { return result.getErrorMessage(); }
+        };
       }
-      catch (Exception e) {
-        log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
-        result.setStatus(TaskStatus.FAILED);
-        result.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-        result.setEndTime(System.currentTimeMillis());
+      finally {
+        // Clean up thread-local Shiro state
+        if (threadState != null) {
+          threadState.clear();
+        }
       }
-
-      if (taskId != null) {
-        taskResults.put(taskId, result);
-      }
-
-      final String finalTaskId = taskId;
-      return new TaskExecutorService.PromotionTaskCallback() {
-        @Override
-        public String getTaskId() { return finalTaskId; }
-        @Override
-        public TaskStatus getStatus() { return result.getStatus(); }
-        @Override
-        public String getErrorMessage() { return result.getErrorMessage(); }
-      };
     }, String.format("Promote %s from %s to %s", request.getPath(),
         request.getSourceRepository(), request.getTargetRepository()));
   }

@@ -255,6 +255,15 @@ function apiRequest(method, path, data) {
       }
     }
 
+    // #region debug-point api-request-headers
+    console.warn('[PROMO-DEBUG] apiRequest:', {
+      method: method, path: path,
+      headerKeys: Object.keys(defaultHeaders),
+      csrfSource: csrfSource, hasCsrf: !!csrfToken,
+      cookieCount: document.cookie.split(';').length
+    });
+    // #endregion
+
     var opts = {
       method: method,
       url: '/service/rest/v1' + path,
@@ -528,6 +537,17 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     // or may be under a different namespace, so we also add a fallback
     // that polls for folderModel in onFolderInfoRender.
     var folderProtoOverrideDone = false;
+
+    // #region debug-point init-nx-coreui-check
+    console.warn('[PROMO-DEBUG] init-check:', {
+      hasNXcoreui: typeof NX !== 'undefined' && !!NX.coreui,
+      hasNXview: typeof NX !== 'undefined' && NX.coreui && !!NX.coreui.view,
+      hasNXcomponent: typeof NX !== 'undefined' && NX.coreui && NX.coreui.view && !!NX.coreui.view.component,
+      hasFolderInfo: typeof NX !== 'undefined' && NX.coreui && NX.coreui.view && NX.coreui.view.component && !!NX.coreui.view.component.ComponentFolderInfo,
+      hasFolderProto: typeof NX !== 'undefined' && NX.coreui && NX.coreui.view && NX.coreui.view.component && NX.coreui.view.component.ComponentFolderInfo && !!NX.coreui.view.component.ComponentFolderInfo.prototype
+    });
+    // #endregion
+
     try {
       if (NX.coreui && NX.coreui.view && NX.coreui.view.component &&
           NX.coreui.view.component.ComponentFolderInfo &&
@@ -538,6 +558,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           origSetModel.call(this, folder);
           this.folderModel = folder;
           this.fireEvent('folderupdated', this, folder);
+
+          // #region debug-point setmodel-called
+          console.warn('[PROMO-DEBUG] setModel called:', {
+            folderKeys: folder ? Object.keys(folder) : null,
+            repoName: folder ? (folder.repositoryName || folder.repository || 'N/A') : 'N/A',
+            path: folder ? (folder.path || folder.name || 'N/A') : 'N/A'
+          });
+          // #endregion
         };
         folderProtoOverrideDone = true;
         console.log('[Promotion] ComponentFolderInfo.setModel overridden successfully');
@@ -575,6 +603,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var me = this;
     me._currentFolderPanel = panel;
 
+    // #region debug-point folder-render
+    console.warn('[PROMO-DEBUG] folder-render:', {
+      xtype: panel.xtype || 'unknown',
+      hasFolderModel: !!panel.folderModel,
+      overrideDone: me._folderProtoOverrideDone
+    });
+    // #endregion
+
     // Try immediately first
     if (me.tryAddFolderButtons(panel)) {
       return; // Success, no need to retry
@@ -610,6 +646,13 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var me = this;
     try {
       var folderModel = panel.folderModel;
+
+      // #region debug-point try-add-folder
+      console.warn('[PROMO-DEBUG] tryAddFolderButtons:', {
+        hasFolderModel: !!folderModel,
+        fmKeys: folderModel ? Object.keys(folderModel) : null
+      });
+      // #endregion
 
       if (!folderModel) return false;
 
