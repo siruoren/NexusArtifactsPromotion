@@ -1014,18 +1014,91 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
   pollPromotionTask: function (taskId, targetRepo) {
     var me = this;
-    var pollInterval = setInterval(function () {
+
+    // Create a progress window that stays open during promotion
+    var progressWin = Ext.create('Ext.window.Window', {
+      title: _t('promotion.modal.promoting'),
+      width: 650,
+      height: 450,
+      modal: true,
+      closable: false,
+      layout: 'fit',
+      items: [{
+        xtype: 'panel',
+        layout: {
+          type: 'vbox',
+          align: 'stretch'
+        },
+        items: [
+          {
+            xtype: 'displayfield',
+            value: '<b>' + sanitize(targetRepo) + '</b>',
+            labelWidth: 120,
+            fieldLabel: _t('promotion.result.targetRepository')
+          },
+          {
+            xtype: 'gridpanel',
+            flex: 1,
+            itemId: 'progressGrid',
+            store: {
+              fields: ['path', 'action', 'status'],
+              data: []
+            },
+            columns: [
+              { text: 'File Path', dataIndex: 'path', flex: 2, cellWrap: true },
+              {
+                text: 'Action', dataIndex: 'action', width: 80,
+                renderer: function (val) {
+                  if (!val) return '';
+                  return val === 'CREATED'
+                    ? '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.modal.action.new') + '</span>'
+                    : '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.modal.action.update') + '</span>';
+                }
+              },
+              { text: 'Status', dataIndex: 'status', width: 100 }
+            ]
+          }
+        ]
+      }]
+    });
+    progressWin.show();
+
+    // Poll for status updates
+    var pollCount = 0;
+    var maxPolls = 300; // 10 minutes at 2s intervals
+
+    var doPoll = function () {
+      pollCount++;
+      if (pollCount > maxPolls) {
+        clearInterval(pollInterval);
+        progressWin.close();
+        me.showPromotionResult({status: 'FAILED', error: 'Timeout waiting for promotion'}, targetRepo);
+        return;
+      }
+
       apiRequest('GET', '/promotion/task/' + encodeURIComponent(taskId))
         .then(function (result) {
+          var grid = progressWin.down('#progressGrid');
+          if (grid && result.items && result.items.length > 0) {
+            grid.getStore().loadData(result.items);
+          }
+
           if (result.status === 'COMPLETED' || result.status === 'FAILED') {
             clearInterval(pollInterval);
+            progressWin.close();
             me.showPromotionResult(result, targetRepo);
           }
         })
         .catch(function () {
           clearInterval(pollInterval);
+          progressWin.close();
         });
-    }, 2000);
+    };
+
+    var pollInterval = setInterval(doPoll, 2000);
+
+    // Initial poll after short delay
+    setTimeout(doPoll, 500);
   },
 
   showPromotionResult: function (result, targetRepo) {
@@ -1033,18 +1106,23 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var title = isSuccess ? _t('promotion.result.title.success') : _t('promotion.result.title.failed');
     var items = '';
 
-    if (result.files && result.files.length > 0) {
+    // New format: items have path (full repo/path), action (CREATED/UPDATED), status
+    if (result.items && result.items.length > 0) {
       items = '<ul>';
-      Ext.each(result.files, function (file) {
-        var action = file.existsInTarget ? _t('promotion.modal.action.update') : _t('promotion.modal.action.new');
-        items += '<li>' + sanitize(file.path) + ' - ' + action + '</li>';
+      Ext.each(result.items, function (item) {
+        var action = item.action === 'CREATED'
+          ? _t('promotion.modal.action.new')
+          : _t('promotion.modal.action.update');
+        var statusIcon = item.status === 'failed' ? ' [FAILED]' : '';
+        var path = sanitize(item.path || '');
+        items += '<li>' + path + ' - ' + action + statusIcon + '</li>';
       });
       items += '</ul>';
     }
 
     var win = Ext.create('Ext.window.Window', {
       title: title,
-      width: 500,
+      width: 550,
       modal: true,
       layout: 'fit',
       items: [{
@@ -1052,7 +1130,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         bodyPadding: 15,
         html: '<p><b>' + _t('promotion.result.targetRepository') + '</b> ' + sanitize(targetRepo) + '</p>' +
               '<p><b>' + _t('promotion.result.status') + '</b> ' + sanitize(result.status) + '</p>' +
-              (result.error ? '<p><b>' + _t('promotion.result.error') + '</b> ' + sanitize(result.error) + '</p>' : '') +
+              (result.errorMessage ? '<p><b>' + _t('promotion.result.error') + '</b> ' + sanitize(result.errorMessage) + '</p>' : '') +
               (items ? '<p><b>' + _t('promotion.result.items') + '</b></p>' + items : '')
       }],
       buttons: [

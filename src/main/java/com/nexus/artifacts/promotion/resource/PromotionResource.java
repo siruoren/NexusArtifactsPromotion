@@ -3,6 +3,7 @@ package com.nexus.artifacts.promotion.resource;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
+import javax.servlet.http.HttpServletRequest;
 import javax.ws.rs.Consumes;
 import javax.ws.rs.GET;
 import javax.ws.rs.POST;
@@ -10,6 +11,8 @@ import javax.ws.rs.Path;
 import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
+import javax.ws.rs.core.Context;
+import javax.ws.rs.core.HttpHeaders;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
@@ -132,11 +135,13 @@ public class PromotionResource implements Resource {
       @ApiResponse(code = 400, message = "Invalid request"),
       @ApiResponse(code = 403, message = "No promotion permission")
   })
-  public Response preview(final PromotionRequest request)
+  public Response preview(final PromotionRequest request,
+                           @Context final HttpServletRequest httpRequest)
   {
     try {
       request.validate();
-      FilePreviewResponse preview = promotionService.previewPromotion(request);
+      String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
+      FilePreviewResponse preview = promotionService.previewPromotion(request, nexusBaseUrl);
       return Response.ok(preview).build();
     }
     catch (IllegalArgumentException e) {
@@ -174,11 +179,17 @@ public class PromotionResource implements Resource {
       @ApiResponse(code = 400, message = "Invalid request"),
       @ApiResponse(code = 403, message = "No promotion permission")
   })
-  public Response execute(final PromotionRequest request)
+  public Response execute(final PromotionRequest request,
+                           @Context final HttpHeaders httpHeaders,
+                           @Context final HttpServletRequest httpRequest)
   {
     try {
       request.validate();
-      String taskId = promotionService.promote(request);
+      // Extract user's Cookie header for HTTP-based authentication
+      String cookieHeader = httpHeaders.getHeaderString(HttpHeaders.COOKIE);
+      // Extract Nexus base URL from incoming request
+      String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
+      String taskId = promotionService.promote(request, cookieHeader, nexusBaseUrl);
       return Response.ok()
           .entity("{\"taskId\":\"" + sanitize(taskId) + "\",\"status\":\"submitted\"}")
           .build();
@@ -273,6 +284,34 @@ public class PromotionResource implements Resource {
         hasNXcoreui, hasNXview, hasNXcomponent, hasFolderInfo, hasFolderProto,
         xtype, hasFolderModel, overrideDone, fmKeys, folderKeys, repoName);
     return Response.ok().entity("ok").build();
+  }
+
+  /**
+   * Extract Nexus base URL from incoming HTTP request.
+   * Supports reverse proxies (X-Forwarded-Proto/Host) and HTTPS with self-signed certs.
+   */
+  private String extractNexusBaseUrl(final HttpServletRequest request) {
+    // Check for reverse proxy headers first
+    String proto = request.getHeader("X-Forwarded-Proto");
+    if (proto == null || proto.isEmpty()) {
+      proto = request.getHeader("X-Forwarded-Scheme");
+    }
+    if (proto == null || proto.isEmpty()) {
+      proto = request.getScheme();
+    }
+
+    String host = request.getHeader("X-Forwarded-Host");
+    if (host == null || host.isEmpty()) {
+      host = request.getHeader("Host");
+    }
+    if (host == null || host.isEmpty()) {
+      host = request.getServerName() + ":" + request.getServerPort();
+    }
+
+    // Remove port for default ports
+    String baseUrl = proto + "://" + host;
+    log.debug("Extracted Nexus base URL: {}", baseUrl);
+    return baseUrl;
   }
 
   /**

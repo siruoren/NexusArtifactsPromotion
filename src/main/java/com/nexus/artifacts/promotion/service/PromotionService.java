@@ -2,8 +2,12 @@ package com.nexus.artifacts.promotion.service;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -11,23 +15,16 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import javax.ws.rs.core.HttpHeaders;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.sonatype.nexus.blobstore.api.Blob;
-import org.sonatype.nexus.blobstore.api.BlobRef;
-import org.sonatype.nexus.repository.Format;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
-import org.sonatype.nexus.repository.storage.Asset;
-import org.sonatype.nexus.repository.storage.AssetBlob;
-import org.sonatype.nexus.repository.storage.Bucket;
-import org.sonatype.nexus.repository.storage.Component;
-import org.sonatype.nexus.repository.storage.Query;
-import org.sonatype.nexus.repository.storage.StorageFacet;
-import org.sonatype.nexus.repository.storage.StorageTx;
-import org.sonatype.nexus.repository.view.Content;
-import org.sonatype.nexus.transaction.UnitOfWork;
 
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.subject.support.SubjectThreadState;
@@ -43,14 +40,44 @@ import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 /**
  * Service for artifact promotion between repositories.
- * Supports promotion of directories, files, and images (Docker).
- * Idempotent: same path syncs update existing content in target.
+ * Uses HTTP download/upload approach to avoid StorageTx transaction state issues.
  */
 @Named
 @Singleton
 public class PromotionService {
 
   private static final Logger log = LoggerFactory.getLogger(PromotionService.class);
+
+  /** Connection/read timeout in milliseconds */
+  private static final int TIMEOUT_MS = 300_000; // 5 minutes
+
+  /** Buffer size for streaming */
+  private static final int BUFFER_SIZE = 8192;
+
+  /**
+   * Trust-all-SSL manager for self-signed certificates.
+   * Initialized once at class load time.
+   */
+  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
+      new X509TrustManager() {
+        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
+        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
+      }
+  };
+
+  static {
+    try {
+      SSLContext sc = SSLContext.getInstance("TLS");
+      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
+      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
+      log.info("SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
+    }
+    catch (Exception e) {
+      log.warn("Failed to initialize SSL trust manager: {}", e.getMessage(), e);
+    }
+  }
 
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
@@ -74,19 +101,16 @@ public class PromotionService {
     this.securityHelper = securityHelper;
   }
 
+  // ==================== Public API ====================
+
   /**
-   * List target repositories where the current user has write permission,
-   * filtered by same format as the source repository.
-   * No special permission required on source repo - if user can see it, they can promote from it.
-   * Format is read from the source repository, not trusted from frontend input.
+   * List target repositories where the current user has write permission.
    */
   public TargetRepositoryList listTargetRepositories(final String sourceRepository, final String format) {
     Repository sourceRepo = repositoryManager.get(sourceRepository);
     if (sourceRepo == null) {
       throw new IllegalArgumentException("Source repository not found: " + sourceRepository);
     }
-
-    // Use actual format from source repository, not the frontend-provided format
     String actualFormat = sourceRepo.getFormat().getValue();
 
     TargetRepositoryList result = new TargetRepositoryList();
@@ -94,25 +118,12 @@ public class PromotionService {
     result.setFormat(actualFormat);
 
     List<TargetRepositoryList.TargetRepository> targets = new ArrayList<>();
-
     for (Repository repo : repositoryManager.browse()) {
-      if (repo.getName().equals(sourceRepository)) {
-        continue;
-      }
-      if (!actualFormat.equals(repo.getFormat().getValue())) {
-        continue;
-      }
-      // Only include repos where the current user has write (edit) permission
-      if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) {
-        continue;
-      }
-
+      if (repo.getName().equals(sourceRepository)) continue;
+      if (!actualFormat.equals(repo.getFormat().getValue())) continue;
+      if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) continue;
       targets.add(new TargetRepositoryList.TargetRepository(
-          repo.getName(),
-          repo.getFormat().getValue(),
-          repo.getType().getValue(),
-          repo.getUrl()
-      ));
+          repo.getName(), repo.getFormat().getValue(), repo.getType().getValue(), repo.getUrl()));
     }
 
     result.setRepositories(targets);
@@ -121,16 +132,11 @@ public class PromotionService {
 
   /**
    * Preview files that will be involved in a promotion.
+   * Uses search API to find files matching the path prefix.
    */
-  public FilePreviewResponse previewPromotion(final PromotionRequest request) {
+  public FilePreviewResponse previewPromotion(final PromotionRequest request, final String nexusBaseUrl) {
     request.validate();
-    // Only check write permission on target repo for preview
     permissionChecker.checkTargetWritePermission(request.getTargetRepository());
-
-    Repository sourceRepo = repositoryManager.get(request.getSourceRepository());
-    if (sourceRepo == null) {
-      throw new IllegalArgumentException("Source repository not found: " + request.getSourceRepository());
-    }
 
     FilePreviewResponse preview = new FilePreviewResponse();
     preview.setSourceRepository(request.getSourceRepository());
@@ -140,43 +146,33 @@ public class PromotionService {
     List<FilePreviewResponse.FileEntry> files = new ArrayList<>();
 
     try {
-      StorageFacet storageFacet = sourceRepo.facet(StorageFacet.class);
-      final StorageTx tx = storageFacet.txSupplier().get();
-      boolean committed = false;
-      try {
-        Query query = Query.builder()
-            .where("name").like(escapeLike(request.getPath()) + "%")
-            .build();
+      // Search for assets under the given path using REST API
+      List<String> assetNames = searchAssets(request.getSourceRepository(), request.getPath(), nexusBaseUrl);
 
-        Iterable<Asset> assets = tx.findAssets(query, Collections.singletonList(sourceRepo));
-
-        int count = 0;
-        long totalSize = 0;
-        for (Asset asset : assets) {
-          String assetName = asset.name();
-          String type = determineType(assetName);
-          long size = asset.size();
-          totalSize += size;
-          count++;
-
-          boolean existsInTarget = checkExistsInTarget(request.getTargetRepository(), assetName);
-          files.add(new FilePreviewResponse.FileEntry(assetName, type, size, existsInTarget));
+      if (assetNames.isEmpty()) {
+        // If search returns nothing, treat the path itself as a single file/directory
+        if (request.isDirectory()) {
+          files.add(new FilePreviewResponse.FileEntry(
+              request.getPath(), "directory", 0, false));
+        } else {
+          files.add(new FilePreviewResponse.FileEntry(
+              request.getPath(), "file", 0, false));
         }
-        preview.setTotalCount(count);
-        preview.setTotalSize(totalSize);
-        tx.commit();
-        committed = true;
+      } else {
+        for (String name : assetNames) {
+          String type = determineType(name);
+          boolean existsInTarget = checkExistsViaHttp(request.getTargetRepository(), name, nexusBaseUrl);
+          files.add(new FilePreviewResponse.FileEntry(name, type, 0, existsInTarget));
+        }
       }
-      finally {
-        if (!committed) { tx.rollback(); }
-      }
+      preview.setTotalCount(files.size());
     }
     catch (Exception e) {
       log.error("Failed to preview promotion files: {}", e.getMessage(), e);
-      files.add(new FilePreviewResponse.FileEntry(request.getPath(),
+      files.add(new FilePreviewResponse.FileEntry(
+          request.getPath(),
           request.isDirectory() ? "directory" : "file", 0, false));
       preview.setTotalCount(1);
-      preview.setTotalSize(0);
     }
 
     preview.setFiles(files);
@@ -186,24 +182,23 @@ public class PromotionService {
   /**
    * Execute artifact promotion.
    * Returns task ID for tracking.
-   * Permission is checked at REST layer; the async task binds the Shiro subject
-   * to avoid losing security context in the thread pool.
+   * @param cookieHeader The raw Cookie header from the user's HTTP request for authentication
+   * @param nexusBaseUrl The Nexus base URL (scheme://host:port) extracted from the incoming request
    */
-  public String promote(final PromotionRequest request) {
+  public String promote(final PromotionRequest request,
+                         final String cookieHeader,
+                         final String nexusBaseUrl)
+  {
     request.validate();
-
-    // Check write permission on target repository at REST layer
     permissionChecker.checkTargetWritePermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
 
-    // Capture current Shiro subject before submitting to thread pool
     Subject subject = securityHelper.subject();
     final SubjectThreadState threadState = (subject != null && subject.isAuthenticated())
         ? new SubjectThreadState(subject) : null;
 
     return taskExecutor.submitPromotionTask(() -> {
-      // Bind Shiro subject to this thread to preserve security context
       if (threadState != null) {
         threadState.bind();
       }
@@ -219,34 +214,24 @@ public class PromotionService {
           taskId = cacheManager.createTaskCache("promo-" + System.currentTimeMillis()).getFileName().toString();
           result.setTaskId(taskId);
 
-          Repository sourceRepo = repositoryManager.get(request.getSourceRepository());
-          Repository targetRepo = repositoryManager.get(request.getTargetRepository());
-
-          if (sourceRepo == null) {
-            throw new IllegalArgumentException("Source repository not found: " + request.getSourceRepository());
-          }
-          if (targetRepo == null) {
-            throw new IllegalArgumentException("Target repository not found: " + request.getTargetRepository());
-          }
-
-          // No need to re-check permission here - already checked at REST layer
-
           List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
 
           if (request.isDirectory()) {
-            promotedItems = promoteDirectory(sourceRepo, targetRepo, request.getPath());
-          }
-          else {
-            promotedItems = promoteFile(sourceRepo, targetRepo, request.getPath());
+            promotedItems = promoteDirectoryViaHttp(
+                request.getSourceRepository(), request.getTargetRepository(),
+                request.getPath(), cookieHeader, result, nexusBaseUrl);
+          } else {
+            promotedItems = promoteFileViaHttp(
+                request.getSourceRepository(), request.getTargetRepository(),
+                request.getPath(), cookieHeader, nexusBaseUrl);
           }
 
           result.setItems(promotedItems);
           result.setStatus(TaskStatus.COMPLETED);
           result.setEndTime(System.currentTimeMillis());
 
-          log.info("Promotion task {} completed: {} items promoted from {} to {}",
+          log.info("Promotion task {} completed: {} items from {} to {}",
               taskId, promotedItems.size(), request.getSourceRepository(), request.getTargetRepository());
-
         }
         catch (Exception e) {
           log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
@@ -261,16 +246,12 @@ public class PromotionService {
 
         final String finalTaskId = taskId;
         return new TaskExecutorService.PromotionTaskCallback() {
-          @Override
-          public String getTaskId() { return finalTaskId; }
-          @Override
-          public TaskStatus getStatus() { return result.getStatus(); }
-          @Override
-          public String getErrorMessage() { return result.getErrorMessage(); }
+          @Override public String getTaskId() { return finalTaskId; }
+          @Override public TaskStatus getStatus() { return result.getStatus(); }
+          @Override public String getErrorMessage() { return result.getErrorMessage(); }
         };
       }
       finally {
-        // Clean up thread-local Shiro state
         if (threadState != null) {
           threadState.clear();
         }
@@ -286,45 +267,57 @@ public class PromotionService {
     return taskResults.get(taskId);
   }
 
+  // ==================== HTTP-based Promotion Logic ====================
+
   /**
-   * Promote all files in a directory.
+   * Promote all files in a directory via HTTP download/upload.
+   * Updates task result with progress info for real-time status polling.
    */
-  private List<PromotionTaskResult.FileItem> promoteDirectory(final Repository sourceRepo,
-                                                               final Repository targetRepo,
-                                                               final String directoryPath)
+  private List<PromotionTaskResult.FileItem> promoteDirectoryViaHttp(
+      final String sourceRepo,
+      final String targetRepo,
+      final String directoryPath,
+      final String cookieHeader,
+      final PromotionTaskResult taskResult,
+      final String nexusBaseUrl) throws IOException
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
 
     try {
-      StorageFacet sourceStorage = sourceRepo.facet(StorageFacet.class);
-      final StorageTx tx = sourceStorage.txSupplier().get();
-      boolean committed = false;
-      try {
-        Query query = Query.builder()
-            .where("name").like(escapeLike(directoryPath) + "%")
-            .build();
+      // Search for all assets under the directory path
+      List<String> assetNames = searchAssets(sourceRepo, directoryPath, nexusBaseUrl);
 
-        Iterable<Asset> assets = tx.findAssets(query, Collections.singletonList(sourceRepo));
-
-        for (Asset asset : assets) {
-          try {
-            PromotionTaskResult.FileItem item = promoteSingleAsset(sourceRepo, targetRepo, tx, asset);
-            items.add(item);
-          }
-          catch (Exception e) {
-            log.error("Failed to promote asset {}: {}", asset.name(), e.getMessage());
-            PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(
-                asset.name(), PromotionTaskResult.FileAction.UPDATED, determineType(asset.name()));
-            item.setStatus("failed");
-            item.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-            items.add(item);
-          }
-        }
-        tx.commit();
-        committed = true;
+      if (assetNames.isEmpty()) {
+        // Treat as single item if no sub-files found
+        PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
+            sourceRepo, targetRepo, directoryPath, cookieHeader, nexusBaseUrl);
+        items.add(item);
+        updateTaskProgress(taskResult, items);
+        return items;
       }
-      finally {
-        if (!committed) { tx.rollback(); }
+
+      int total = assetNames.size();
+      for (int i = 0; i < total; i++) {
+        String assetName = assetNames.get(i);
+        log.info("[PROMO-PROGRESS] [{}/{}] Promoting: {}", i + 1, total,
+            sourceRepo + "/" + assetName);
+
+        try {
+          PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
+              sourceRepo, targetRepo, assetName, cookieHeader, nexusBaseUrl);
+          items.add(item);
+        }
+        catch (Exception e) {
+          log.error("Failed to promote {}: {}", assetName, e.getMessage());
+          PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(
+              sourceRepo + "/" + assetName, PromotionTaskResult.FileAction.UPDATED, determineType(assetName));
+          failedItem.setStatus("failed");
+          failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          items.add(failedItem);
+        }
+
+        // Update task result so frontend can poll progress
+        updateTaskProgress(taskResult, items);
       }
     }
     catch (Exception e) {
@@ -336,157 +329,310 @@ public class PromotionService {
   }
 
   /**
-   * Promote a single file.
+   * Promote a single file via HTTP download/upload.
    */
-  private List<PromotionTaskResult.FileItem> promoteFile(final Repository sourceRepo,
-                                                          final Repository targetRepo,
-                                                          final String filePath)
+  private List<PromotionTaskResult.FileItem> promoteFileViaHttp(
+      final String sourceRepo,
+      final String targetRepo,
+      final String filePath,
+      final String cookieHeader,
+      final String nexusBaseUrl) throws IOException
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
-
     try {
-      StorageFacet sourceStorage = sourceRepo.facet(StorageFacet.class);
-      final StorageTx tx = sourceStorage.txSupplier().get();
-      boolean committed = false;
-      try {
-        Bucket bucket = tx.findBucket(sourceRepo);
-        Asset asset = tx.findAssetWithProperty("name", filePath, bucket);
-        if (asset == null) {
-          throw new IllegalArgumentException("Asset not found: " + filePath);
-        }
-        items.add(promoteSingleAsset(sourceRepo, targetRepo, tx, asset));
-        tx.commit();
-        committed = true;
-      }
-      finally {
-        if (!committed) { tx.rollback(); }
-      }
+      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, nexusBaseUrl);
+      items.add(item);
     }
     catch (Exception e) {
       log.error("Failed to promote file {}: {}", filePath, e.getMessage(), e);
-      throw new RuntimeException("File promotion failed", e);
+      throw new RuntimeException("File promotion failed: " + sanitizeErrorMessage(e.getMessage()), e);
     }
-
     return items;
   }
 
   /**
-   * Promote a single asset from source to target repository.
-   * Idempotent: if the asset already exists in target, it is updated.
+   * Core method: download a file from source repo and upload to target repo via HTTP.
    */
-  private PromotionTaskResult.FileItem promoteSingleAsset(final Repository sourceRepo,
-                                                           final Repository targetRepo,
-                                                           final StorageTx sourceTx,
-                                                           final Asset sourceAsset)
+  private PromotionTaskResult.FileItem promoteSingleFileViaHttp(
+      final String sourceRepo,
+      final String targetRepo,
+      final String filePath,
+      final String cookieHeader,
+      final String nexusBaseUrl) throws IOException
   {
-    String assetName = sourceAsset.name();
-    String type = determineType(assetName);
+    String fullSourcePath = sourceRepo + "/" + filePath;
+    log.debug("Promoting via HTTP: {} -> {}/{}", fullSourcePath, targetRepo, filePath);
 
-    boolean existsInTarget = checkExistsInTarget(targetRepo.getName(), assetName);
+    // Check if already exists in target
+    boolean existsInTarget = checkExistsViaHttp(targetRepo, filePath, nexusBaseUrl);
     PromotionTaskResult.FileAction action = existsInTarget
-        ? PromotionTaskResult.FileAction.UPDATED
-        : PromotionTaskResult.FileAction.CREATED;
+        ? PromotionTaskResult.FileAction.UPDATED : PromotionTaskResult.FileAction.CREATED;
 
+    // Download from source
+    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
+    HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    downloadConn.setRequestMethod("GET");
+    downloadConn.setConnectTimeout(TIMEOUT_MS);
+    downloadConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(downloadConn, cookieHeader);
+
+    int responseCode = downloadConn.getResponseCode();
+    if (responseCode != 200) {
+      String errorMsg = readErrorResponse(downloadConn);
+      downloadConn.disconnect();
+      throw new IOException("Download from " + fullSourcePath + " failed: HTTP " + responseCode + " - " + errorMsg);
+    }
+
+    // Upload to target
+    URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
+    HttpURLConnection uploadConn = (HttpURLConnection) targetUrl.openConnection();
+    uploadConn.setRequestMethod("PUT");
+    uploadConn.setDoOutput(true);
+    uploadConn.setConnectTimeout(TIMEOUT_MS);
+    uploadConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(uploadConn, cookieHeader);
+
+    // Stream content from download to upload
+    try (InputStream input = downloadConn.getInputStream();
+         OutputStream output = uploadConn.getOutputStream()) {
+
+      byte[] buffer = new byte[BUFFER_SIZE];
+      int bytesRead;
+      while ((bytesRead = input.read(buffer)) != -1) {
+        output.write(buffer, 0, bytesRead);
+      }
+      output.flush();
+    }
+    finally {
+      downloadConn.disconnect();
+    }
+
+    int uploadResponse = uploadConn.getResponseCode();
+    String uploadMsg = "";
+    if (uploadResponse >= 400) {
+      uploadMsg = readErrorResponse(uploadConn);
+    }
+    uploadConn.disconnect();
+
+    if (uploadResponse < 200 || uploadResponse > 299) {
+      throw new IOException("Upload to " + targetRepo + "/" + filePath +
+          " failed: HTTP " + uploadResponse + " - " + uploadMsg);
+    }
+
+    log.info("Successfully promoted: {} -> {}/{} ({})",
+        fullSourcePath, targetRepo, filePath, action);
+    return new PromotionTaskResult.FileItem(fullSourcePath, action, determineType(filePath));
+  }
+
+  // ==================== Helper Methods ====================
+
+  /**
+   * Search for assets under a path prefix using Nexus search API.
+   */
+  private List<String> searchAssets(final String repository, final String pathPrefix, final String nexusBaseUrl) throws IOException {
+    List<String> results = new ArrayList<>();
     try {
-      BlobRef blobRef = sourceAsset.blobRef();
-      if (blobRef == null) {
-        throw new IllegalStateException("Asset has no blob: " + assetName);
+      String encodedPrefix = pathPrefix.replace("%", "%25").replace("+", "%2B")
+          .replace(" ", "%20").replace("/", "%2F");
+
+      String searchUrlStr = nexusBaseUrl + "/service/rest/v1/search?repository=" +
+          repository + "&name=" + encodedPrefix + "*";
+
+      URL url = new URL(searchUrlStr);
+      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(30_000);
+      conn.setReadTimeout(60_000);
+      conn.setRequestProperty("Accept", "application/json");
+
+      int code = conn.getResponseCode();
+      if (code == 200) {
+        // Parse JSON response manually to avoid extra dependencies
+        String json = readStream(conn.getInputStream());
+        results = parseSearchItems(json, pathPrefix);
       }
+      conn.disconnect();
+    }
+    catch (Exception e) {
+      log.warn("Search API call failed for {}/{}, returning empty: {}", repository, pathPrefix, e.getMessage());
+    }
+    return results;
+  }
 
-      Blob blob = sourceTx.getBlob(blobRef);
-      if (blob == null) {
-        throw new IllegalStateException("Blob not found for asset: " + assetName);
-      }
+  /**
+   * Parse Nexus search API response to extract asset names.
+   * Simple JSON parser that extracts "name" fields from items array.
+   */
+  private List<String> parseSearchItems(final String json, final String pathPrefix) {
+    List<String> items = new ArrayList<>();
+    if (json == null || json.isEmpty()) return items;
 
-      // Stream content to target repository
-      StorageFacet targetStorage = targetRepo.facet(StorageFacet.class);
-      final StorageTx targetTx = targetStorage.txSupplier().get();
-      boolean targetCommitted = false;
-      try {
-        Bucket targetBucket = targetTx.findBucket(targetRepo);
+    // Simple parsing: find "items" array, then extract "name" from each item
+    try {
+      int itemsStart = json.indexOf("\"items\"");
+      if (itemsStart < 0) return items;
 
-        try (InputStream inputStream = blob.getInputStream()) {
-          saveToTarget(targetRepo, targetTx, targetBucket, assetName, sourceAsset, inputStream, blob.getMetrics().getContentSize());
+      // Find the [ after "items"
+      int arrayStart = json.indexOf('[', itemsStart);
+      if (arrayStart < 0) return items;
+
+      // Find matching ]
+      int depth = 0;
+      int pos = arrayStart;
+      while (pos < json.length()) {
+        char c = json.charAt(pos);
+        if (c == '[') depth++;
+        else if (c == ']') {
+          depth--;
+          if (depth == 0) break;
         }
-
-        targetTx.commit();
-        targetCommitted = true;
+        pos++;
       }
-      finally {
-        if (!targetCommitted) { targetTx.rollback(); }
+      String itemsArray = json.substring(arrayStart, pos + 1);
+
+      // Extract each object and find "name"
+      int objStart = 0;
+      while ((objStart = itemsArray.indexOf('{', objStart)) >= 0) {
+        int objEnd = findMatchingBrace(itemsArray, objStart);
+        if (objEnd < 0) break;
+        String obj = itemsArray.substring(objStart, objEnd + 1);
+
+        String name = extractJsonString(obj, "name");
+        if (name != null && !name.isEmpty()) {
+          // Only include files that start with our path prefix
+          if (name.startsWith(pathPrefix) && !name.equals(pathPrefix)) {
+            items.add(name);
+          }
+        }
+        objStart = objEnd + 1;
       }
     }
     catch (Exception e) {
-      throw new RuntimeException("Failed to promote asset: " + assetName, e);
+      log.warn("Failed to parse search response: {}", e.getMessage());
     }
-
-    return new PromotionTaskResult.FileItem(assetName, action, type);
+    return items;
   }
 
   /**
-   * Save content to target repository using the StorageTx API.
-   * Handles both new and existing assets (idempotent).
+   * Find matching closing brace.
    */
-  private void saveToTarget(final Repository targetRepo,
-                             final StorageTx tx,
-                             final Bucket bucket,
-                             final String assetName,
-                             final Asset sourceAsset,
-                             final InputStream inputStream,
-                             final long size) throws IOException
-  {
-    // Find or create component
-    Component component = tx.findComponentWithProperty("name", assetName, bucket);
-    if (component == null) {
-      Format format = targetRepo.getFormat();
-      component = tx.createComponent(bucket, format);
-      component.group("promoted");
-      component.name(assetName);
-      tx.saveComponent(component);
+  private int findMatchingBrace(final String s, final int start) {
+    int depth = 0;
+    for (int i = start; i < s.length(); i++) {
+      char c = s.charAt(i);
+      if (c == '{') depth++;
+      else if (c == '}') {
+        depth--;
+        if (depth == 0) return i;
+      }
     }
-
-    // Find or create asset
-    Asset targetAsset = tx.findAssetWithProperty("name", assetName, bucket);
-    if (targetAsset == null) {
-      targetAsset = tx.createAsset(bucket, component);
-      targetAsset.name(assetName);
-    }
-
-    // Attach blob using setBlob
-    AssetBlob assetBlob = tx.setBlob(
-        targetAsset,
-        assetName,
-        () -> inputStream,
-        ImmutableList.of(),
-        null,
-        sourceAsset.contentType(),
-        true
-    );
-
-    tx.saveAsset(targetAsset);
+    return -1;
   }
 
   /**
-   * Check if an asset exists in the target repository.
+   * Extract a string value by key from a JSON object string.
    */
-  private boolean checkExistsInTarget(final String targetRepoName, final String assetName) {
+  private String extractJsonString(final String json, final String key) {
+    String searchKey = "\"" + key + "\"";
+    int keyIdx = json.indexOf(searchKey);
+    if (keyIdx < 0) return null;
+
+    int colonIdx = json.indexOf(':', keyIdx + searchKey.length());
+    if (colonIdx < 0) return null;
+
+    // Skip whitespace
+    int valStart = colonIdx + 1;
+    while (valStart < json.length() && Character.isWhitespace(json.charAt(valStart))) {
+      valStart++;
+    }
+    if (valStart >= json.length()) return null;
+
+    if (json.charAt(valStart) == '"') {
+      // String value
+      StringBuilder sb = new StringBuilder();
+      int i = valStart + 1;
+      while (i < json.length()) {
+        char c = json.charAt(i);
+        if (c == '\\') {
+          if (i + 1 < json.length()) {
+            sb.append(json.charAt(i + 1));
+            i += 2;
+            continue;
+          }
+        }
+        else if (c == '"') {
+          break;
+        }
+        sb.append(c);
+        i++;
+      }
+      return sb.toString();
+    }
+    return null;
+  }
+
+  /**
+   * Check if an asset exists in target repository via HEAD request.
+   */
+  private boolean checkExistsViaHttp(final String targetRepo, final String assetName, final String nexusBaseUrl) {
     try {
-      Repository targetRepo = repositoryManager.get(targetRepoName);
-      if (targetRepo == null) {
-        return false;
-      }
-      StorageFacet storageFacet = targetRepo.facet(StorageFacet.class);
-      final StorageTx tx = storageFacet.txSupplier().get();
-      try {
-        Bucket bucket = tx.findBucket(targetRepo);
-        return tx.findAssetWithProperty("name", assetName, bucket) != null;
-      }
-      finally {
-        tx.rollback();
-      }
+      URL url = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + assetName);
+      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(10_000);
+      int code = conn.getResponseCode();
+      conn.disconnect();
+      return code == 200;
     }
     catch (Exception e) {
       return false;
+    }
+  }
+
+  /**
+   * Set authentication headers on HTTP connection.
+   * Uses the user's session cookie from the original request.
+   */
+  private void setAuthHeaders(final HttpURLConnection conn, final String cookieHeader) {
+    if (cookieHeader != null && !cookieHeader.isEmpty()) {
+      conn.setRequestProperty(HttpHeaders.COOKIE, cookieHeader);
+    }
+    conn.setRequestProperty("X-Nexus-UI", "true");
+    conn.setRequestProperty("Accept", "*/*");
+  }
+
+  /**
+   * Read error response body from connection.
+   */
+  private String readErrorResponse(final HttpURLConnection conn) throws IOException {
+    InputStream errStream = conn.getErrorStream();
+    if (errStream != null) {
+      return readStream(errStream);
+    }
+    return "";
+  }
+
+  /**
+   * Read entire stream into a string.
+   */
+  private String readStream(final InputStream input) throws IOException {
+    StringBuilder sb = new StringBuilder();
+    byte[] buffer = new byte[BUFFER_SIZE];
+    int bytesRead;
+    while ((bytesRead = input.read(buffer)) != -1) {
+      sb.append(new String(buffer, 0, bytesRead, "UTF-8"));
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Update task result with current progress (for polling).
+   */
+  private void updateTaskProgress(final PromotionTaskResult taskResult,
+                                   final List<PromotionTaskResult.FileItem> items) {
+    if (taskResult != null) {
+      taskResult.setItems(new ArrayList<>(items)); // Copy for thread safety
     }
   }
 
@@ -499,11 +645,6 @@ public class PromotionService {
       return "directory";
     }
     return "file";
-  }
-
-  private String escapeLike(final String input) {
-    if (input == null) return "";
-    return input.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
   }
 
   private String sanitizeErrorMessage(final String message) {
