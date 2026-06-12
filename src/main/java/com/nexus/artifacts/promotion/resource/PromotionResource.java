@@ -77,7 +77,7 @@ public class PromotionResource implements Resource {
       boolean hasPermission = permissionChecker.hasRepositoryWritePermission(repository, format);
       return Response.ok()
           .entity("{\"hasPermission\":" + hasPermission + ",\"repository\":\""
-              + sanitize(repository) + "\",\"format\":\"" + sanitize(format) + "\"}")
+              + jsonEscape(repository) + "\",\"format\":\"" + jsonEscape(format) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -110,8 +110,8 @@ public class PromotionResource implements Resource {
     catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
           .entity("{\"error\":\"Permission denied\",\"username\":\""
-              + sanitize(e.getUsername()) + "\",\"repository\":\""
-              + sanitize(e.getRepository()) + "\"}")
+              + jsonEscape(e.getUsername()) + "\",\"repository\":\""
+              + jsonEscape(e.getRepository()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -146,14 +146,14 @@ public class PromotionResource implements Resource {
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
           .entity("{\"error\":\"Permission denied\",\"username\":\""
-              + sanitize(e.getUsername()) + "\",\"repository\":\""
-              + sanitize(e.getRepository()) + "\"}")
+              + jsonEscape(e.getUsername()) + "\",\"repository\":\""
+              + jsonEscape(e.getRepository()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -196,24 +196,24 @@ public class PromotionResource implements Resource {
       String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
       String taskId = promotionService.promote(request, cookieHeader, csrfToken, nexusBaseUrl);
       return Response.ok()
-          .entity("{\"taskId\":\"" + sanitize(taskId) + "\",\"status\":\"submitted\"}")
+          .entity("{\"taskId\":\"" + jsonEscape(taskId) + "\",\"status\":\"submitted\"}")
           .build();
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
           .entity("{\"error\":\"Permission denied\",\"username\":\""
-              + sanitize(e.getUsername()) + "\",\"repository\":\""
-              + sanitize(e.getRepository()) + "\"}")
+              + jsonEscape(e.getUsername()) + "\",\"repository\":\""
+              + jsonEscape(e.getRepository()) + "\"}")
           .build();
     }
     catch (SecurityException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -239,8 +239,28 @@ public class PromotionResource implements Resource {
   public Response getTaskStatus(@PathParam("taskId") final String taskId)
   {
     try {
-      PromotionTaskResult result = promotionService.getTaskResult(sanitize(taskId));
+      String safeTaskId = jsonEscape(taskId);
+      PromotionTaskResult result = promotionService.getTaskResult(safeTaskId);
       if (result == null) {
+        // Task may still be running - check TaskExecutorService
+        TaskStatus status = promotionService.getTaskExecutorStatus(safeTaskId);
+        if (status != null) {
+          // If task is already completed/failed but result not yet in taskResults,
+          // wait briefly for the result to appear (race condition between wrapTask.finally and taskResults.put)
+          if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED) {
+            for (int i = 0; i < 10; i++) {
+              try { Thread.sleep(200); } catch (InterruptedException e) { break; }
+              result = promotionService.getTaskResult(safeTaskId);
+              if (result != null) {
+                return Response.ok(result).build();
+              }
+            }
+          }
+          // Return a running status so frontend knows to keep polling
+          return Response.ok()
+              .entity("{\"status\":\"" + status.getValue() + "\",\"taskId\":\"" + safeTaskId + "\"}")
+              .build();
+        }
         return Response.status(Response.Status.NOT_FOUND)
             .entity("{\"error\":\"Task not found\"}")
             .build();
@@ -320,14 +340,37 @@ public class PromotionResource implements Resource {
   }
 
   /**
-   * Sanitize output to prevent XSS.
+   * Escape a string for safe inclusion in a manually constructed JSON response.
+   * Handles quotes, backslashes, newlines, and other control characters.
    */
-  private String sanitize(final String input) {
+  private String jsonEscape(final String input) {
     if (input == null) return "";
-    return input.replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&#x27;")
-        .replace("&", "&amp;");
+    StringBuilder sb = new StringBuilder(input.length() + 16);
+    for (int i = 0; i < input.length(); i++) {
+      char c = input.charAt(i);
+      switch (c) {
+        case '"':  sb.append("\\\""); break;
+        case '\\': sb.append("\\\\"); break;
+        case '\n': sb.append("\\n"); break;
+        case '\r': sb.append("\\r"); break;
+        case '\t': sb.append("\\t"); break;
+        case '\b': sb.append("\\b"); break;
+        case '\f': sb.append("\\f"); break;
+        default:
+          if (c < ' ') {
+            // Control characters: output as \\uXXXX
+            sb.append("\\u");
+            String hex = Integer.toHexString(c);
+            for (int pad = 4 - hex.length(); pad > 0; pad--) {
+              sb.append('0');
+            }
+            sb.append(hex);
+          } else {
+            sb.append(c);
+          }
+          break;
+      }
+    }
+    return sb.toString();
   }
 }

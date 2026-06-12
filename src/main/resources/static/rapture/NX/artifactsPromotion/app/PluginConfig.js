@@ -214,20 +214,30 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
   t: function (key) {
     var bundle = this.bundles[this.currentLocale] || this.bundles['en'];
+    var template;
     if (bundle && bundle.hasOwnProperty(key)) {
-      return bundle[key];
+      template = bundle[key];
+    } else {
+      var enBundle = this.bundles['en'];
+      if (enBundle && enBundle.hasOwnProperty(key)) {
+        template = enBundle[key];
+      } else {
+        return key;
+      }
     }
-    var enBundle = this.bundles['en'];
-    if (enBundle && enBundle.hasOwnProperty(key)) {
-      return enBundle[key];
+    // Support {0}, {1}, ... parameter substitution
+    if (arguments.length > 1) {
+      for (var i = 1; i < arguments.length; i++) {
+        template = template.replace('{' + (i - 1) + '}', arguments[i]);
+      }
     }
-    return key;
+    return template;
   }
 });
 
-// Shorthand
+// Shorthand - forwards all arguments to I18n.t for parameter substitution
 function _t(key) {
-  return NX.artifactsPromotion.I18n.t(key);
+  return NX.artifactsPromotion.I18n.t.apply(NX.artifactsPromotion.I18n, arguments);
 }
 
 // ==================== Utility ====================
@@ -612,6 +622,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     Ext.defer(doRetry, retryInterval);
   },
 
+  onFolderInfoUpdated: function (panel, folder) {
+    var me = this;
+    me._currentFolderPanel = panel;
+    if (folder) {
+      panel.folderModel = folder;
+    }
+    me.tryAddFolderButtons(panel);
+  },
+
   /**
    * Try to add promotion/sync buttons to a folder info panel.
    * @param {Object} panel The ComponentFolderInfo panel
@@ -929,23 +948,44 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     });
 
     var fileStore = Ext.create('Ext.data.Store', {
-      fields: ['path', 'type', 'size', 'existsInTarget'],
-      data: preview && preview.files ? preview.files : []
+      fields: ['path', 'type', 'size', 'status'],
+      data: preview && preview.files ? (function () {
+        var arr = [];
+        Ext.each(preview.files, function (f) {
+          arr.push({ path: f.path, type: f.type, size: f.size, status: 'pending' });
+        });
+        return arr;
+      })() : []
     });
+
+    var totalFiles = fileStore.getCount();
+
+    var statusRenderer = function (val) {
+      switch (val) {
+        case 'processing':
+          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
+        case 'success':
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
+        case 'failed':
+          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        default:
+          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
+      }
+    };
 
     var win = Ext.create('Ext.window.Window', {
       title: _t('promotion.modal.title'),
-      width: 600,
+      width: 700,
       height: 500,
       modal: true,
+      closable: true,
       layout: 'fit',
       items: [{
         xtype: 'panel',
-        layout: {
-          type: 'vbox',
-          align: 'stretch'
-        },
+        layout: { type: 'vbox', align: 'stretch' },
+        bodyPadding: 10,
         items: [
+          // Target repo selector (hidden during progress)
           {
             xtype: 'combobox',
             fieldLabel: _t('promotion.modal.targetRepository'),
@@ -957,21 +997,46 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             editable: false,
             itemId: 'targetCombo'
           },
+          // Target repo display (shown during progress, hidden initially)
+          {
+            xtype: 'displayfield',
+            itemId: 'targetDisplay',
+            hidden: true,
+            value: '',
+            labelWidth: 120,
+            fieldLabel: _t('promotion.result.targetRepository')
+          },
+          // Progress bar (hidden initially, shown during progress)
+          {
+            xtype: 'container',
+            itemId: 'progressContainer',
+            hidden: true,
+            margin: '8 0',
+            layout: { type: 'hbox', align: 'middle' },
+            items: [
+              {
+                xtype: 'progressbar',
+                itemId: 'overallProgress',
+                flex: 1,
+                value: 0,
+                text: _t('promotion.progress.completed', 0, totalFiles || '?'),
+                animate: true
+              }
+            ]
+          },
+          // File list grid
           {
             xtype: 'gridpanel',
             title: _t('promotion.modal.filesToPromote'),
             flex: 1,
+            itemId: 'fileGrid',
             store: fileStore,
             columns: [
-              { text: 'Path', dataIndex: 'path', flex: 2 },
+              { text: 'Path', dataIndex: 'path', flex: 2, cellWrap: true },
               { text: 'Type', dataIndex: 'type', width: 80 },
               {
-                text: 'Action', dataIndex: 'existsInTarget', width: 80,
-                renderer: function (val) {
-                  return val
-                    ? '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.modal.action.update') + '</span>'
-                    : '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.modal.action.new') + '</span>';
-                }
+                text: _t('promotion.result.status'), dataIndex: 'status', width: 100,
+                renderer: statusRenderer
               }
             ]
           }
@@ -980,6 +1045,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       buttons: [
         {
           text: _t('promotion.modal.cancel'),
+          itemId: 'cancelBtn',
           handler: function () { win.close(); }
         },
         {
@@ -989,9 +1055,11 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             var targetRepo = win.down('#targetCombo').getValue();
             if (!targetRepo) return;
 
-            var btn = win.down('#promoteBtn');
-            btn.setText(_t('promotion.modal.promoting'));
-            btn.disable();
+            var promoteBtn = win.down('#promoteBtn');
+            var cancelBtn = win.down('#cancelBtn');
+            promoteBtn.setText(_t('promotion.modal.promoting'));
+            promoteBtn.disable();
+            cancelBtn.disable();
 
             // Collect file paths from preview for directory promotion
             var promoFiles = [];
@@ -1010,12 +1078,41 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               files: promoFiles
             })
             .then(function (result) {
-              win.close();
-              me.pollPromotionTask(result.taskId, targetRepo, promoFiles);
+              // Switch to progress mode in the same window
+              win.setTitle(_t('promotion.modal.promoting'));
+
+              // Hide target combo, show target display
+              win.down('#targetCombo').hide();
+              var targetDisplay = win.down('#targetDisplay');
+              targetDisplay.setValue('<b>' + sanitize(targetRepo) + '</b>');
+              targetDisplay.show();
+
+              // Show progress bar
+              var progressContainer = win.down('#progressContainer');
+              progressContainer.show();
+
+              // Remove grid title
+              var grid = win.down('#fileGrid');
+              if (grid && grid.title) {
+                grid.setTitle('');
+              }
+
+              // Change buttons: hide promote, change cancel to close
+              promoteBtn.hide();
+              cancelBtn.setText(_t('promotion.result.close'));
+              cancelBtn.enable();
+              cancelBtn.setHandler(function () {
+                if (win._pollInterval) { clearInterval(win._pollInterval); }
+                win.close();
+              });
+
+              // Start polling for task status
+              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles);
             })
             .catch(function (err) {
-              btn.setText(_t('promotion.modal.promote'));
-              btn.enable();
+              promoteBtn.setText(_t('promotion.modal.promote'));
+              promoteBtn.enable();
+              cancelBtn.enable();
               // Check if error contains username and repository info for write permission denied
               if (err.username && err.repository) {
                 var msg = _t('promotion.permission.write.denied')
@@ -1033,139 +1130,105 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     win.show();
   },
 
-  pollPromotionTask: function (taskId, targetRepo, fileList) {
-    var me = this;
+  startPollingInWindow: function (win, taskId, fileList, totalFiles) {
+    var isFinished = false;
 
-    // Build initial store from file list (all pending)
-    var initialData = [];
-    var totalFiles = 0;
-    if (fileList && fileList.length > 0) {
-      totalFiles = fileList.length;
-      Ext.each(fileList, function (f) {
-        initialData.push({ path: f, action: '', status: 'pending' });
-      });
-    }
+    var finishProgress = function (result) {
+      if (isFinished) return;
+      isFinished = true;
+      if (win._pollInterval) { clearInterval(win._pollInterval); }
 
-    // Create progress window with progress bar + file list grid
-    var progressWin = Ext.create('Ext.window.Window', {
-      title: _t('promotion.modal.promoting'),
-      width: 700,
-      height: 480,
-      modal: true,
-      closable: false,
-      layout: 'fit',
-      items: [{
-        xtype: 'panel',
-        layout: { type: 'vbox', align: 'stretch' },
-        bodyPadding: 10,
-        items: [
-          // Target repo info
-          {
-            xtype: 'displayfield',
-            value: '<b>' + sanitize(targetRepo) + '</b>',
-            labelWidth: 120,
-            fieldLabel: _t('promotion.result.targetRepository')
-          },
-          // Overall progress bar
-          {
-            xtype: 'container',
-            margin: '8 0',
-            layout: { type: 'hbox', align: 'middle' },
-            items: [
-              {
-                xtype: 'progressbar',
-                itemId: 'overallProgress',
-                flex: 1,
-                value: 0,
-                text: _t('promotion.progress.completed', 0, totalFiles || '?'),
-                animate: true
-              }
-            ]
-          },
-          // File list grid with per-file status
-          {
-            xtype: 'gridpanel',
-            flex: 1,
-            itemId: 'progressGrid',
-            store: {
-              fields: ['path', 'action', 'status'],
-              data: initialData
-            },
-            columns: [
-              { text: _t('promotion.modal.filesToPromote'), dataIndex: 'path', flex: 2, cellWrap: true },
-              {
-                text: 'Action', dataIndex: 'action', width: 80,
-                renderer: function (val) {
-                  if (!val) return '';
-                  return val === 'CREATED'
-                    ? '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.modal.action.new') + '</span>'
-                    : '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.modal.action.update') + '</span>';
-                }
-              },
-              {
-                text: 'Status', dataIndex: 'status', width: 100,
-                renderer: function (val) {
-                  switch (val) {
-                    case 'processing':
-                      return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
-                    case 'success':
-                      return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
-                    case 'failed':
-                      return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
-                    default:
-                      return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
-                  }
-                }
-              }
-            ]
+      var grid = win.down('#fileGrid');
+      var progressBar = win.down('#overallProgress');
+
+      // Mark all remaining items based on task result
+      if (grid && !grid.destroyed) {
+        var store = grid.getStore();
+        if (result.status === 'FAILED') {
+          if (store.getCount() === 0 && result.error) {
+            store.add({ path: result.error, status: 'failed' });
           }
-        ]
-      }]
-    });
-    progressWin.show();
+          store.each(function (rec) {
+            if (rec.get('status') !== 'success') {
+              rec.set('status', 'failed');
+            }
+          });
+        } else {
+          // Task completed - mark any remaining pending/processing items as success
+          store.each(function (rec) {
+            if (rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
+              rec.set('status', 'success');
+            }
+          });
+        }
+      }
 
-    // Track which paths have been seen to detect current processing item
-    var seenPaths = {};
+      // Update progress bar to 100%
+      if (progressBar) {
+        progressBar.setValue(1);
+        var gridStore = grid ? grid.getStore() : null;
+        var total = gridStore ? gridStore.getCount() : totalFiles;
+        var done = 0;
+        if (gridStore) {
+          gridStore.each(function (rec) {
+            if (rec.get('status') === 'success' || rec.get('status') === 'failed') done++;
+          });
+        }
+        progressBar.setText(_t('promotion.progress.completed', done, total));
+      }
+
+      // Update window title
+      if (result.status === 'COMPLETED') {
+        win.setTitle(_t('promotion.progress.success'));
+      } else {
+        win.setTitle(_t('promotion.progress.failed'));
+      }
+
+      // Window stays open for user to review results - user closes manually
+    };
 
     var doPoll = function () {
       apiRequest('GET', '/promotion/task/' + encodeURIComponent(taskId))
         .then(function (result) {
-          var grid = progressWin.down('#progressGrid');
-          var progressBar = progressWin.down('#overallProgress');
+          if (isFinished || win.destroyed) return;
+
+          var grid = win.down('#fileGrid');
+          var progressBar = win.down('#overallProgress');
+
+          if (!grid || !progressBar || win.destroyed) {
+            if (win._pollInterval) { clearInterval(win._pollInterval); }
+            return;
+          }
+
           var store = grid.getStore();
 
           if (result.items && result.items.length > 0) {
             // Update existing rows or add new ones
             Ext.each(result.items, function (item) {
-              seenPaths[item.path] = true;
               var idx = store.findExact('path', item.path);
               if (idx >= 0) {
                 var rec = store.getAt(idx);
-                rec.set('action', item.action || '');
                 rec.set('status', item.status === 'failed' ? 'failed' : 'success');
               } else {
                 store.add({
                   path: item.path,
-                  action: item.action || '',
+                  type: item.type || '',
+                  size: 0,
                   status: item.status === 'failed' ? 'failed' : 'success'
                 });
               }
             });
 
-            // Mark any non-seen-but-in-store records as still pending or processing
-            // The last incomplete one is likely being processed now
+            // Mark first non-completed item as processing
             var processedCount = 0;
             var hasProcessing = false;
             store.each(function (rec) {
               var st = rec.get('status');
               if (st === 'success' || st === 'failed') {
                 processedCount++;
-              } else if (st !== 'processing') {
-                // First non-completed item is currently being processed
-                if (!hasProcessing) {
-                  rec.set('status', 'processing');
-                  hasProcessing = true;
-                }
+              } else if (!hasProcessing) {
+                rec.set('status', 'processing');
+                hasProcessing = true;
               }
             });
 
@@ -1176,44 +1239,27 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             progressBar.setText(_t('promotion.progress.completed', processedCount, total));
           }
 
-          if (result.status === 'COMPLETED' || result.status === 'FAILED') {
-            clearInterval(pollInterval);
-            // Final update: mark all remaining as failed if task failed
-            if (result.status === 'FAILED') {
-              var grid2 = progressWin.down('#progressGrid');
-              var store2 = grid2.getStore();
-              store2.each(function (rec) {
-                if (rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
-                  rec.set('status', 'failed');
-                }
-              });
-              var pb = progressWin.down('#overallProgress');
-              pb.setValue(1);
-            }
-            // Small delay then show result
-            setTimeout(function () {
-              progressWin.close();
-              me.showPromotionResult(result, targetRepo);
-            }, 800);
+          // Check if task is done (handle both uppercase and lowercase status values)
+          var statusUpper = (result.status || '').toUpperCase();
+          if (statusUpper === 'COMPLETED' || statusUpper === 'FAILED') {
+            result.status = statusUpper;
+            finishProgress(result);
           }
         })
         .catch(function () {
-          clearInterval(pollInterval);
-          progressWin.close();
+          // On poll error, don't close - just retry next interval
         });
     };
 
-    var pollInterval = setInterval(doPoll, 1500);
+    win._pollInterval = setInterval(doPoll, 1500);
 
     // Initial poll after short delay
     setTimeout(doPoll, 500);
 
     // Timeout safety: 15 minutes max
     setTimeout(function () {
-      clearInterval(pollInterval);
-      if (!progressWin.destroyed) {
-        progressWin.close();
-        me.showPromotionResult({ status: 'FAILED', error: 'Timeout waiting for promotion' }, targetRepo);
+      if (!isFinished) {
+        finishProgress({ status: 'FAILED', error: 'Timeout waiting for promotion' });
       }
     }, 900000);
   },
@@ -1223,16 +1269,13 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var title = isSuccess ? _t('promotion.result.title.success') : _t('promotion.result.title.failed');
     var items = '';
 
-    // New format: items have path (full repo/path), action (CREATED/UPDATED), status
+    // New format: items have path (full repo/path), status
     if (result.items && result.items.length > 0) {
       items = '<ul>';
       Ext.each(result.items, function (item) {
-        var action = item.action === 'CREATED'
-          ? _t('promotion.modal.action.new')
-          : _t('promotion.modal.action.update');
         var statusIcon = item.status === 'failed' ? ' [FAILED]' : '';
         var path = sanitize(item.path || '');
-        items += '<li>' + path + ' - ' + action + statusIcon + '</li>';
+        items += '<li>' + path + statusIcon + '</li>';
       });
       items += '</ul>';
     }

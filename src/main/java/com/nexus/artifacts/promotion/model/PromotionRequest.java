@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.List;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
  * Request DTO for artifact promotion.
@@ -33,7 +34,9 @@ public class PromotionRequest {
   public String getPath() { return path; }
   public void setPath(String path) { this.path = path; }
 
+  @JsonProperty("isDirectory")
   public boolean isDirectory() { return isDirectory; }
+  @JsonProperty("isDirectory")
   public void setDirectory(boolean directory) { isDirectory = directory; }
 
   public String getFormat() { return format; }

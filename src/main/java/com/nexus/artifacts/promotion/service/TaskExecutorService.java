@@ -87,7 +87,16 @@ public class TaskExecutorService {
   public String submitPromotionTask(final Callable<PromotionTaskCallback> task,
                                      final String taskDescription)
   {
-    final String taskId = generateTaskId("promo");
+    return submitPromotionTask(task, taskDescription, generateTaskId("promo"));
+  }
+
+  /**
+   * Submit a promotion task with a pre-defined taskId.
+   */
+  public String submitPromotionTask(final Callable<PromotionTaskCallback> task,
+                                     final String taskDescription,
+                                     final String taskId)
+  {
     log.info("Submitting promotion task {}: {}", taskId, taskDescription);
 
     // Wrap task with timeout and error handling

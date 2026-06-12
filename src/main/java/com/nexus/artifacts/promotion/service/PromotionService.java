@@ -10,6 +10,7 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
@@ -121,6 +122,9 @@ public class PromotionService {
     for (Repository repo : repositoryManager.browse()) {
       if (repo.getName().equals(sourceRepository)) continue;
       if (!actualFormat.equals(repo.getFormat().getValue())) continue;
+      // Skip remote/proxy repositories - cannot upload to them via promotion
+      String repoType = repo.getType().getValue();
+      if ("proxy".equals(repoType)) continue;
       if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) continue;
       targets.add(new TargetRepositoryList.TargetRepository(
           repo.getName(), repo.getFormat().getValue(), repo.getType().getValue(), repo.getUrl()));
@@ -150,29 +154,29 @@ public class PromotionService {
       List<String> assetNames = searchAssets(request.getSourceRepository(), request.getPath(), nexusBaseUrl);
 
       if (assetNames.isEmpty()) {
-        // If search returns nothing, treat the path itself as a single file/directory
-        if (request.isDirectory()) {
+        // No files found via search - for directory promotion, return empty list
+        // so the UI can show "no files found" rather than promoting the directory itself
+        if (!request.isDirectory()) {
           files.add(new FilePreviewResponse.FileEntry(
-              request.getPath(), "directory", 0, false));
-        } else {
-          files.add(new FilePreviewResponse.FileEntry(
-              request.getPath(), "file", 0, false));
+              request.getPath(), "file", 0));
         }
+        // For directory: leave files empty, will show error message to user
       } else {
         for (String name : assetNames) {
           String type = determineType(name);
-          boolean existsInTarget = checkExistsViaHttp(request.getTargetRepository(), name, nexusBaseUrl);
-          files.add(new FilePreviewResponse.FileEntry(name, type, 0, existsInTarget));
+          files.add(new FilePreviewResponse.FileEntry(name, type, 0));
         }
       }
       preview.setTotalCount(files.size());
     }
     catch (Exception e) {
       log.error("Failed to preview promotion files: {}", e.getMessage(), e);
-      files.add(new FilePreviewResponse.FileEntry(
-          request.getPath(),
-          request.isDirectory() ? "directory" : "file", 0, false));
-      preview.setTotalCount(1);
+      // Only add single entry for file promotion, not for directory
+      if (!request.isDirectory()) {
+        files.add(new FilePreviewResponse.FileEntry(
+            request.getPath(), "file", 0));
+        preview.setTotalCount(1);
+      }
     }
 
     preview.setFiles(files);
@@ -195,6 +199,9 @@ public class PromotionService {
 
     String username = permissionChecker.getCurrentUsername();
 
+    // Generate taskId upfront so callable and TaskExecutorService use the same ID
+    final String taskId = "promo-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
+
     Subject subject = securityHelper.subject();
     final SubjectThreadState threadState = (subject != null && subject.isAuthenticated())
         ? new SubjectThreadState(subject) : null;
@@ -204,19 +211,16 @@ public class PromotionService {
         threadState.bind();
       }
       try {
-        String taskId = null;
         PromotionTaskResult result = new PromotionTaskResult();
         result.setSourceRepository(request.getSourceRepository());
         result.setTargetRepository(request.getTargetRepository());
         result.setUsername(username);
         result.setStartTime(System.currentTimeMillis());
+        result.setTaskId(taskId);
+
+        List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
 
         try {
-          taskId = cacheManager.createTaskCache("promo-" + System.currentTimeMillis()).getFileName().toString();
-          result.setTaskId(taskId);
-
-          List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
-
           if (request.isDirectory()) {
             promotedItems = promoteDirectoryViaHttp(
                 request.getSourceRepository(), request.getTargetRepository(),
@@ -242,13 +246,10 @@ public class PromotionService {
           result.setEndTime(System.currentTimeMillis());
         }
 
-        if (taskId != null) {
-          taskResults.put(taskId, result);
-        }
+        taskResults.put(taskId, result);
 
-        final String finalTaskId = taskId;
         return new TaskExecutorService.PromotionTaskCallback() {
-          @Override public String getTaskId() { return finalTaskId; }
+          @Override public String getTaskId() { return taskId; }
           @Override public TaskStatus getStatus() { return result.getStatus(); }
           @Override public String getErrorMessage() { return result.getErrorMessage(); }
         };
@@ -259,7 +260,7 @@ public class PromotionService {
         }
       }
     }, String.format("Promote %s from %s to %s", request.getPath(),
-        request.getSourceRepository(), request.getTargetRepository()));
+        request.getSourceRepository(), request.getTargetRepository()), taskId);
   }
 
   /**
@@ -267,6 +268,13 @@ public class PromotionService {
    */
   public PromotionTaskResult getTaskResult(final String taskId) {
     return taskResults.get(taskId);
+  }
+
+  /**
+   * Get task status from TaskExecutorService (for running tasks not yet in taskResults).
+   */
+  public TaskStatus getTaskExecutorStatus(final String taskId) {
+    return taskExecutor.getPromotionTaskStatus(taskId);
   }
 
   // ==================== HTTP-based Promotion Logic ====================
@@ -287,19 +295,53 @@ public class PromotionService {
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
 
+    // Log what we received from frontend
+    log.info("Directory promotion called: source={}, target={}, path={}, providedFiles={}",
+        sourceRepo, targetRepo, directoryPath,
+        (providedFiles != null ? providedFiles.size() + " items" : "null"));
+    if (providedFiles != null) {
+      for (int i = 0; i < providedFiles.size(); i++) {
+        log.info("  providedFile[{}]: {}", i, providedFiles.get(i));
+      }
+    }
+
     try {
-      // Use provided file list from frontend preview, or fallback to search API
-      List<String> assetNames = (providedFiles != null && !providedFiles.isEmpty())
-          ? providedFiles
-          : searchAssets(sourceRepo, directoryPath, nexusBaseUrl);
+      List<String> assetNames;
+
+      if (providedFiles != null && !providedFiles.isEmpty()) {
+        // Use files from frontend preview - filter out any non-file entries
+        assetNames = new ArrayList<>();
+        for (String f : providedFiles) {
+          if (f == null || f.isEmpty()) continue;
+          if (f.equals(directoryPath)) {
+            log.warn("Frontend sent directory path itself as file, skipping: {}", f);
+            continue;
+          }
+          if (f.endsWith("/")) {
+            log.warn("Frontend sent directory entry, skipping: {}", f);
+            continue;
+          }
+          assetNames.add(f);
+        }
+        log.info("After filtering providedFiles: {} valid files", assetNames.size());
+      } else {
+        // No files from frontend - try search API
+        log.warn("No files from frontend, falling back to search API for {}/{}",
+            sourceRepo, directoryPath);
+        assetNames = searchAssets(sourceRepo, directoryPath, nexusBaseUrl);
+        // Filter search results too
+        List<String> filtered = new ArrayList<>();
+        for (String name : assetNames) {
+          if (!name.equals(directoryPath) && !name.endsWith("/")) {
+            filtered.add(name);
+          }
+        }
+        assetNames = filtered;
+      }
 
       if (assetNames.isEmpty()) {
-        // Treat as single item if no sub-files found
-        PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
-            sourceRepo, targetRepo, directoryPath, cookieHeader, csrfToken, nexusBaseUrl);
-        items.add(item);
-        updateTaskProgress(taskResult, items);
-        return items;
+        throw new IOException("No files found under directory '" + directoryPath +
+            "' in repository " + sourceRepo + ". Cannot promote an empty directory.");
       }
 
       int total = assetNames.size();
@@ -318,7 +360,7 @@ public class PromotionService {
         catch (Exception e) {
           log.error("Failed to promote {}: {}", assetName, e.getMessage());
           PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(
-              sourceRepo + "/" + assetName, PromotionTaskResult.FileAction.UPDATED, determineType(assetName));
+              assetName, determineType(assetName));
           failedItem.setStatus("failed");
           failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
           items.add(failedItem);
@@ -373,11 +415,6 @@ public class PromotionService {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.debug("Promoting via HTTP: {} -> {}/{}", fullSourcePath, targetRepo, filePath);
 
-    // Check if already exists in target
-    boolean existsInTarget = checkExistsViaHttp(targetRepo, filePath, nexusBaseUrl);
-    PromotionTaskResult.FileAction action = existsInTarget
-        ? PromotionTaskResult.FileAction.UPDATED : PromotionTaskResult.FileAction.CREATED;
-
     // Download from source
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
@@ -429,17 +466,41 @@ public class PromotionService {
           " failed: HTTP " + uploadResponse + " - " + uploadMsg);
     }
 
-    log.info("Successfully promoted: {} -> {}/{} ({})",
-        fullSourcePath, targetRepo, filePath, action);
-    return new PromotionTaskResult.FileItem(fullSourcePath, action, determineType(filePath));
+    log.info("Successfully promoted: {} -> {}/{}",
+        fullSourcePath, targetRepo, filePath);
+    return new PromotionTaskResult.FileItem(filePath, determineType(filePath));
   }
 
   // ==================== Helper Methods ====================
 
   /**
    * Search for assets under a path prefix using Nexus search API.
+   * Tries multiple approaches: search API → components API fallback.
    */
   private List<String> searchAssets(final String repository, final String pathPrefix, final String nexusBaseUrl) throws IOException {
+    List<String> results = new ArrayList<>();
+
+    // Normalize path: strip trailing slash
+    String normalizedPrefix = (pathPrefix != null && pathPrefix.endsWith("/"))
+        ? pathPrefix.substring(0, pathPrefix.length() - 1) : pathPrefix;
+
+    // Approach 1: Search API with wildcard
+    results = trySearchApi(repository, normalizedPrefix, nexusBaseUrl);
+
+    // Approach 2: Components API fallback if search returned nothing
+    if (results.isEmpty() && normalizedPrefix != null && !normalizedPrefix.isEmpty()) {
+      log.debug("Search API returned empty for {}/{}, trying components API", repository, normalizedPrefix);
+      results = tryComponentsApi(repository, normalizedPrefix, nexusBaseUrl);
+    }
+
+    return results;
+  }
+
+  /**
+   * Try Nexus Search API to find assets.
+   */
+  private List<String> trySearchApi(final String repository, final String pathPrefix,
+                                     final String nexusBaseUrl) throws IOException {
     List<String> results = new ArrayList<>();
     try {
       String encodedPrefix = pathPrefix.replace("%", "%25").replace("+", "%2B")
@@ -457,14 +518,43 @@ public class PromotionService {
 
       int code = conn.getResponseCode();
       if (code == 200) {
-        // Parse JSON response manually to avoid extra dependencies
         String json = readStream(conn.getInputStream());
         results = parseSearchItems(json, pathPrefix);
+        log.debug("Search API found {} items for {}/{}", results.size(), repository, pathPrefix);
       }
       conn.disconnect();
     }
     catch (Exception e) {
       log.warn("Search API call failed for {}/{}, returning empty: {}", repository, pathPrefix, e.getMessage());
+    }
+    return results;
+  }
+
+  /**
+   * Fallback: Use components API to list all components and filter by path prefix.
+   */
+  private List<String> tryComponentsApi(final String repository, final String pathPrefix,
+                                         final String nexusBaseUrl) throws IOException {
+    List<String> results = new ArrayList<>();
+    try {
+      String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository;
+      URL url = new URL(urlStr);
+      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(30_000);
+      conn.setReadTimeout(120_000);
+      conn.setRequestProperty("Accept", "application/json");
+
+      int code = conn.getResponseCode();
+      if (code == 200) {
+        String json = readStream(conn.getInputStream());
+        results = parseComponentAssets(json, pathPrefix);
+        log.debug("Components API found {} items for {}/{}", results.size(), repository, pathPrefix);
+      }
+      conn.disconnect();
+    }
+    catch (Exception e) {
+      log.warn("Components API call failed for {}/{}: {}", repository, pathPrefix, e.getMessage());
     }
     return results;
   }
@@ -521,6 +611,88 @@ public class PromotionService {
       log.warn("Failed to parse search response: {}", e.getMessage());
     }
     return items;
+  }
+
+  /**
+   * Parse Nexus Components API response to extract asset paths.
+   * Response format: { "items": [ { "assets": [ { "path": "...", ... } ], ... }, ... ] }
+   */
+  private List<String> parseComponentAssets(final String json, final String pathPrefix) {
+    List<String> results = new ArrayList<>();
+    if (json == null || json.isEmpty()) return results;
+
+    try {
+      int itemsStart = json.indexOf("\"items\"");
+      if (itemsStart < 0) return results;
+
+      int arrayStart = json.indexOf('[', itemsStart);
+      if (arrayStart < 0) return results;
+
+      // Find matching ]
+      int depth = 0;
+      int pos = arrayStart;
+      while (pos < json.length()) {
+        char c = json.charAt(pos);
+        if (c == '[') depth++;
+        else if (c == ']') {
+          depth--;
+          if (depth == 0) break;
+        }
+        pos++;
+      }
+      String itemsArray = json.substring(arrayStart, pos + 1);
+
+      // Extract each component object
+      int objStart = 0;
+      while ((objStart = itemsArray.indexOf('{', objStart)) >= 0) {
+        int objEnd = findMatchingBrace(itemsArray, objStart);
+        if (objEnd < 0) break;
+        String componentObj = itemsArray.substring(objStart, objEnd + 1);
+
+        // Find "assets" array inside this component
+        int assetsIdx = componentObj.indexOf("\"assets\"");
+        if (assetsIdx >= 0) {
+          int assetsArrStart = componentObj.indexOf('[', assetsIdx);
+          if (assetsArrStart >= 0) {
+            // Find matching ] for assets array
+            int aDepth = 0;
+            int aPos = assetsArrStart;
+            while (aPos < componentObj.length()) {
+              char c = componentObj.charAt(aPos);
+              if (c == '[') aDepth++;
+              else if (c == ']') {
+                aDepth--;
+                if (aDepth == 0) break;
+              }
+              aPos++;
+            }
+            String assetsArr = componentObj.substring(assetsArrStart, aPos + 1);
+
+            // Extract each asset object and get "path"
+            int aObjStart = 0;
+            while ((aObjStart = assetsArr.indexOf('{', aObjStart)) >= 0) {
+              int aObjEnd = findMatchingBrace(assetsArr, aObjStart);
+              if (aObjEnd < 0) break;
+              String assetObj = assetsArr.substring(aObjStart, aObjEnd + 1);
+
+              String assetPath = extractJsonString(assetObj, "path");
+              if (assetPath != null && !assetPath.isEmpty()
+                  && assetPath.startsWith(pathPrefix)
+                  && !assetPath.equals(pathPrefix)) {
+                results.add(assetPath);
+              }
+              aObjStart = aObjEnd + 1;
+            }
+          }
+        }
+
+        objStart = objEnd + 1;
+      }
+    }
+    catch (Exception e) {
+      log.warn("Failed to parse components response: {}", e.getMessage());
+    }
+    return results;
   }
 
   /**

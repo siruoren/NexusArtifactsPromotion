@@ -58,25 +58,20 @@ public class PromotionTaskResult {
   @JsonInclude(JsonInclude.Include.NON_NULL)
   public static class FileItem {
     private String path;
-    private FileAction action;
     private String type; // "directory", "file", "image"
     private String status;
     private String errorMessage;
 
     public FileItem() {}
 
-    public FileItem(String path, FileAction action, String type) {
+    public FileItem(String path, String type) {
       this.path = path;
-      this.action = action;
       this.type = type;
       this.status = "success";
     }
 
     public String getPath() { return path; }
     public void setPath(String path) { this.path = path; }
-
-    public FileAction getAction() { return action; }
-    public void setAction(FileAction action) { this.action = action; }
 
     public String getType() { return type; }
     public void setType(String type) { this.type = type; }
@@ -88,11 +83,4 @@ public class PromotionTaskResult {
     public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
   }
 
-  /**
-   * Action taken on a file during promotion.
-   */
-  public enum FileAction {
-    CREATED,
-    UPDATED
-  }
 }

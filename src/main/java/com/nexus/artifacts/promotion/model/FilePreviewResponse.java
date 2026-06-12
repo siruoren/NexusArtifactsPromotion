@@ -42,15 +42,13 @@ public class FilePreviewResponse {
     private String path;
     private String type; // "directory", "file", "image"
     private long size;
-    private boolean existsInTarget;
 
     public FileEntry() {}
 
-    public FileEntry(String path, String type, long size, boolean existsInTarget) {
+    public FileEntry(String path, String type, long size) {
       this.path = path;
       this.type = type;
       this.size = size;
-      this.existsInTarget = existsInTarget;
     }
 
     public String getPath() { return path; }
@@ -61,8 +59,5 @@ public class FilePreviewResponse {
 
     public long getSize() { return size; }
     public void setSize(long size) { this.size = size; }
-
-    public boolean isExistsInTarget() { return existsInTarget; }
-    public void setExistsInTarget(boolean existsInTarget) { this.existsInTarget = existsInTarget; }
   }
 }
