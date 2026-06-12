@@ -217,6 +217,10 @@ public class PromotionService {
         result.setUsername(username);
         result.setStartTime(System.currentTimeMillis());
         result.setTaskId(taskId);
+        result.setStatus(TaskStatus.RUNNING.getValue());
+
+        // Put initial result so frontend can poll immediately
+        taskResults.put(taskId, result);
 
         List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
 
@@ -233,7 +237,7 @@ public class PromotionService {
           }
 
           result.setItems(promotedItems);
-          result.setStatus(TaskStatus.COMPLETED);
+          result.setStatus(TaskStatus.COMPLETED.getValue());
           result.setEndTime(System.currentTimeMillis());
 
           log.info("Promotion task {} completed: {} items from {} to {}",
@@ -241,7 +245,7 @@ public class PromotionService {
         }
         catch (Exception e) {
           log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
-          result.setStatus(TaskStatus.FAILED);
+          result.setStatus(TaskStatus.FAILED.getValue());
           result.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
         }
@@ -250,7 +254,7 @@ public class PromotionService {
 
         return new TaskExecutorService.PromotionTaskCallback() {
           @Override public String getTaskId() { return taskId; }
-          @Override public TaskStatus getStatus() { return result.getStatus(); }
+          @Override public TaskStatus getStatus() { return TaskStatus.fromValue(result.getStatus()); }
           @Override public String getErrorMessage() { return result.getErrorMessage(); }
         };
       }
@@ -818,6 +822,11 @@ public class PromotionService {
                                    final List<PromotionTaskResult.FileItem> items) {
     if (taskResult != null) {
       taskResult.setItems(new ArrayList<>(items)); // Copy for thread safety
+      // Also update taskResults map so frontend can poll progress during task execution
+      String tid = taskResult.getTaskId();
+      if (tid != null) {
+        taskResults.put(tid, taskResult);
+      }
     }
   }
 

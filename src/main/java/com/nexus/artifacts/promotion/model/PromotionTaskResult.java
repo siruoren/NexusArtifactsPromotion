@@ -14,7 +14,7 @@ public class PromotionTaskResult {
   private String taskId;
   private String sourceRepository;
   private String targetRepository;
-  private TaskStatus status;
+  private String status;
   private List<FileItem> items;
   private String username;
   private long startTime;
@@ -34,8 +34,8 @@ public class PromotionTaskResult {
   public String getTargetRepository() { return targetRepository; }
   public void setTargetRepository(String targetRepository) { this.targetRepository = targetRepository; }
 
-  public TaskStatus getStatus() { return status; }
-  public void setStatus(TaskStatus status) { this.status = status; }
+  public String getStatus() { return status; }
+  public void setStatus(String status) { this.status = status; }
 
   public List<FileItem> getItems() { return items; }
   public void setItems(List<FileItem> items) { this.items = items; }
