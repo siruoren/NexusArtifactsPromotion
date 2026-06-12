@@ -141,9 +141,9 @@ public class PromotionService {
 
     try {
       StorageFacet storageFacet = sourceRepo.facet(StorageFacet.class);
-      UnitOfWork.begin(storageFacet.txSupplier());
+      final StorageTx tx = storageFacet.txSupplier().get();
+      boolean committed = false;
       try {
-        StorageTx tx = UnitOfWork.currentTx();
         Query query = Query.builder()
             .where("name").like(escapeLike(request.getPath()) + "%")
             .build();
@@ -164,9 +164,11 @@ public class PromotionService {
         }
         preview.setTotalCount(count);
         preview.setTotalSize(totalSize);
+        tx.commit();
+        committed = true;
       }
       finally {
-        UnitOfWork.end();
+        if (!committed) { tx.rollback(); }
       }
     }
     catch (Exception e) {
@@ -295,9 +297,9 @@ public class PromotionService {
 
     try {
       StorageFacet sourceStorage = sourceRepo.facet(StorageFacet.class);
-      UnitOfWork.begin(sourceStorage.txSupplier());
+      final StorageTx tx = sourceStorage.txSupplier().get();
+      boolean committed = false;
       try {
-        StorageTx tx = UnitOfWork.currentTx();
         Query query = Query.builder()
             .where("name").like(escapeLike(directoryPath) + "%")
             .build();
@@ -318,9 +320,11 @@ public class PromotionService {
             items.add(item);
           }
         }
+        tx.commit();
+        committed = true;
       }
       finally {
-        UnitOfWork.end();
+        if (!committed) { tx.rollback(); }
       }
     }
     catch (Exception e) {
@@ -342,18 +346,20 @@ public class PromotionService {
 
     try {
       StorageFacet sourceStorage = sourceRepo.facet(StorageFacet.class);
-      UnitOfWork.begin(sourceStorage.txSupplier());
+      final StorageTx tx = sourceStorage.txSupplier().get();
+      boolean committed = false;
       try {
-        StorageTx tx = UnitOfWork.currentTx();
         Bucket bucket = tx.findBucket(sourceRepo);
         Asset asset = tx.findAssetWithProperty("name", filePath, bucket);
         if (asset == null) {
           throw new IllegalArgumentException("Asset not found: " + filePath);
         }
         items.add(promoteSingleAsset(sourceRepo, targetRepo, tx, asset));
+        tx.commit();
+        committed = true;
       }
       finally {
-        UnitOfWork.end();
+        if (!committed) { tx.rollback(); }
       }
     }
     catch (Exception e) {
@@ -394,9 +400,9 @@ public class PromotionService {
 
       // Stream content to target repository
       StorageFacet targetStorage = targetRepo.facet(StorageFacet.class);
-      UnitOfWork.begin(targetStorage.txSupplier());
+      final StorageTx targetTx = targetStorage.txSupplier().get();
+      boolean targetCommitted = false;
       try {
-        StorageTx targetTx = UnitOfWork.currentTx();
         Bucket targetBucket = targetTx.findBucket(targetRepo);
 
         try (InputStream inputStream = blob.getInputStream()) {
@@ -404,9 +410,10 @@ public class PromotionService {
         }
 
         targetTx.commit();
+        targetCommitted = true;
       }
       finally {
-        UnitOfWork.end();
+        if (!targetCommitted) { targetTx.rollback(); }
       }
     }
     catch (Exception e) {
@@ -469,14 +476,13 @@ public class PromotionService {
         return false;
       }
       StorageFacet storageFacet = targetRepo.facet(StorageFacet.class);
-      UnitOfWork.begin(storageFacet.txSupplier());
+      final StorageTx tx = storageFacet.txSupplier().get();
       try {
-        StorageTx tx = UnitOfWork.currentTx();
         Bucket bucket = tx.findBucket(targetRepo);
         return tx.findAssetWithProperty("name", assetName, bucket) != null;
       }
       finally {
-        UnitOfWork.end();
+        tx.rollback();
       }
     }
     catch (Exception e) {

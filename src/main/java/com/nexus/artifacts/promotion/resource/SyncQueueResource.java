@@ -12,6 +12,8 @@ import javax.ws.rs.PUT;
 import javax.ws.rs.Path;
 import javax.ws.rs.Produces;
 import javax.ws.rs.Consumes;
+import javax.ws.rs.QueryParam;
+import javax.ws.rs.DefaultValue;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
 
@@ -81,10 +83,37 @@ public class SyncQueueResource implements Resource {
    * Shows: queue ID, source/target repo, file details, status, times, username, result.
    */
   @GET
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("List all sync queue tasks (root endpoint)")
+  public Response listAllTasks(
+      @QueryParam("page") @DefaultValue("1") int page,
+      @QueryParam("start") @DefaultValue("0") int start,
+      @QueryParam("limit") @DefaultValue("25") int limit
+  ) {
+    Response authError = requireAuthentication();
+    if (authError != null) {
+      return authError;
+    }
+    try {
+      List<SyncTaskInfo> tasks = syncService.getAllSyncTasks();
+      return Response.ok(tasks).build();
+    }
+    catch (Exception e) {
+      log.error("Failed to list sync tasks: {}", e.getMessage());
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to list sync tasks\"}")
+          .build();
+    }
+  }
+
+  /**
+   * Get all sync tasks (alias /list for backward compatibility).
+   */
+  @GET
   @Path("/list")
   @Produces(MediaType.APPLICATION_JSON)
   @ApiOperation("List all sync queue tasks")
-  public Response listAllTasks()
+  public Response listAllTasksAlias()
   {
     Response authError = requireAuthentication();
     if (authError != null) {
