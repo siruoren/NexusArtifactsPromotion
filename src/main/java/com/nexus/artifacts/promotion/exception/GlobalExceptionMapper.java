@@ -20,10 +20,13 @@ public class GlobalExceptionMapper implements ExceptionMapper<Exception> {
   @Override
   public Response toResponse(final Exception exception) {
     if (exception instanceof PermissionDeniedException) {
+      PermissionDeniedException pde = (PermissionDeniedException) exception;
       log.warn("Permission denied: {}", exception.getMessage());
       return Response.status(Response.Status.FORBIDDEN)
           .type(MediaType.APPLICATION_JSON)
-          .entity("{\"error\":\"Permission denied\",\"message\":\"" +
+          .entity("{\"error\":\"Permission denied\",\"username\":\"" +
+              sanitize(pde.getUsername()) + "\",\"repository\":\"" +
+              sanitize(pde.getRepository()) + "\",\"message\":\"" +
               sanitize(exception.getMessage()) + "\"}")
           .build();
     }

@@ -17,8 +17,9 @@
   "promotion.result.close": "Close",
   "promotion.permission.denied": "You do not have promotion permission for this repository.",
   "promotion.permission.denied.admin": "You do not have promotion permission. Please contact your administrator.",
+  "promotion.permission.write.denied": "User '{0}' does not have promotion write permission for repository '{1}'.",
   "promotion.noTargets.title": "No Target Repositories",
-  "promotion.noTargets.message": "No available target repositories with the same format and your promotion permission.",
+  "promotion.noTargets.message": "No available target repositories with the same format and your write permission.",
   "promotion.preview.failed": "Preview Failed",
   "promotion.execute.failed": "Promotion Failed",
 

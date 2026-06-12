@@ -9,15 +9,15 @@ import org.apache.shiro.subject.Subject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.nexus.artifacts.promotion.exception.PermissionDeniedException;
+
 /**
- * Enterprise-grade permission checker for promotion and sync operations.
- * Validates user permissions at both UI and API levels.
+ * Permission checker using Nexus system permissions.
+ * Uses Nexus built-in repository-view permissions instead of custom privileges.
  *
- * Permission format follows Shiro WildcardPermission:
- *   domain:action
- *
- * Wildcard: nexus-artifacts-promotion:promote  (all repos)
- * Specific: nexus-artifacts-promotion-{repoName}-{format}:promote
+ * Nexus system permission format:
+ *   nexus:repository-view:{format}:{repositoryName}:edit  (write)
+ *   nexus:repository-view:{format}:{repositoryName}:read  (read)
  */
 @Named
 @Singleton
@@ -30,96 +30,84 @@ public class PermissionChecker {
   }
 
   /**
-   * Check if the current user has promotion permission for the given repository.
+   * Check if the current user has write (edit) permission on a repository.
+   * Uses Nexus system permission: nexus:repository-view:{format}:{repoName}:edit
    */
-  public boolean hasPromotionPermission(final String repositoryName, final String format) {
+  public boolean hasRepositoryWritePermission(final String repositoryName, final String format) {
     Subject subject = SecurityUtils.getSubject();
     if (subject == null || !subject.isAuthenticated()) {
-      log.warn("Promotion permission check failed: no authenticated subject");
+      log.warn("Write permission check failed: no authenticated subject");
       return false;
     }
 
     String fmt = (format != null && !format.isEmpty()) ? format : "raw";
 
-    // Check specific repository permission first
-    // ApplicationPermission generates: nexus:{domain}:{actions}
-    // domain = "nexus-artifacts-promotion-{repoName}-{format}", action = "promote"
-    String specificPermission = "nexus:nexus-artifacts-promotion-"
-        + sanitize(repositoryName) + "-" + sanitize(fmt)
-        + ":" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
-
-    if (subject.isPermitted(specificPermission)) {
-      log.debug("User '{}' has specific promotion permission for repo '{}', format '{}'",
+    // Check specific repository write permission
+    String permission = "nexus:repository-view:" + fmt + ":" + repositoryName + ":edit";
+    if (subject.isPermitted(permission)) {
+      log.debug("User '{}' has write permission for repo '{}', format '{}'",
           subject.getPrincipal(), repositoryName, fmt);
       return true;
     }
 
-    // Check wildcard permission: "nexus:nexus-artifacts-promotion:promote"
-    String wildcardPermission = "nexus:nexus-artifacts-promotion:" + PromotionPrivilegeDescriptor.ACTION_PROMOTE;
-    if (subject.isPermitted(wildcardPermission)) {
-      log.debug("User '{}' has wildcard promotion permission", subject.getPrincipal());
-      return true;
-    }
-
-    log.warn("User '{}' lacks promotion permission for repo '{}', format '{}'",
-        subject.getPrincipal(), repositoryName, fmt);
+    log.debug("User '{}' lacks write permission for repo '{}', format '{}', tried: {}",
+        subject.getPrincipal(), repositoryName, fmt, permission);
     return false;
   }
 
   /**
-   * Check if the current user has sync permission for the given repository.
+   * Check if the current user has read permission on a repository.
+   * Uses Nexus system permission: nexus:repository-view:{format}:{repoName}:read
    */
-  public boolean hasSyncPermission(final String repositoryName, final String format) {
+  public boolean hasRepositoryReadPermission(final String repositoryName, final String format) {
     Subject subject = SecurityUtils.getSubject();
     if (subject == null || !subject.isAuthenticated()) {
-      log.warn("Sync permission check failed: no authenticated subject");
       return false;
     }
 
     String fmt = (format != null && !format.isEmpty()) ? format : "raw";
+    String permission = "nexus:repository-view:" + fmt + ":" + repositoryName + ":read";
+    return subject.isPermitted(permission);
+  }
 
-    // Check specific repository permission
-    // ApplicationPermission generates: nexus:{domain}:{actions}
-    String specificPermission = "nexus:nexus-artifacts-sync-"
-        + sanitize(repositoryName) + "-" + sanitize(fmt)
-        + ":" + SyncPrivilegeDescriptor.ACTION_SYNC;
-
-    if (subject.isPermitted(specificPermission)) {
-      log.debug("User '{}' has specific sync permission for repo '{}', format '{}'",
-          subject.getPrincipal(), repositoryName, fmt);
-      return true;
-    }
-
-    // Check wildcard permission
-    String wildcardPermission = "nexus:nexus-artifacts-sync:" + SyncPrivilegeDescriptor.ACTION_SYNC;
-    if (subject.isPermitted(wildcardPermission)) {
-      log.debug("User '{}' has wildcard sync permission", subject.getPrincipal());
-      return true;
-    }
-
-    log.warn("User '{}' lacks sync permission for repo '{}', format '{}'",
-        subject.getPrincipal(), repositoryName, fmt);
-    return false;
+  /**
+   * Check if the current user has promotion permission for a source repository.
+   * For source repo, we only need read permission (user can see the asset).
+   */
+  public boolean hasPromotionPermission(final String repositoryName, final String format) {
+    return hasRepositoryReadPermission(repositoryName, format);
   }
 
   /**
    * Check if the current user has promotion permission for a target repository.
+   * For target repo, we need write (edit) permission.
    */
   public boolean hasPromotionPermissionForTarget(final String sourceRepository,
                                                   final String targetRepository,
                                                   final String format)
   {
-    return hasPromotionPermission(sourceRepository, format)
-        && hasPromotionPermission(targetRepository, format);
+    return hasRepositoryReadPermission(sourceRepository, format)
+        && hasRepositoryWritePermission(targetRepository, format);
   }
 
   /**
-   * Assert promotion permission, throwing exception if not authorized.
+   * Assert write permission on target repository, throwing exception if not authorized.
+   * The exception includes username and repository name for UI display.
+   */
+  public void checkTargetWritePermission(final String targetRepository, final String format) {
+    if (!hasRepositoryWritePermission(targetRepository, format)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("edit", username, targetRepository);
+    }
+  }
+
+  /**
+   * Assert promotion permission for source repository (read access).
    */
   public void checkPromotionPermission(final String repositoryName, final String format) {
-    if (!hasPromotionPermission(repositoryName, format)) {
-      throw new SecurityException(
-          "User does not have promotion permission for repository: " + repositoryName);
+    if (!hasRepositoryReadPermission(repositoryName, format)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("read", username, repositoryName);
     }
   }
 
@@ -130,10 +118,22 @@ public class PermissionChecker {
                                                   final String targetRepository,
                                                   final String format)
   {
-    if (!hasPromotionPermissionForTarget(sourceRepository, targetRepository, format)) {
-      throw new SecurityException(
-          "User does not have promotion permission for repositories: " + sourceRepository + " -> " + targetRepository);
+    if (!hasRepositoryReadPermission(sourceRepository, format)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("read", username, sourceRepository);
     }
+    if (!hasRepositoryWritePermission(targetRepository, format)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("edit", username, targetRepository);
+    }
+  }
+
+  /**
+   * Check if the current user has sync permission for the given repository.
+   * Sync requires edit permission on the repository.
+   */
+  public boolean hasSyncPermission(final String repositoryName, final String format) {
+    return hasRepositoryWritePermission(repositoryName, format);
   }
 
   /**
@@ -141,8 +141,8 @@ public class PermissionChecker {
    */
   public void checkSyncPermission(final String repositoryName, final String format) {
     if (!hasSyncPermission(repositoryName, format)) {
-      throw new SecurityException(
-          "User does not have sync permission for repository: " + repositoryName);
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("edit", username, repositoryName);
     }
   }
 
@@ -155,12 +155,5 @@ public class PermissionChecker {
       return subject.getPrincipal().toString();
     }
     return "anonymous";
-  }
-
-  private String sanitize(final String input) {
-    if (input == null || input.isEmpty()) {
-      return "_";
-    }
-    return input.replaceAll("[^a-zA-Z0-9_\\-.]", "_");
   }
 }

@@ -5,15 +5,12 @@ com.nexus.artifacts.promotion.config.PromotionCapability
 com.nexus.artifacts.promotion.config.PromotionCapabilityDescriptor
 com.nexus.artifacts.promotion.config.SyncCapability
 com.nexus.artifacts.promotion.config.SyncCapabilityDescriptor
+com.nexus.artifacts.promotion.exception.GlobalExceptionMapper
 com.nexus.artifacts.promotion.resource.PromotionResource
 com.nexus.artifacts.promotion.resource.SyncQueueResource
 com.nexus.artifacts.promotion.resource.SyncResource
 com.nexus.artifacts.promotion.resource.SystemConfigResource
 com.nexus.artifacts.promotion.security.PermissionChecker
-com.nexus.artifacts.promotion.security.PrivilegeInitializer
-com.nexus.artifacts.promotion.security.PromotionPrivilegeDescriptor
-com.nexus.artifacts.promotion.security.RepositoryPrivilegeListener
-com.nexus.artifacts.promotion.security.SyncPrivilegeDescriptor
 com.nexus.artifacts.promotion.service.PromotionService
 com.nexus.artifacts.promotion.service.SyncService
 com.nexus.artifacts.promotion.service.TaskCacheManager

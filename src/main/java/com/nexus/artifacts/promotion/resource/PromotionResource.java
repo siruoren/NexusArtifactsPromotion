@@ -17,6 +17,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.rest.Resource;
 
+import com.nexus.artifacts.promotion.exception.PermissionDeniedException;
 import com.nexus.artifacts.promotion.model.FilePreviewResponse;
 import com.nexus.artifacts.promotion.model.PromotionRequest;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
@@ -32,7 +33,7 @@ import io.swagger.annotations.ApiResponses;
 
 /**
  * REST API for artifact promotion operations.
- * All endpoints enforce permission checks.
+ * Uses Nexus system permissions (repository-view:edit) for authorization.
  */
 @Api("Artifact Promotion")
 @Path("/v1/promotion")
@@ -55,13 +56,13 @@ public class PromotionResource implements Resource {
   }
 
   /**
-   * Check if the current user has promotion permission for a repository.
+   * Check if the current user has write permission on a repository.
    * Used by UI to determine whether to show the promotion button.
    */
   @GET
   @Path("/permission")
   @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("Check promotion permission for a repository")
+  @ApiOperation("Check write permission for a repository")
   @ApiResponses({
       @ApiResponse(code = 200, message = "Permission check result"),
       @ApiResponse(code = 403, message = "No permission")
@@ -70,7 +71,7 @@ public class PromotionResource implements Resource {
                                    @QueryParam("format") final String format)
   {
     try {
-      boolean hasPermission = permissionChecker.hasPromotionPermission(repository, format);
+      boolean hasPermission = permissionChecker.hasRepositoryWritePermission(repository, format);
       return Response.ok()
           .entity("{\"hasPermission\":" + hasPermission + ",\"repository\":\""
               + sanitize(repository) + "\",\"format\":\"" + sanitize(format) + "\"}")
@@ -86,7 +87,7 @@ public class PromotionResource implements Resource {
 
   /**
    * List target repositories available for promotion.
-   * Only returns repositories of the same format where the user has promotion permission.
+   * Only returns repositories of the same format where the user has write permission.
    */
   @GET
   @Path("/targets")
@@ -94,7 +95,7 @@ public class PromotionResource implements Resource {
   @ApiOperation("List target repositories for promotion")
   @ApiResponses({
       @ApiResponse(code = 200, message = "Target repository list"),
-      @ApiResponse(code = 403, message = "No promotion permission")
+      @ApiResponse(code = 403, message = "No permission")
   })
   public Response listTargets(@QueryParam("sourceRepository") final String sourceRepository,
                                @QueryParam("format") final String format)
@@ -103,9 +104,11 @@ public class PromotionResource implements Resource {
       TargetRepositoryList result = promotionService.listTargetRepositories(sourceRepository, format);
       return Response.ok(result).build();
     }
-    catch (SecurityException e) {
+    catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"Permission denied\",\"username\":\""
+              + sanitize(e.getUsername()) + "\",\"repository\":\""
+              + sanitize(e.getRepository()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -141,9 +144,11 @@ public class PromotionResource implements Resource {
           .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
           .build();
     }
-    catch (SecurityException e) {
+    catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"Permission denied\",\"username\":\""
+              + sanitize(e.getUsername()) + "\",\"repository\":\""
+              + sanitize(e.getRepository()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -181,6 +186,13 @@ public class PromotionResource implements Resource {
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
           .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .build();
+    }
+    catch (PermissionDeniedException e) {
+      return Response.status(Response.Status.FORBIDDEN)
+          .entity("{\"error\":\"Permission denied\",\"username\":\""
+              + sanitize(e.getUsername()) + "\",\"repository\":\""
+              + sanitize(e.getRepository()) + "\"}")
           .build();
     }
     catch (SecurityException e) {

@@ -68,12 +68,11 @@ public class PromotionService {
   }
 
   /**
-   * List target repositories that the current user has promotion permission for,
+   * List target repositories where the current user has write permission,
    * filtered by same format as the source repository.
+   * No special permission required on source repo - if user can see it, they can promote from it.
    */
   public TargetRepositoryList listTargetRepositories(final String sourceRepository, final String format) {
-    permissionChecker.checkPromotionPermission(sourceRepository, format);
-
     TargetRepositoryList result = new TargetRepositoryList();
     result.setSourceRepository(sourceRepository);
     result.setFormat(format);
@@ -87,7 +86,8 @@ public class PromotionService {
       if (!repo.getFormat().getValue().equals(format)) {
         continue;
       }
-      if (!permissionChecker.hasPromotionPermission(repo.getName(), format)) {
+      // Only include repos where the current user has write (edit) permission
+      if (!permissionChecker.hasRepositoryWritePermission(repo.getName(), format)) {
         continue;
       }
 
@@ -108,8 +108,8 @@ public class PromotionService {
    */
   public FilePreviewResponse previewPromotion(final PromotionRequest request) {
     request.validate();
-    permissionChecker.checkPromotionPermissionForTarget(
-        request.getSourceRepository(), request.getTargetRepository(), request.getFormat());
+    // Only check write permission on target repo for preview
+    permissionChecker.checkTargetWritePermission(request.getTargetRepository(), request.getFormat());
 
     Repository sourceRepo = repositoryManager.get(request.getSourceRepository());
     if (sourceRepo == null) {
@@ -172,8 +172,8 @@ public class PromotionService {
   public String promote(final PromotionRequest request) {
     request.validate();
 
-    permissionChecker.checkPromotionPermissionForTarget(
-        request.getSourceRepository(), request.getTargetRepository(), request.getFormat());
+    // Check write permission on target repository
+    permissionChecker.checkTargetWritePermission(request.getTargetRepository(), request.getFormat());
 
     String username = permissionChecker.getCurrentUsername();
 
@@ -199,9 +199,9 @@ public class PromotionService {
           throw new IllegalArgumentException("Target repository not found: " + request.getTargetRepository());
         }
 
-        if (!permissionChecker.hasPromotionPermissionForTarget(
-            request.getSourceRepository(), request.getTargetRepository(), request.getFormat())) {
-          throw new SecurityException("User no longer has promotion permission");
+        // Re-check write permission inside the task
+        if (!permissionChecker.hasRepositoryWritePermission(request.getTargetRepository(), request.getFormat())) {
+          throw new SecurityException("User '" + username + "' no longer has write permission for repository: " + request.getTargetRepository());
         }
 
         List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();

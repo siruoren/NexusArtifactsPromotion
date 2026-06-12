@@ -56,8 +56,9 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.result.close": "Close",
     "promotion.permission.denied": "You do not have promotion permission for this repository.",
     "promotion.permission.denied.admin": "You do not have promotion permission. Please contact your administrator.",
+    "promotion.permission.write.denied": "User '{0}' does not have promotion write permission for repository '{1}'.",
     "promotion.noTargets.title": "No Target Repositories",
-    "promotion.noTargets.message": "No available target repositories with the same format and your promotion permission.",
+    "promotion.noTargets.message": "No available target repositories with the same format and your write permission.",
     "promotion.preview.failed": "Preview Failed",
     "promotion.execute.failed": "Promotion Failed",
 
@@ -124,8 +125,9 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.result.close": "\u5173\u95ed",
     "promotion.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u664b\u7ea7\u6743\u9650\u3002",
     "promotion.permission.denied.admin": "\u60a8\u6ca1\u6709\u664b\u7ea7\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
+    "promotion.permission.write.denied": "\u7528\u6237 '{0}' \u6ca1\u6709 '{1}' \u4ed3\u5e93\u7684\u664b\u7ea7\u5199\u5165\u6743\u9650\u3002",
     "promotion.noTargets.title": "\u65e0\u53ef\u7528\u76ee\u6807\u4ed3\u5e93",
-    "promotion.noTargets.message": "\u6ca1\u6709\u76f8\u540c\u683c\u5f0f\u4e14\u60a8\u62e5\u6709\u664b\u7ea7\u6743\u9650\u7684\u76ee\u6807\u4ed3\u5e93\u3002",
+    "promotion.noTargets.message": "\u6ca1\u6709\u76f8\u540c\u683c\u5f0f\u4e14\u60a8\u62e5\u6709\u5199\u5165\u6743\u9650\u7684\u76ee\u6807\u4ed3\u5e93\u3002",
     "promotion.preview.failed": "\u9884\u89c8\u5931\u8d25",
     "promotion.execute.failed": "\u664b\u7ea7\u5931\u8d25",
 
@@ -222,11 +224,23 @@ function sanitize(str) {
 
 function apiRequest(method, path, data) {
   return new Ext.Promise(function (resolve, reject) {
+    // Get CSRF token from cookie (Nexus uses NX-ANTI-CSRF-TOKEN)
+    var csrfToken = null;
+    var cookies = document.cookie.split(';');
+    for (var i = 0; i < cookies.length; i++) {
+      var cookie = cookies[i].trim();
+      if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
+        csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
+        break;
+      }
+    }
+
     var opts = {
       method: method,
       url: '/service/rest/v1' + path,
       headers: {
-        'Accept': 'application/json'
+        'Accept': 'application/json',
+        'X-Nexus-UI': 'true'
       },
       success: function (response) {
         var status = response.status;
@@ -244,11 +258,22 @@ function apiRequest(method, path, data) {
       failure: function (response) {
         var status = response.status;
         if (status === 401) {
-          reject(new Error('401 Authentication required'));
+          // CSRF token mismatch or session expired
+          reject(new Error('Authentication required, please refresh the page and try again'));
           return;
         }
         if (status === 403) {
-          reject(new Error('No permission'));
+          // Try to parse the response body for username and repository info
+          try {
+            var errBody = Ext.decode(response.responseText);
+            var permErr = new Error(errBody.error || 'No permission');
+            permErr.username = errBody.username;
+            permErr.repository = errBody.repository;
+            permErr.responseData = errBody;
+            reject(permErr);
+          } catch (e) {
+            reject(new Error('No permission'));
+          }
           return;
         }
         try {
@@ -263,6 +288,9 @@ function apiRequest(method, path, data) {
     if (data) {
       opts.jsonData = data;
       opts.headers['Content-Type'] = 'application/json';
+    }
+    if (csrfToken) {
+      opts.headers['NX-ANTI-CSRF-TOKEN'] = csrfToken;
     }
     Ext.Ajax.request(opts);
   });
@@ -446,7 +474,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       text: _t('sync.queue.page.title'),
       description: _t('sync.queue.page.title'),
       view: { xtype: 'nx-artifacts-promotion-syncqueue' },
-      iconCls: 'x-fa fa-exchange',
+      iconCls: 'x-fa fa-tasks',
       weight: 200,
       authenticationRequired: true,
       visible: function () {
@@ -468,9 +496,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     // ComponentFolderInfo does not fire events on setModel,
     // so we override setModel to fire a custom 'folderupdated' event
+    // and store the folder model on the panel for later access
     var origSetModel = NX.coreui.view.component.ComponentFolderInfo.prototype.setModel;
     NX.coreui.view.component.ComponentFolderInfo.prototype.setModel = function (folder) {
       origSetModel.call(this, folder);
+      // Store folder model on the panel instance for tryAddFolderButtons
+      this.folderModel = folder;
       this.fireEvent('folderupdated', this, folder);
     };
 
@@ -499,8 +530,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     me.tryAddFolderButtons(panel);
   },
 
-  onFolderInfoUpdated: function (panel) {
+  onFolderInfoUpdated: function (panel, folder) {
     var me = this;
+    // Ensure folderModel is set on the panel
+    if (folder) {
+      panel.folderModel = folder;
+    }
     me.tryAddFolderButtons(panel);
   },
 
@@ -510,8 +545,50 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var folderModel = panel.folderModel;
       if (!folderModel) return;
 
-      var repoName = folderModel.repositoryName;
-      var path = folderModel.path;
+      // folderModel may be an Ext.data.Model or a plain object
+      // Try both direct property access and get() method
+      var repoName = folderModel.repositoryName || (folderModel.get && folderModel.get('repositoryName'));
+      var path = folderModel.path || (folderModel.get && folderModel.get('path'));
+
+      // Additional fallback: try common property names in Nexus folder models
+      if (!repoName) {
+        repoName = folderModel.repository || (folderModel.get && folderModel.get('repository'));
+      }
+      if (!path) {
+        path = folderModel.id || (folderModel.get && folderModel.get('id'));
+      }
+
+      if (!repoName || !path) {
+        // Fallback: try to get info from the panel's display fields
+        var panelItems = panel.query('displayfield');
+        Ext.each(panelItems, function (field) {
+          if (!repoName && field.fieldLabel && field.fieldLabel.indexOf('\u4ed3\u5e93') >= 0) {
+            repoName = field.getValue();
+          }
+          if (!path && field.fieldLabel && (field.fieldLabel.indexOf('\u8def\u5f84') >= 0 || field.fieldLabel.indexOf('Path') >= 0)) {
+            path = field.getValue();
+          }
+        });
+      }
+
+      if (!repoName || !path) {
+        // Fallback: try to get repository name from the tree panel's store
+        var treePanel = panel.up('nx-coreui-component-asset-tree');
+        if (treePanel) {
+          var tree = treePanel.down('treepanel');
+          if (tree) {
+            var selected = tree.getSelectionModel().getSelection()[0];
+            if (selected) {
+              if (!repoName) {
+                repoName = selected.get('repositoryName') || selected.get('text');
+              }
+              if (!path) {
+                path = selected.get('id') || selected.get('text');
+              }
+            }
+          }
+        }
+      }
 
       if (!repoName || !path) return;
 
@@ -558,6 +635,49 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         }
       }
     } catch (e) { /* ignore */ }
+    try {
+      // Fallback: try folderModel format
+      if (this._currentFolderPanel && this._currentFolderPanel.folderModel) {
+        var fm = this._currentFolderPanel.folderModel;
+        var fmt = fm.format || (fm.get && fm.get('format'));
+        if (fmt) return fmt;
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      // Fallback: try assetModel format
+      if (this._currentAssetPanel && this._currentAssetPanel.assetModel) {
+        var am = this._currentAssetPanel.assetModel;
+        var afmt = am.format || (am.get && am.get('format'));
+        if (afmt) return afmt;
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      // Fallback: try componentModel format
+      if (this._currentAssetPanel && this._currentAssetPanel.componentModel) {
+        var cm = this._currentAssetPanel.componentModel;
+        var cfmt = cm.format || (cm.get && cm.get('format'));
+        if (cfmt) return cfmt;
+      }
+    } catch (e) { /* ignore */ }
+    // Last resort: try to guess format from repository name patterns
+    if (repoName) {
+      if (repoName.indexOf('maven') >= 0 || repoName.indexOf('Maven') >= 0) return 'maven2';
+      if (repoName.indexOf('npm') >= 0 || repoName.indexOf('NPM') >= 0) return 'npm';
+      if (repoName.indexOf('nuget') >= 0 || repoName.indexOf('NuGet') >= 0) return 'nuget';
+      if (repoName.indexOf('pypi') >= 0 || repoName.indexOf('PyPI') >= 0) return 'pypi';
+      if (repoName.indexOf('docker') >= 0 || repoName.indexOf('Docker') >= 0) return 'docker';
+      if (repoName.indexOf('raw') >= 0 || repoName.indexOf('Raw') >= 0) return 'raw';
+      if (repoName.indexOf('yum') >= 0 || repoName.indexOf('Yum') >= 0) return 'yum';
+      if (repoName.indexOf('apt') >= 0 || repoName.indexOf('APT') >= 0) return 'apt';
+      if (repoName.indexOf('go') >= 0 || repoName.indexOf('Go') >= 0) return 'go';
+      if (repoName.indexOf('conda') >= 0 || repoName.indexOf('Conda') >= 0) return 'conda';
+      if (repoName.indexOf('rubygems') >= 0 || repoName.indexOf('RubyGems') >= 0) return 'rubygems';
+      if (repoName.indexOf('helm') >= 0 || repoName.indexOf('Helm') >= 0) return 'helm';
+      if (repoName.indexOf('gitlfs') >= 0 || repoName.indexOf('GitLFS') >= 0) return 'gitlfs';
+      if (repoName.indexOf('r') >= 0 || repoName.indexOf('R') >= 0) return 'r';
+      // Default to raw if we can't determine
+      return 'raw';
+    }
     return null;
   },
 
@@ -667,13 +787,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
   handlePromotionClick: function (repoName, path, isDirectory, format) {
     var me = this;
-    checkPromotionPermission(repoName, format).then(function (hasPermission) {
-      if (!hasPermission) {
-        showAlertDialog(_t('common.noPermission'), _t('promotion.permission.denied'));
-        return;
-      }
-      me.showPromotionModal(repoName, path, isDirectory, format);
-    });
+    // Directly show promotion modal - target repo list is filtered by write permission
+    me.showPromotionModal(repoName, path, isDirectory, format);
   },
 
   handleSyncClick: function (repoName, path, isDirectory, format) {
@@ -794,31 +909,33 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             var targetRepo = win.down('#targetCombo').getValue();
             if (!targetRepo) return;
 
-            checkPromotionPermission(request.sourceRepository, request.format).then(function (hasPermission) {
-              if (!hasPermission) {
-                showAlertDialog(_t('common.noPermission'), _t('promotion.permission.denied.admin'));
+            var btn = win.down('#promoteBtn');
+            btn.setText(_t('promotion.modal.promoting'));
+            btn.disable();
+
+            apiRequest('POST', '/promotion/execute', {
+              sourceRepository: request.sourceRepository,
+              targetRepository: targetRepo,
+              path: request.path,
+              isDirectory: request.isDirectory,
+              format: request.format
+            })
+            .then(function (result) {
+              win.close();
+              me.pollPromotionTask(result.taskId, targetRepo);
+            })
+            .catch(function (err) {
+              btn.setText(_t('promotion.modal.promote'));
+              btn.enable();
+              // Check if error contains username and repository info for write permission denied
+              if (err.username && err.repository) {
+                var msg = _t('promotion.permission.write.denied')
+                  .replace('{0}', err.username)
+                  .replace('{1}', err.repository);
+                showAlertDialog(_t('common.noPermission'), msg);
                 return;
               }
-              var btn = win.down('#promoteBtn');
-              btn.setText(_t('promotion.modal.promoting'));
-              btn.disable();
-
-              apiRequest('POST', '/promotion/execute', {
-                sourceRepository: request.sourceRepository,
-                targetRepository: targetRepo,
-                path: request.path,
-                isDirectory: request.isDirectory,
-                format: request.format
-              })
-              .then(function (result) {
-                win.close();
-                me.pollPromotionTask(result.taskId, targetRepo);
-              })
-              .catch(function (err) {
-                btn.setText(_t('promotion.modal.promote'));
-                btn.enable();
-                showAlertDialog(_t('promotion.execute.failed'), sanitize(err.message));
-              });
+              showAlertDialog(_t('promotion.execute.failed'), sanitize(err.message));
             });
           }
         }
