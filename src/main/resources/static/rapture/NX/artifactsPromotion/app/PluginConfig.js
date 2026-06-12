@@ -1184,7 +1184,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             });
           }
         }
-        progressBar.setText(_t('promotion.progress.completed', done, total));
+        progressBar.updateText(_t('promotion.progress.completed', done, total));
       }
 
       // Update window title
@@ -1207,62 +1207,45 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         return;
       }
 
-      // Use Ext.Ajax.request directly instead of apiRequest to avoid Promise issues
-      var defaultHeaders = Ext.Ajax.defaultHeaders || {};
-      var csrfToken = defaultHeaders['NX-ANTI-CSRF-TOKEN'];
-      if (!csrfToken) {
-        var cookies = document.cookie.split(';');
-        for (var ci = 0; ci < cookies.length; ci++) {
-          var cookie = cookies[ci].trim();
-          if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
-            csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
-            break;
-          }
+      // Use raw XMLHttpRequest to avoid any framework issues
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/service/rest/v1/promotion/task/' + encodeURIComponent(taskId), true);
+      xhr.setRequestHeader('Accept', 'application/json');
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        if (isFinished || win.destroyed) {
+          stopPolling();
+          return;
         }
-      }
 
-      var ajaxOpts = {
-        method: 'GET',
-        url: '/service/rest/v1/promotion/task/' + encodeURIComponent(taskId),
-        headers: {
-          'Accept': 'application/json',
-          'X-Nexus-UI': 'true'
-        },
-        success: function (response) {
-          if (isFinished || win.destroyed) {
-            stopPolling();
-            return;
-          }
+        if (xhr.status !== 200) {
+          // Task not found or error - retry next interval
+          return;
+        }
 
-          var grid = win.down('#fileGrid');
-          var progressBar = win.down('#overallProgress');
-          if (!grid || !progressBar || win.destroyed) {
-            stopPolling();
-            return;
-          }
+        var grid = win.down('#fileGrid');
+        var progressBar = win.down('#overallProgress');
+        if (!grid || !progressBar || win.destroyed) {
+          stopPolling();
+          return;
+        }
 
-          var store = grid.getStore();
-          var result = {};
-          try {
-            if (response.responseText) {
-              result = Ext.decode(response.responseText);
-            }
-          } catch (e) {
-            // JSON parse failed - show error in progress bar
-            progressBar.setText('Error parsing response');
-            return;
-          }
+        var store = grid.getStore();
+        var result = {};
+        try {
+          result = JSON.parse(xhr.responseText);
+        } catch (e) {
+          progressBar.updateText('Error parsing response');
+          return;
+        }
 
-          var statusStr = (result.status || '').toLowerCase();
-          var backendItems = result.items || [];
-          var backendItemCount = backendItems.length;
+        var statusStr = (result.status || '').toLowerCase();
+        var backendItems = result.items || [];
+        var backendItemCount = backendItems.length;
+        var currentTotal = Math.max(store.getCount(), totalFiles);
 
-          // Show status in progress bar for debugging
-          var currentTotal = Math.max(store.getCount(), totalFiles);
-
-          if (statusStr === 'completed' || statusStr === 'failed') {
+        if (statusStr === 'completed' || statusStr === 'failed') {
             var taskFailed = (statusStr === 'failed');
-            var backendDoneCount = backendItemCount; // All items are done when task is completed
 
             // Update store items from backend results
             for (var i = 0; i < backendItems.length; i++) {
@@ -1282,66 +1265,78 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               }
             });
 
-            // Use backend count directly - don't rely on store
-            finishProgress(
-              { status: taskFailed ? 'FAILED' : 'COMPLETED' },
-              backendDoneCount > 0 ? backendDoneCount : store.getCount(),
-              currentTotal
-            );
+            // Set progress bar directly here - use backend count
+            var doneCount = backendItemCount > 0 ? backendItemCount : store.getCount();
+            progressBar.setValue(1);
+            progressBar.updateText('已完成:' + doneCount + '/' + currentTotal);
+
+            // Update window title
+            if (taskFailed) {
+              win.setTitle(_t('promotion.progress.failed'));
+            } else {
+              win.setTitle(_t('promotion.progress.success'));
+            }
+
+            // Stop polling
+            if (!isFinished) {
+              isFinished = true;
+              stopPolling();
+            }
             return;
           }
 
-          // Task is still running - update progress from backend items
-          for (var j = 0; j < backendItems.length; j++) {
-            var bi = backendItems[j];
-            if (!bi.path) continue;
-            var bidx = store.findExact('path', bi.path);
-            if (bidx >= 0) {
-              store.getAt(bidx).set('status', bi.status === 'failed' ? 'failed' : 'success');
-            }
+        // Task is still running - update progress from backend items
+        for (var j = 0; j < backendItems.length; j++) {
+          var bi = backendItems[j];
+          if (!bi.path) continue;
+          var bidx = store.findExact('path', bi.path);
+          if (bidx >= 0) {
+            store.getAt(bidx).set('status', bi.status === 'failed' ? 'failed' : 'success');
           }
-
-          // Mark first pending item as processing
-          var hasProcessing = false;
-          store.each(function (rec) {
-            if (!hasProcessing && rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
-              rec.set('status', 'processing');
-              hasProcessing = true;
-            }
-          });
-
-          // Count and update progress bar
-          var processedCount = 0;
-          store.each(function (rec) {
-            var st = rec.get('status');
-            if (st === 'success' || st === 'failed') { processedCount++; }
-          });
-
-          var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
-          progressBar.setValue(pct);
-          progressBar.setText(_t('promotion.progress.completed', processedCount, currentTotal));
-        },
-        failure: function (response) {
-          // Don't stop polling on transient errors, just retry
-          if (response.status === 404) {
-            // Task not found yet, might still be starting
-            return;
-          }
-          // For other errors, just log and retry next interval
         }
+
+        // Mark first pending item as processing
+        var hasProcessing = false;
+        store.each(function (rec) {
+          if (!hasProcessing && rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
+            rec.set('status', 'processing');
+            hasProcessing = true;
+          }
+        });
+
+        // Count and update progress bar
+        var processedCount = 0;
+        store.each(function (rec) {
+          var st = rec.get('status');
+          if (st === 'success' || st === 'failed') { processedCount++; }
+        });
+
+        var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
+        progressBar.setValue(pct);
+        progressBar.updateText(_t('promotion.progress.completed', processedCount, currentTotal));
       };
 
+      // Add CSRF token if available
+      var csrfToken = null;
+      var cookies = document.cookie.split(';');
+      for (var ci = 0; ci < cookies.length; ci++) {
+        var cookie = cookies[ci].trim();
+        if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
+          csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
+          break;
+        }
+      }
       if (csrfToken) {
-        ajaxOpts.headers['NX-ANTI-CSRF-TOKEN'] = csrfToken;
+        xhr.setRequestHeader('NX-ANTI-CSRF-TOKEN', csrfToken);
       }
 
-      Ext.Ajax.request(ajaxOpts);
+      xhr.send();
     };
 
     win._pollInterval = setInterval(doPoll, 1500);
 
-    // Initial poll after short delay
-    setTimeout(doPoll, 500);
+    // Initial poll after delay to allow task to be created
+    setTimeout(doPoll, 2000);
   },
 
   showPromotionResult: function (result, targetRepo) {

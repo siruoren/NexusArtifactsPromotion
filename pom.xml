@@ -253,7 +253,9 @@
         <version>2.22.2</version>
       </plugin>
 
-      <!-- Generate prod.js and debug.js for Rapture framework -->
+      <!-- Auto-generate prod.js and debug.js from PluginConfig.js before build -->
+      <!-- Copies PluginConfig.js to the Rapture-expected filenames in src/main/resources -->
+      <!-- so that maven-bundle-plugin includes them in the final JAR -->
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-antrun-plugin</artifactId>
@@ -261,17 +263,17 @@
         <executions>
           <execution>
             <id>generate-rapture-js</id>
-            <phase>process-resources</phase>
+            <phase>initialize</phase>
             <goals>
               <goal>run</goal>
             </goals>
             <configuration>
               <target>
                 <copy file="${project.basedir}/src/main/resources/static/rapture/NX/artifactsPromotion/app/PluginConfig.js"
-                      tofile="${project.build.outputDirectory}/static/rapture/nexus-artifacts-promotion-plugin-prod.js"
+                      tofile="${project.basedir}/src/main/resources/static/rapture/nexus-artifacts-promotion-plugin-prod.js"
                       overwrite="true"/>
                 <copy file="${project.basedir}/src/main/resources/static/rapture/NX/artifactsPromotion/app/PluginConfig.js"
-                      tofile="${project.build.outputDirectory}/static/rapture/nexus-artifacts-promotion-plugin-debug.js"
+                      tofile="${project.basedir}/src/main/resources/static/rapture/nexus-artifacts-promotion-plugin-debug.js"
                       overwrite="true"/>
               </target>
             </configuration>
