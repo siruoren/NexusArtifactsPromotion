@@ -235,9 +235,13 @@ Ext.define('NX.artifactsPromotion.I18n', {
   }
 });
 
-// Shorthand - forwards all arguments to I18n.t for parameter substitution
+// Shorthand with parameter substitution: _t('key', arg0, arg1) replaces {0}, {1} etc.
 function _t(key) {
-  return NX.artifactsPromotion.I18n.t.apply(NX.artifactsPromotion.I18n, arguments);
+  var text = NX.artifactsPromotion.I18n.t(key);
+  for (var i = 1; i < arguments.length; i++) {
+    text = text.replace(new RegExp('\\{' + (i - 1) + '\\}', 'g'), arguments[i]);
+  }
+  return text;
 }
 
 // ==================== Utility ====================
@@ -1145,7 +1149,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       }
     };
 
-    var finishProgress = function (result) {
+    var finishProgress = function (result, backendDoneCount, backendTotalCount) {
       if (isFinished) return;
       isFinished = true;
       stopPolling();
@@ -1153,38 +1157,32 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var grid = win.down('#fileGrid');
       var progressBar = win.down('#overallProgress');
 
-      // Mark all remaining items based on task result
+      // Ensure all items have final status in the grid
       if (grid && !grid.destroyed) {
         var store = grid.getStore();
-        if (result.status === 'FAILED') {
-          if (store.getCount() === 0 && result.error) {
-            store.add({ path: result.error, status: 'failed' });
+        var taskFailed = (result.status === 'FAILED');
+        store.each(function (rec) {
+          var st = rec.get('status');
+          if (st !== 'success' && st !== 'failed') {
+            rec.set('status', taskFailed ? 'failed' : 'success');
           }
-          store.each(function (rec) {
-            if (rec.get('status') !== 'success') {
-              rec.set('status', 'failed');
-            }
-          });
-        } else {
-          // Task completed - mark any remaining pending/processing items as success
-          store.each(function (rec) {
-            if (rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
-              rec.set('status', 'success');
-            }
-          });
-        }
+        });
       }
 
-      // Update progress bar to 100%
+      // Update progress bar - use backend counts directly for accuracy
       if (progressBar) {
         progressBar.setValue(1);
-        var gridStore = grid ? grid.getStore() : null;
-        var total = gridStore ? gridStore.getCount() : totalFiles;
-        var done = 0;
-        if (gridStore) {
-          gridStore.each(function (rec) {
-            if (rec.get('status') === 'success' || rec.get('status') === 'failed') done++;
-          });
+        var total = backendTotalCount || totalFiles;
+        var done = backendDoneCount;
+        // Fallback: if no backend counts, count from store
+        if (!done) {
+          var gridStore = grid ? grid.getStore() : null;
+          total = gridStore ? gridStore.getCount() : totalFiles;
+          if (gridStore) {
+            gridStore.each(function (rec) {
+              if (rec.get('status') === 'success' || rec.get('status') === 'failed') done++;
+            });
+          }
         }
         progressBar.setText(_t('promotion.progress.completed', done, total));
       }
@@ -1195,8 +1193,6 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       } else {
         win.setTitle(_t('promotion.progress.failed'));
       }
-
-      // Window stays open for user to review results - user closes manually
     };
 
     var doPoll = function () {
@@ -1207,12 +1203,32 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
       pollCount++;
       if (pollCount > MAX_POLLS) {
-        finishProgress({ status: 'FAILED', error: 'Polling timeout' });
+        finishProgress({ status: 'FAILED' }, 0, totalFiles);
         return;
       }
 
-      apiRequest('GET', '/promotion/task/' + encodeURIComponent(taskId))
-        .then(function (result) {
+      // Use Ext.Ajax.request directly instead of apiRequest to avoid Promise issues
+      var defaultHeaders = Ext.Ajax.defaultHeaders || {};
+      var csrfToken = defaultHeaders['NX-ANTI-CSRF-TOKEN'];
+      if (!csrfToken) {
+        var cookies = document.cookie.split(';');
+        for (var ci = 0; ci < cookies.length; ci++) {
+          var cookie = cookies[ci].trim();
+          if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
+            csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
+            break;
+          }
+        }
+      }
+
+      var ajaxOpts = {
+        method: 'GET',
+        url: '/service/rest/v1/promotion/task/' + encodeURIComponent(taskId),
+        headers: {
+          'Accept': 'application/json',
+          'X-Nexus-UI': 'true'
+        },
+        success: function (response) {
           if (isFinished || win.destroyed) {
             stopPolling();
             return;
@@ -1220,67 +1236,106 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
           var grid = win.down('#fileGrid');
           var progressBar = win.down('#overallProgress');
-
           if (!grid || !progressBar || win.destroyed) {
             stopPolling();
             return;
           }
 
           var store = grid.getStore();
+          var result = {};
+          try {
+            if (response.responseText) {
+              result = Ext.decode(response.responseText);
+            }
+          } catch (e) {
+            // JSON parse failed - show error in progress bar
+            progressBar.setText('Error parsing response');
+            return;
+          }
 
-          if (result.items && result.items.length > 0) {
-            // Update existing rows or add new ones
-            Ext.each(result.items, function (item) {
+          var statusStr = (result.status || '').toLowerCase();
+          var backendItems = result.items || [];
+          var backendItemCount = backendItems.length;
+
+          // Show status in progress bar for debugging
+          var currentTotal = Math.max(store.getCount(), totalFiles);
+
+          if (statusStr === 'completed' || statusStr === 'failed') {
+            var taskFailed = (statusStr === 'failed');
+            var backendDoneCount = backendItemCount; // All items are done when task is completed
+
+            // Update store items from backend results
+            for (var i = 0; i < backendItems.length; i++) {
+              var item = backendItems[i];
+              if (!item.path) continue;
               var idx = store.findExact('path', item.path);
               if (idx >= 0) {
-                var rec = store.getAt(idx);
-                rec.set('status', item.status === 'failed' ? 'failed' : 'success');
-              } else {
-                store.add({
-                  path: item.path,
-                  type: item.type || '',
-                  size: 0,
-                  status: item.status === 'failed' ? 'failed' : 'success'
-                });
+                store.getAt(idx).set('status', item.status === 'failed' ? 'failed' : 'success');
               }
-            });
+            }
 
-            // Mark first non-completed item as processing
-            var processedCount = 0;
-            var hasProcessing = false;
+            // Mark any remaining pending/processing items
             store.each(function (rec) {
               var st = rec.get('status');
-              if (st === 'success' || st === 'failed') {
-                processedCount++;
-              } else if (!hasProcessing) {
-                rec.set('status', 'processing');
-                hasProcessing = true;
+              if (st !== 'success' && st !== 'failed') {
+                rec.set('status', taskFailed ? 'failed' : 'success');
               }
             });
 
-            // Update progress bar
-            var total = Math.max(store.getCount(), totalFiles);
-            var pct = total > 0 ? (processedCount / total) : 0;
-            progressBar.setValue(pct);
-            progressBar.setText(_t('promotion.progress.completed', processedCount, total));
+            // Use backend count directly - don't rely on store
+            finishProgress(
+              { status: taskFailed ? 'FAILED' : 'COMPLETED' },
+              backendDoneCount > 0 ? backendDoneCount : store.getCount(),
+              currentTotal
+            );
+            return;
+          }
 
-            // Also check: if all items in store have final status, task is done
-            if (processedCount >= total && total > 0) {
-              finishProgress({ status: 'COMPLETED' });
-              return;
+          // Task is still running - update progress from backend items
+          for (var j = 0; j < backendItems.length; j++) {
+            var bi = backendItems[j];
+            if (!bi.path) continue;
+            var bidx = store.findExact('path', bi.path);
+            if (bidx >= 0) {
+              store.getAt(bidx).set('status', bi.status === 'failed' ? 'failed' : 'success');
             }
           }
 
-          // Check if task is done (handle both uppercase and lowercase status values)
-          var statusUpper = (result.status || '').toUpperCase();
-          if (statusUpper === 'COMPLETED' || statusUpper === 'FAILED') {
-            result.status = statusUpper;
-            finishProgress(result);
+          // Mark first pending item as processing
+          var hasProcessing = false;
+          store.each(function (rec) {
+            if (!hasProcessing && rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
+              rec.set('status', 'processing');
+              hasProcessing = true;
+            }
+          });
+
+          // Count and update progress bar
+          var processedCount = 0;
+          store.each(function (rec) {
+            var st = rec.get('status');
+            if (st === 'success' || st === 'failed') { processedCount++; }
+          });
+
+          var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
+          progressBar.setValue(pct);
+          progressBar.setText(_t('promotion.progress.completed', processedCount, currentTotal));
+        },
+        failure: function (response) {
+          // Don't stop polling on transient errors, just retry
+          if (response.status === 404) {
+            // Task not found yet, might still be starting
+            return;
           }
-        })
-        .catch(function () {
-          // On poll error, don't close - just retry next interval
-        });
+          // For other errors, just log and retry next interval
+        }
+      };
+
+      if (csrfToken) {
+        ajaxOpts.headers['NX-ANTI-CSRF-TOKEN'] = csrfToken;
+      }
+
+      Ext.Ajax.request(ajaxOpts);
     };
 
     win._pollInterval = setInterval(doPoll, 1500);

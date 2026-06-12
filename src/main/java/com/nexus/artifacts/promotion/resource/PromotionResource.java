@@ -239,32 +239,37 @@ public class PromotionResource implements Resource {
   public Response getTaskStatus(@PathParam("taskId") final String taskId)
   {
     try {
-      String safeTaskId = jsonEscape(taskId);
-      PromotionTaskResult result = promotionService.getTaskResult(safeTaskId);
+      PromotionTaskResult result = promotionService.getTaskResult(taskId);
       if (result == null) {
+        log.debug("Task {} not found in taskResults, checking executor", taskId);
         // Task may still be running - check TaskExecutorService
-        TaskStatus status = promotionService.getTaskExecutorStatus(safeTaskId);
+        TaskStatus status = promotionService.getTaskExecutorStatus(taskId);
         if (status != null) {
           // If task is already completed/failed but result not yet in taskResults,
           // wait briefly for the result to appear (race condition between wrapTask.finally and taskResults.put)
           if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED) {
             for (int i = 0; i < 10; i++) {
               try { Thread.sleep(200); } catch (InterruptedException e) { break; }
-              result = promotionService.getTaskResult(safeTaskId);
+              result = promotionService.getTaskResult(taskId);
               if (result != null) {
+                log.debug("Task {} result appeared after waiting, status={}", taskId, result.getStatus());
                 return Response.ok(result).build();
               }
             }
           }
           // Return a running status so frontend knows to keep polling
+          log.debug("Task {} executor status={}, returning running", taskId, status.getValue());
           return Response.ok()
-              .entity("{\"status\":\"" + status.getValue() + "\",\"taskId\":\"" + safeTaskId + "\"}")
+              .entity("{\"status\":\"" + status.getValue() + "\",\"taskId\":\"" + jsonEscape(taskId) + "\"}")
               .build();
         }
+        log.warn("Task {} not found anywhere", taskId);
         return Response.status(Response.Status.NOT_FOUND)
             .entity("{\"error\":\"Task not found\"}")
             .build();
       }
+      log.debug("Task {} found in taskResults, status={}, items={}", taskId, result.getStatus(),
+          result.getItems() != null ? result.getItems().size() : 0);
       return Response.ok(result).build();
     }
     catch (Exception e) {
