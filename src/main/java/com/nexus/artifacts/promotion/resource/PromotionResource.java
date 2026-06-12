@@ -187,9 +187,14 @@ public class PromotionResource implements Resource {
       request.validate();
       // Extract user's Cookie header for HTTP-based authentication
       String cookieHeader = httpHeaders.getHeaderString(HttpHeaders.COOKIE);
+      // Extract CSRF token for write operations
+      String csrfToken = httpHeaders.getHeaderString("NX-ANTI-CSRF-TOKEN");
+      if (csrfToken == null || csrfToken.isEmpty()) {
+        csrfToken = httpHeaders.getHeaderString("nx-anti-csrf-token");
+      }
       // Extract Nexus base URL from incoming request
       String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
-      String taskId = promotionService.promote(request, cookieHeader, nexusBaseUrl);
+      String taskId = promotionService.promote(request, cookieHeader, csrfToken, nexusBaseUrl);
       return Response.ok()
           .entity("{\"taskId\":\"" + sanitize(taskId) + "\",\"status\":\"submitted\"}")
           .build();

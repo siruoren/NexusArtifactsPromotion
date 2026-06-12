@@ -187,6 +187,7 @@ public class PromotionService {
    */
   public String promote(final PromotionRequest request,
                          final String cookieHeader,
+                         final String csrfToken,
                          final String nexusBaseUrl)
   {
     request.validate();
@@ -219,11 +220,12 @@ public class PromotionService {
           if (request.isDirectory()) {
             promotedItems = promoteDirectoryViaHttp(
                 request.getSourceRepository(), request.getTargetRepository(),
-                request.getPath(), cookieHeader, result, nexusBaseUrl);
+                request.getPath(), cookieHeader, csrfToken, result, nexusBaseUrl,
+                request.getFiles());
           } else {
             promotedItems = promoteFileViaHttp(
                 request.getSourceRepository(), request.getTargetRepository(),
-                request.getPath(), cookieHeader, nexusBaseUrl);
+                request.getPath(), cookieHeader, csrfToken, nexusBaseUrl);
           }
 
           result.setItems(promotedItems);
@@ -278,25 +280,31 @@ public class PromotionService {
       final String targetRepo,
       final String directoryPath,
       final String cookieHeader,
+      final String csrfToken,
       final PromotionTaskResult taskResult,
-      final String nexusBaseUrl) throws IOException
+      final String nexusBaseUrl,
+      final List<String> providedFiles) throws IOException
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
 
     try {
-      // Search for all assets under the directory path
-      List<String> assetNames = searchAssets(sourceRepo, directoryPath, nexusBaseUrl);
+      // Use provided file list from frontend preview, or fallback to search API
+      List<String> assetNames = (providedFiles != null && !providedFiles.isEmpty())
+          ? providedFiles
+          : searchAssets(sourceRepo, directoryPath, nexusBaseUrl);
 
       if (assetNames.isEmpty()) {
         // Treat as single item if no sub-files found
         PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
-            sourceRepo, targetRepo, directoryPath, cookieHeader, nexusBaseUrl);
+            sourceRepo, targetRepo, directoryPath, cookieHeader, csrfToken, nexusBaseUrl);
         items.add(item);
         updateTaskProgress(taskResult, items);
         return items;
       }
 
       int total = assetNames.size();
+      log.info("Directory promotion: {} files to promote from {}", total, directoryPath);
+
       for (int i = 0; i < total; i++) {
         String assetName = assetNames.get(i);
         log.info("[PROMO-PROGRESS] [{}/{}] Promoting: {}", i + 1, total,
@@ -304,7 +312,7 @@ public class PromotionService {
 
         try {
           PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
-              sourceRepo, targetRepo, assetName, cookieHeader, nexusBaseUrl);
+              sourceRepo, targetRepo, assetName, cookieHeader, csrfToken, nexusBaseUrl);
           items.add(item);
         }
         catch (Exception e) {
@@ -336,11 +344,12 @@ public class PromotionService {
       final String targetRepo,
       final String filePath,
       final String cookieHeader,
+      final String csrfToken,
       final String nexusBaseUrl) throws IOException
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
     try {
-      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, nexusBaseUrl);
+      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl);
       items.add(item);
     }
     catch (Exception e) {
@@ -358,6 +367,7 @@ public class PromotionService {
       final String targetRepo,
       final String filePath,
       final String cookieHeader,
+      final String csrfToken,
       final String nexusBaseUrl) throws IOException
   {
     String fullSourcePath = sourceRepo + "/" + filePath;
@@ -374,7 +384,7 @@ public class PromotionService {
     downloadConn.setRequestMethod("GET");
     downloadConn.setConnectTimeout(TIMEOUT_MS);
     downloadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(downloadConn, cookieHeader);
+    setAuthHeaders(downloadConn, cookieHeader, csrfToken);
 
     int responseCode = downloadConn.getResponseCode();
     if (responseCode != 200) {
@@ -390,7 +400,7 @@ public class PromotionService {
     uploadConn.setDoOutput(true);
     uploadConn.setConnectTimeout(TIMEOUT_MS);
     uploadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(uploadConn, cookieHeader);
+    setAuthHeaders(uploadConn, cookieHeader, csrfToken);
 
     // Stream content from download to upload
     try (InputStream input = downloadConn.getInputStream();
@@ -592,11 +602,14 @@ public class PromotionService {
 
   /**
    * Set authentication headers on HTTP connection.
-   * Uses the user's session cookie from the original request.
+   * Uses the user's session cookie and CSRF token from the original request.
    */
-  private void setAuthHeaders(final HttpURLConnection conn, final String cookieHeader) {
+  private void setAuthHeaders(final HttpURLConnection conn, final String cookieHeader, final String csrfToken) {
     if (cookieHeader != null && !cookieHeader.isEmpty()) {
       conn.setRequestProperty(HttpHeaders.COOKIE, cookieHeader);
+    }
+    if (csrfToken != null && !csrfToken.isEmpty()) {
+      conn.setRequestProperty("NX-ANTI-CSRF-TOKEN", csrfToken);
     }
     conn.setRequestProperty("X-Nexus-UI", "true");
     conn.setRequestProperty("Accept", "*/*");

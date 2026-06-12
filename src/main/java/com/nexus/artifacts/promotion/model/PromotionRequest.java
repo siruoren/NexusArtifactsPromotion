@@ -16,6 +16,11 @@ public class PromotionRequest {
   private String path;
   private boolean isDirectory;
   private String format;
+  /**
+   * File list for directory promotion.
+   * When isDirectory=true, this contains the files to promote one by one.
+   */
+  private List<String> files;
 
   public PromotionRequest() {}
 
@@ -33,6 +38,9 @@ public class PromotionRequest {
 
   public String getFormat() { return format; }
   public void setFormat(String format) { this.format = format; }
+
+  public List<String> getFiles() { return files; }
+  public void setFiles(List<String> files) { this.files = files; }
 
   /**
    * Validate the request, throwing IllegalArgumentException if invalid.
