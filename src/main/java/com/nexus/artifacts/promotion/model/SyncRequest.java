@@ -22,7 +22,7 @@ public class SyncRequest {
   public void setPath(String path) { this.path = path; }
 
   public boolean isDirectory() { return isDirectory; }
-  public void setDirectory(boolean directory) { isDirectory = directory; }
+  public void setIsDirectory(boolean directory) { isDirectory = directory; }
 
   public String getFormat() { return format; }
   public void setFormat(String format) { this.format = format; }

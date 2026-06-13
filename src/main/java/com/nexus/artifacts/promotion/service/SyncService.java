@@ -371,6 +371,8 @@ public class SyncService {
       UnitOfWork.begin(storageFacet.txSupplier());
       try {
         StorageTx tx = UnitOfWork.currentTx();
+        tx.begin();
+
         Bucket bucket = tx.findBucket(repo);
 
         Query query = Query.builder()
@@ -381,6 +383,8 @@ public class SyncService {
         for (Asset asset : assets) {
           assetNames.add(asset.name());
         }
+
+        tx.commit();
       }
       finally {
         UnitOfWork.end();
@@ -393,9 +397,10 @@ public class SyncService {
   }
 
   /**
-   * List remote assets by fetching the remote directory listing.
-   * Parses HTML directory index pages to extract file links.
-   * Also tries to use proxy repo's configured HTTP client for authentication.
+   * List remote assets by querying the remote repository.
+   * Strategy:
+   * 1. Try to extract repo name from remote URL and use internal API if it's a local repo
+   * 2. Otherwise, fall back to HTTP directory listing
    */
   private List<String> listRemoteAssets(final Repository repo, final String directoryPath) {
     List<String> remoteAssets = new ArrayList<>();
@@ -422,6 +427,138 @@ public class SyncService {
         return remoteAssets;
       }
 
+      // Normalize remote URL
+      if (!remoteUrl.endsWith("/")) {
+        remoteUrl += "/";
+      }
+
+      // Strategy 1: Try to extract repo name from URL and check if it's a local repo
+      // URL pattern: http://host:port/repository/<repo-name>/...
+      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
+      if (remoteRepoName != null) {
+        log.info("Extracted remote repo name from URL: {}", remoteRepoName);
+        List<String> internalAssets = listInternalRepoAssets(remoteRepoName, directoryPath);
+        if (!internalAssets.isEmpty()) {
+          log.info("Using internal repo listing, found {} assets", internalAssets.size());
+          return internalAssets;
+        }
+        // Even if empty, if the repo exists locally, don't fall back to HTTP
+        // (the directory might just be empty on the remote)
+        try {
+          Repository remoteRepo = repositoryManager.get(remoteRepoName);
+          if (remoteRepo != null) {
+            log.info("Remote repo {} exists locally but has 0 assets in path {}", remoteRepoName, directoryPath);
+            return internalAssets;
+          }
+        }
+        catch (Exception ignored) { }
+      }
+
+      // Strategy 2: Fall back to HTTP directory listing
+      log.info("Falling back to HTTP directory listing for remote: {}", remoteUrl);
+      remoteAssets = listRemoteAssetsViaHttp(repo, directoryPath, remoteUrl, attributes);
+
+    }
+    catch (Exception e) {
+      log.error("Failed to list remote assets for {}: {}", directoryPath, e.getMessage(), e);
+    }
+
+    return remoteAssets;
+  }
+
+  /**
+   * Extract repository name from a Nexus repository URL.
+   * URL pattern: http://host:port/repository/<repo-name>/ or http://host:port/repository/<repo-name>
+   * Returns null if the URL doesn't match the pattern.
+   */
+  private String extractRepoNameFromUrl(final String remoteUrl) {
+    try {
+      java.net.URL url = new java.net.URL(remoteUrl);
+      String path = url.getPath();
+      // path should be like /repository/repo-name/ or /repository/repo-name
+      if (path.startsWith("/repository/")) {
+        String repoPart = path.substring("/repository/".length());
+        // Remove trailing slash
+        if (repoPart.endsWith("/")) {
+          repoPart = repoPart.substring(0, repoPart.length() - 1);
+        }
+        // The repo name is the first segment
+        int slashIdx = repoPart.indexOf('/');
+        String repoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
+        if (!repoName.isEmpty()) {
+          return repoName;
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to extract repo name from URL {}: {}", remoteUrl, e.getMessage());
+    }
+    return null;
+  }
+
+  /**
+   * List assets from a repository on the same Nexus instance using internal APIs.
+   */
+  private List<String> listInternalRepoAssets(final String remoteRepoName, final String directoryPath) {
+    List<String> assets = new ArrayList<>();
+
+    try {
+      Repository remoteRepo = repositoryManager.get(remoteRepoName);
+      if (remoteRepo == null) {
+        log.warn("Remote repository {} not found in local Nexus", remoteRepoName);
+        return assets;
+      }
+
+      StorageFacet storageFacet = remoteRepo.facet(StorageFacet.class);
+      UnitOfWork.begin(storageFacet.txSupplier());
+      try {
+        StorageTx tx = UnitOfWork.currentTx();
+        tx.begin();
+
+        // Query assets in the directory
+        Query query = Query.builder()
+            .where("name").like(escapeLike(directoryPath) + "%")
+            .build();
+
+        Iterable<Asset> assetIter = tx.findAssets(query, Collections.singletonList(remoteRepo));
+        for (Asset asset : assetIter) {
+          String name = asset.name();
+          // Only include files directly in this directory (not in subdirectories)
+          // unless it's a subdirectory entry
+          String relativePath = name.startsWith(directoryPath) ? name.substring(directoryPath.length()) : name;
+          // Skip if it goes into subdirectories (contains additional /)
+          if (!relativePath.contains("/") || relativePath.endsWith("/")) {
+            assets.add(name);
+          }
+          else {
+            // It's a file in a subdirectory, include it too for complete sync
+            assets.add(name);
+          }
+        }
+
+        tx.commit();
+      }
+      finally {
+        UnitOfWork.end();
+      }
+
+      log.info("Found {} assets from internal repo {} in path {}", assets.size(), remoteRepoName, directoryPath);
+    }
+    catch (Exception e) {
+      log.warn("Failed to list assets from internal repo {}: {}", remoteRepoName, e.getMessage());
+    }
+
+    return assets;
+  }
+
+  /**
+   * List remote assets via HTTP directory listing (for external remotes).
+   */
+  private List<String> listRemoteAssetsViaHttp(final Repository repo, final String directoryPath,
+      final String remoteUrl, final Map<String, Map<String, Object>> attributes) {
+    List<String> remoteAssets = new ArrayList<>();
+
+    try {
       // Get authentication config if available
       String authUsername = null;
       String authPassword = null;
@@ -436,10 +573,6 @@ public class SyncService {
         }
       }
 
-      // Normalize URLs
-      if (!remoteUrl.endsWith("/")) {
-        remoteUrl += "/";
-      }
       String dirUrl = remoteUrl + directoryPath;
       if (!dirUrl.endsWith("/")) {
         dirUrl += "/";
@@ -447,14 +580,12 @@ public class SyncService {
 
       log.info("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? "yes" : "no");
 
-      // Fetch remote directory listing
       HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
       conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
 
-      // Add basic auth if configured
       if (authUsername != null && authPassword != null) {
         String auth = authUsername + ":" + authPassword;
         String encoded = java.util.Base64.getEncoder().encodeToString(auth.getBytes("UTF-8"));
@@ -466,22 +597,10 @@ public class SyncService {
 
       if (responseCode != 200) {
         log.warn("Failed to fetch remote directory listing: HTTP {} for {}", responseCode, dirUrl);
-        // Try reading error stream for more info
-        try {
-          if (conn.getErrorStream() != null) {
-            byte[] errorBytes = new byte[512];
-            int read = conn.getErrorStream().read(errorBytes);
-            if (read > 0) {
-              log.warn("Error response: {}", new String(errorBytes, 0, read, "UTF-8"));
-            }
-          }
-        }
-        catch (Exception ignored) { }
         conn.disconnect();
         return remoteAssets;
       }
 
-      // Parse HTML to extract links
       StringBuilder html = new StringBuilder();
       try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
         String line;
@@ -494,8 +613,6 @@ public class SyncService {
       String htmlStr = html.toString();
       log.debug("Remote directory HTML (first 500 chars): {}", htmlStr.substring(0, Math.min(500, htmlStr.length())));
 
-      // Extract href links from HTML - common patterns:
-      // <a href="filename">, <a href='./filename'>, <a href="filename">
       Pattern linkPattern = Pattern.compile(
           "<a[^>]+href\\s*=\\s*[\"'](?!(?:mailto:|javascript:|\\?|/|#))([^\"']+)[\"']",
           Pattern.CASE_INSENSITIVE);
@@ -503,27 +620,21 @@ public class SyncService {
 
       while (matcher.find()) {
         String href = matcher.group(1);
-        // Remove leading ./ if present
         if (href.startsWith("./")) {
           href = href.substring(2);
         }
-        // Skip parent directory link and root
         if (href.equals("../") || href.equals("/") || href.equals(".")) {
           continue;
         }
-        // Skip query strings and anchors
         if (href.contains("?") || href.contains("#")) {
           continue;
         }
 
-        // Build full asset path
         String assetPath;
         if (href.endsWith("/")) {
-          // Subdirectory - include it for recursive sync
           assetPath = directoryPath + (directoryPath.endsWith("/") ? "" : "/") + href;
         }
         else {
-          // File
           assetPath = directoryPath + (directoryPath.endsWith("/") ? "" : "/") + href;
         }
 
@@ -534,7 +645,7 @@ public class SyncService {
 
     }
     catch (Exception e) {
-      log.error("Failed to list remote assets for {}: {}", directoryPath, e.getMessage(), e);
+      log.warn("Failed to list remote assets via HTTP for {}: {}", directoryPath, e.getMessage());
     }
 
     return remoteAssets;
@@ -625,6 +736,8 @@ public class SyncService {
     UnitOfWork.begin(storageFacet.txSupplier());
     try {
       StorageTx tx = UnitOfWork.currentTx();
+      tx.begin();
+
       Bucket bucket = tx.findBucket(repo);
 
       Asset asset = tx.findAssetWithProperty("name", assetName, bucket);
@@ -635,6 +748,7 @@ public class SyncService {
         log.debug("Deleted cached asset: {}", assetName);
       }
       else {
+        tx.commit();
         log.debug("Asset {} not found in local cache, will be fetched fresh from remote", assetName);
       }
     }
