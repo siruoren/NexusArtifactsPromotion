@@ -20,6 +20,29 @@ All notable changes to this project will be documented in this file.
   - Delete local cache before sync to force fresh download from remote
   - Permission control: requires delete permission on proxy repository
   - Async execution with queue management and progress tracking
+- **Docker Image Promotion**: efficient Docker image promotion between repositories
+  - Parse Docker manifest to identify all referenced blobs (config + layers)
+  - Only promote blobs actually needed by the manifest (not all blobs in repo)
+  - Support promoting all tags or specific tags of an image
+  - MD5 incremental check for blobs: skip unchanged layers automatically
+  - Manifest-aware: promote manifest after all blobs are transferred
+- **Docker Proxy Sync**: efficient Docker image sync from proxy repositories
+  - Parse manifest to determine blob dependencies before syncing
+  - Sync only referenced blobs instead of blindly syncing all files
+  - Support syncing all tags or specific tags via Docker Registry V2 API
+  - Fallback to Nexus Components API when Docker Registry API unavailable
+- **Docker REST API Endpoints**:
+  - `GET /v1/docker/images?repository=xxx` - list Docker images with tags
+  - `GET /v1/docker/tags?repository=xxx&image=yyy` - list tags for an image
+  - `POST /v1/docker/promote` - promote Docker images (all/specific tags)
+  - `POST /v1/docker/sync` - sync Docker images from proxy (all/specific tags)
+  - `GET /v1/docker/promote/task/{taskId}` - query Docker promotion task status
+  - `GET /v1/docker/sync/task/{taskId}` - query Docker sync task status
+- **Docker UI Integration**: Docker-specific dialog in Nexus UI
+  - Image selector dropdown (populated by /docker/images API)
+  - Tag selection grid with checkboxes (select specific tags or all)
+  - Progress polling during Docker promote/sync
+  - Docker-specific button text on asset/folder panels
 - **Scheduled Task Template**: `Proxy Repository Scheduled Sync`
   - Register as Nexus system task template (System → Tasks)
   - Support specifying proxy repository name and sync directory path
