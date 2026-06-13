@@ -23,10 +23,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
-import org.sonatype.nexus.repository.proxy.ProxyFacet;
 import org.sonatype.nexus.repository.view.Content;
-import org.sonatype.nexus.repository.view.Context;
 import org.sonatype.nexus.repository.view.Request;
+import org.sonatype.nexus.repository.view.Response;
+import org.sonatype.nexus.repository.view.ViewFacet;
 
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.subject.support.SubjectThreadState;
@@ -60,8 +60,12 @@ public class SyncService {
   /** Nexus local base URL for internal API calls */
   private static final String LOCAL_NEXUS_BASE = "http://localhost:8081";
 
-  /** Admin credentials for internal API calls */
-  private static final String ADMIN_AUTH = "admin:admin123";
+  /** Default admin credentials for internal API calls */
+  private static final String DEFAULT_ADMIN_USERNAME = "admin";
+  private static final String DEFAULT_ADMIN_PASSWORD = "admin123";
+
+  private volatile String adminUsername = DEFAULT_ADMIN_USERNAME;
+  private volatile String adminPassword = DEFAULT_ADMIN_PASSWORD;
 
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
@@ -83,6 +87,26 @@ public class SyncService {
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
+  }
+
+  /**
+   * Update admin credentials from capability configuration.
+   */
+  public void updateAdminCredentials(final String username, final String password) {
+    if (username != null && !username.isEmpty()) {
+      this.adminUsername = username;
+    }
+    if (password != null && !password.isEmpty()) {
+      this.adminPassword = password;
+    }
+    log.info("Admin credentials updated for sync service");
+  }
+
+  /**
+   * Get the current admin auth string (username:password).
+   */
+  private String getAdminAuth() {
+    return adminUsername + ":" + adminPassword;
   }
 
   /**
@@ -303,6 +327,9 @@ public class SyncService {
     try {
       log.info("Starting directory sync for {}:{}", repo.getName(), directoryPath);
 
+      // Extract auth from proxy repo configuration
+      String[] repoAuth = extractAuthFromRepo(repo);
+
       // Step 1: Get remote file list
       List<String> remoteAssets = listRemoteAssets(repo, directoryPath);
       log.info("Found {} remote assets to sync in {}:{}", remoteAssets.size(), repo.getName(), directoryPath);
@@ -318,7 +345,7 @@ public class SyncService {
             assetPath, determineType(assetPath));
 
         try {
-          syncAssetViaContentFacet(repo, assetPath);
+          syncAssetViaContentFacet(repo, assetPath, repoAuth);
           detail.setStatus("success");
         }
         catch (Exception e) {
@@ -345,11 +372,14 @@ public class SyncService {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
+      // Extract auth from proxy repo configuration
+      String[] repoAuth = extractAuthFromRepo(repo);
+
       SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(
           filePath, determineType(filePath));
 
       try {
-        syncAssetViaContentFacet(repo, filePath);
+        syncAssetViaContentFacet(repo, filePath, repoAuth);
         detail.setStatus("success");
       }
       catch (Exception e) {
@@ -368,52 +398,62 @@ public class SyncService {
   }
 
   /**
-   * Sync a single asset using Nexus official ProxyFacet.get().
+   * Sync a single asset by dispatching a GET request through the repository's view facet.
    *
-   * This is the official Nexus way to trigger proxy repository sync:
-   * ProxyFacet.get(context) -> checks local cache -> if missing/stale -> fetches from RemoteStorage
-   * -> saves to BlobStore -> creates Asset -> returns Content
+   * Using ViewFacet.dispatch() routes the request through the full Nexus routing pipeline,
+   * which properly sets up TokenMatcher.State and other context attributes that
+   * ProxyFacet.get() requires. This avoids the "Missing: TokenMatcher$State" error.
    *
    * Flow:
-   * 1. Delete existing local cache (via REST API) to force fresh download
+   * 1. Check if asset exists in local cache
+   *    - If exists: delete it to force fresh download from remote
+   *    - If not exists: skip deletion, just fetch from remote
    * 2. Invalidate negative cache so previously 404'd assets can be retried
-   * 3. Call ProxyFacet.get(context) which auto-fetches from remote
+   * 3. Dispatch GET request through ViewFacet -> Nexus auto-fetches from remote if not cached
    */
-  private void syncAssetViaContentFacet(final Repository repo, final String assetPath) throws Exception {
-    log.info("Syncing asset {} via ProxyFacet.get()", assetPath);
+  private void syncAssetViaContentFacet(final Repository repo, final String assetPath,
+      final String[] repoAuth) throws Exception {
+    log.info("Syncing asset {} via ViewFacet.dispatch()", assetPath);
 
     try {
-      // Step 1: Delete existing local cache to force fresh download
-      deleteAssetViaApi(repo.getName(), assetPath);
+      // Step 1: Only delete if asset already exists in local cache
+      String cachedAssetId = findAssetIdViaApi(repo.getName(), assetPath, repoAuth);
+      if (cachedAssetId != null) {
+        log.info("Asset {} exists in cache, deleting to force fresh download", assetPath);
+        deleteAssetByIdViaApi(cachedAssetId, assetPath, repoAuth);
+      }
+      else {
+        log.info("Asset {} not in cache, will fetch fresh from remote", assetPath);
+      }
 
       // Step 2: Invalidate negative cache so previously 404'd assets can be retried
       invalidateNegativeCache(repo, assetPath);
 
-      // Step 3: Use ProxyFacet.get() - Nexus official way to trigger proxy fetch
-      // This triggers: check local -> if missing -> remote fetch -> save to BlobStore
-      ProxyFacet proxyFacet = repo.facet(ProxyFacet.class);
-      if (proxyFacet != null) {
+      // Step 3: Use ViewFacet.dispatch() - routes through full Nexus pipeline
+      // This properly sets up TokenMatcher.State and other context attributes
+      ViewFacet viewFacet = repo.facet(ViewFacet.class);
+      if (viewFacet != null) {
         Request request = new Request.Builder()
             .action("GET")
             .path("/" + assetPath)
             .build();
 
-        Context context = new Context(repo, request);
-        Content content = proxyFacet.get(context);
+        Response response = viewFacet.dispatch(request);
 
-        if (content != null) {
-          log.info("Successfully synced asset {} from remote", assetPath);
+        if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
+          log.info("Successfully synced asset {} from remote (HTTP {})",
+              assetPath, response.getStatus().getCode());
         }
         else {
-          log.warn("ProxyFacet.get() returned null for asset {}, asset may not exist on remote", assetPath);
+          log.warn("Failed to sync asset {}: HTTP {}", assetPath, response.getStatus().getCode());
         }
       }
       else {
-        log.warn("Repository {} does not have ProxyFacet, skipping proxy fetch", repo.getName());
+        log.warn("Repository {} does not have ViewFacet, skipping sync", repo.getName());
       }
     }
     catch (Exception e) {
-      log.error("Failed to sync asset {} via ProxyFacet: {}", assetPath, e.getMessage());
+      log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
       throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
     }
   }
@@ -455,14 +495,20 @@ public class SyncService {
         remoteUrl += "/";
       }
 
+      // Extract authentication config from proxy repo's httpclient settings
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String authUsername = (repoAuth != null) ? repoAuth[0] : null;
+      String authPassword = (repoAuth != null) ? repoAuth[1] : null;
+
       // Strategy 1: Check if remote URL points to a local Nexus repo
       String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
       if (remoteRepoName != null) {
         try {
           Repository remoteRepo = repositoryManager.get(remoteRepoName);
           if (remoteRepo != null) {
-            log.info("Remote URL points to local Nexus repo: {}, listing via REST API", remoteRepoName);
-            List<String> assets = listAssetsViaApi(remoteRepoName, directoryPath);
+            log.info("Remote URL points to local Nexus repo: {}, listing via REST API (auth: {})",
+                remoteRepoName, authUsername != null ? authUsername : "default");
+            List<String> assets = listAssetsViaApi(remoteRepoName, directoryPath, authUsername, authPassword);
             log.info("Found {} assets from local repo {} in path {}", assets.size(), remoteRepoName, directoryPath);
             return assets;
           }
@@ -474,7 +520,7 @@ public class SyncService {
 
       // Strategy 2: Fall back to HTTP directory listing
       log.info("Falling back to HTTP directory listing for remote: {}", remoteUrl);
-      return listRemoteAssetsViaHttp(directoryPath, remoteUrl, attributes);
+      return listRemoteAssetsViaHttp(directoryPath, remoteUrl, authUsername, authPassword);
 
     }
     catch (Exception e) {
@@ -510,17 +556,23 @@ public class SyncService {
   }
 
   /**
-   * List assets from a local Nexus repository via REST API.
+   * List assets from a local Nexus repository via Search API.
+   * Uses group filter to search only within the target directory,
+   * avoiding scanning all assets in the repository.
    * Handles pagination via continuationToken.
+   * Uses proxy-configured credentials if provided, falls back to default admin credentials.
    */
-  private List<String> listAssetsViaApi(final String repoName, final String directoryPath) throws Exception {
+  private List<String> listAssetsViaApi(final String repoName, final String directoryPath,
+      final String authUsername, final String authPassword) throws Exception {
     List<String> assetNames = new ArrayList<>();
     String normalizedDir = directoryPath;
-    if (!normalizedDir.endsWith("/")) {
-      normalizedDir = normalizedDir + "/";
+    if (normalizedDir.endsWith("/")) {
+      normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
     }
 
-    String apiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/assets?repository=" + repoName;
+    // Use Search API with group filter to only list assets in the target directory
+    String apiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName
+        + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
     String continuationToken = null;
 
     do {
@@ -534,10 +586,13 @@ public class SyncService {
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
       conn.setRequestProperty("Accept", "application/json");
-      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(ADMIN_AUTH));
+      // Use proxy-configured credentials if available, otherwise fall back to default admin credentials
+      String effectiveAuth = (authUsername != null && authPassword != null)
+          ? authUsername + ":" + authPassword : getAdminAuth();
+      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
 
       if (conn.getResponseCode() != 200) {
-        log.warn("Assets API returned HTTP {} for {}", conn.getResponseCode(), url);
+        log.warn("Search API returned HTTP {} for {}", conn.getResponseCode(), url);
         conn.disconnect();
         return assetNames;
       }
@@ -557,7 +612,7 @@ public class SyncService {
           String item = itemsSection.substring(objStart, objEnd + 1);
           String path = extractJsonValue(item, "path");
 
-          if (path != null && path.startsWith(normalizedDir) && path.length() > normalizedDir.length()) {
+          if (path != null) {
             assetNames.add(path);
           }
 
@@ -575,32 +630,19 @@ public class SyncService {
   /**
    * List remote assets via HTTP directory listing (for external remotes).
    * Parses HTML directory index pages to extract file links.
+   * Uses proxy-configured credentials if provided.
    */
   private List<String> listRemoteAssetsViaHttp(final String directoryPath,
-      final String remoteUrl, final Map<String, Map<String, Object>> attributes) {
+      final String remoteUrl, final String authUsername, final String authPassword) {
     List<String> remoteAssets = new ArrayList<>();
 
     try {
-      // Get authentication config if available
-      String authUsername = null;
-      String authPassword = null;
-      if (attributes.containsKey("httpclient")) {
-        @SuppressWarnings("unchecked")
-        Map<String, Object> httpClientAttrs = attributes.get("httpclient");
-        @SuppressWarnings("unchecked")
-        Map<String, Object> authAttrs = (Map<String, Object>) httpClientAttrs.get("authentication");
-        if (authAttrs != null) {
-          authUsername = (String) authAttrs.get("username");
-          authPassword = (String) authAttrs.get("password");
-        }
-      }
-
       String dirUrl = remoteUrl + directoryPath;
       if (!dirUrl.endsWith("/")) {
         dirUrl += "/";
       }
 
-      log.info("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? "yes" : "no");
+      log.info("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? authUsername : "no");
 
       HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
       conn.setRequestMethod("GET");
@@ -660,33 +702,28 @@ public class SyncService {
   // ========================================================================
 
   /**
-   * Delete a local cached asset via REST API.
-   * This forces ContentFacet.get() to re-download from remote.
+   * Delete a local cached asset by its ID via REST API.
+   * This is more efficient than deleteAssetViaApi as it skips the search step.
+   * Uses proxy-configured credentials if available, otherwise falls back to default admin credentials.
    */
-  private void deleteAssetViaApi(final String repoName, final String assetPath) {
+  private void deleteAssetByIdViaApi(final String assetId, final String assetPath,
+      final String[] repoAuth) {
     try {
-      // Find the asset ID via search API
-      String assetId = findAssetIdViaApi(repoName, assetPath);
-      if (assetId != null) {
-        String deleteUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/assets/" + assetId;
-        HttpURLConnection conn = (HttpURLConnection) new URL(deleteUrl).openConnection();
-        conn.setRequestMethod("DELETE");
-        conn.setConnectTimeout(15_000);
-        conn.setReadTimeout(30_000);
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(ADMIN_AUTH));
+      String deleteUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/assets/" + assetId;
+      HttpURLConnection conn = (HttpURLConnection) new URL(deleteUrl).openConnection();
+      conn.setRequestMethod("DELETE");
+      conn.setConnectTimeout(15_000);
+      conn.setReadTimeout(30_000);
+      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(getEffectiveAuth(repoAuth)));
 
-        int responseCode = conn.getResponseCode();
-        conn.disconnect();
+      int responseCode = conn.getResponseCode();
+      conn.disconnect();
 
-        if (responseCode == 204 || responseCode == 200) {
-          log.debug("Deleted cached asset via API: {}", assetPath);
-        }
-        else {
-          log.warn("Failed to delete asset via API: HTTP {} for {}", responseCode, assetPath);
-        }
+      if (responseCode == 204 || responseCode == 200) {
+        log.info("Deleted cached asset via API: {}", assetPath);
       }
       else {
-        log.debug("Asset {} not found in local cache, will be fetched fresh from remote", assetPath);
+        log.warn("Failed to delete asset via API: HTTP {} for {}", responseCode, assetPath);
       }
     }
     catch (Exception e) {
@@ -695,14 +732,42 @@ public class SyncService {
   }
 
   /**
-   * Find an asset ID by path using the Nexus REST API.
+   * Find an asset ID by path using the Nexus Search API.
+   * Uses group and name filters to search only within the target scope,
+   * avoiding scanning all assets in the repository.
+   * Uses proxy-configured credentials if available, otherwise falls back to default admin credentials.
    */
-  private String findAssetIdViaApi(final String repoName, final String assetPath) throws Exception {
-    String apiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/assets?repository=" + repoName;
+  private String findAssetIdViaApi(final String repoName, final String assetPath,
+      final String[] repoAuth) throws Exception {
+    // Split path into group (directory) and name (filename)
+    // e.g. "2/test_network_daemon.sh" -> group="2", name="test_network_daemon.sh"
+    String group = null;
+    String name = null;
+    int lastSlash = assetPath.lastIndexOf('/');
+    if (lastSlash > 0) {
+      group = assetPath.substring(0, lastSlash);
+      name = assetPath.substring(lastSlash + 1);
+    }
+    else if (lastSlash == 0) {
+      name = assetPath.substring(1);
+    }
+    else {
+      name = assetPath;
+    }
+
+    // Use Search API with group and name filters for targeted search
+    StringBuilder apiUrl = new StringBuilder(LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName);
+    if (group != null && !group.isEmpty()) {
+      apiUrl.append("&group=").append(java.net.URLEncoder.encode(group, "UTF-8"));
+    }
+    if (name != null && !name.isEmpty()) {
+      apiUrl.append("&name=").append(java.net.URLEncoder.encode(name, "UTF-8"));
+    }
+
     String continuationToken = null;
 
     do {
-      String url = apiUrl;
+      String url = apiUrl.toString();
       if (continuationToken != null) {
         url += "&continuationToken=" + continuationToken;
       }
@@ -712,9 +777,10 @@ public class SyncService {
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
       conn.setRequestProperty("Accept", "application/json");
-      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(ADMIN_AUTH));
+      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(getEffectiveAuth(repoAuth)));
 
       if (conn.getResponseCode() != 200) {
+        log.debug("Search API returned HTTP {} for {}", conn.getResponseCode(), url);
         conn.disconnect();
         return null;
       }
@@ -792,6 +858,50 @@ public class SyncService {
   // ========================================================================
   // Utility methods
   // ========================================================================
+
+  /**
+   * Extract authentication credentials from a proxy repository's httpclient configuration.
+   * Returns a String array [username, password], or null if no authentication is configured.
+   */
+  private String[] extractAuthFromRepo(final Repository repo) {
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null) {
+        return null;
+      }
+      Map<String, Map<String, Object>> attributes = config.getAttributes();
+      if (attributes == null || !attributes.containsKey("httpclient")) {
+        return null;
+      }
+      @SuppressWarnings("unchecked")
+      Map<String, Object> httpClientAttrs = attributes.get("httpclient");
+      @SuppressWarnings("unchecked")
+      Map<String, Object> authAttrs = (Map<String, Object>) httpClientAttrs.get("authentication");
+      if (authAttrs == null) {
+        return null;
+      }
+      String username = (String) authAttrs.get("username");
+      String password = (String) authAttrs.get("password");
+      if (username != null && password != null) {
+        return new String[]{username, password};
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to extract auth from repo {}: {}", repo.getName(), e.getMessage());
+    }
+    return null;
+  }
+
+  /**
+   * Build effective auth string for API calls.
+   * Uses proxy-configured credentials if available, otherwise falls back to default admin credentials.
+   */
+  private String getEffectiveAuth(final String[] repoAuth) {
+    if (repoAuth != null && repoAuth.length == 2 && repoAuth[0] != null && repoAuth[1] != null) {
+      return repoAuth[0] + ":" + repoAuth[1];
+    }
+    return getAdminAuth();
+  }
 
   private String determineType(final String path) {
     if (path == null) return "file";

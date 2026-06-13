@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.capability.CapabilitySupport;
 
+import com.nexus.artifacts.promotion.service.SyncService;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
 import static com.nexus.artifacts.promotion.config.SyncCapabilityDescriptor.*;
@@ -25,10 +26,12 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
   private static final Logger log = LoggerFactory.getLogger(SyncCapability.class);
 
   private final TaskExecutorService taskExecutor;
+  private final SyncService syncService;
 
   @Inject
-  public SyncCapability(final TaskExecutorService taskExecutor) {
+  public SyncCapability(final TaskExecutorService taskExecutor, final SyncService syncService) {
     this.taskExecutor = taskExecutor;
+    this.syncService = syncService;
   }
 
   @Override
@@ -60,6 +63,14 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
       catch (NumberFormatException e) {
         log.warn("Invalid max sync queue size value: {}", maxQueueStr);
       }
+    }
+
+    // Update admin credentials for internal API calls
+    String adminUser = props.get(PROP_ADMIN_USERNAME);
+    String adminPass = props.get(PROP_ADMIN_PASSWORD);
+    if (adminUser != null || adminPass != null) {
+      syncService.updateAdminCredentials(adminUser, adminPass);
+      log.info("Admin credentials updated from capability configuration");
     }
 
     log.info("Sync capability activated");
