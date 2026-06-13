@@ -24,8 +24,16 @@ import javax.ws.rs.core.HttpHeaders;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.sonatype.nexus.blobstore.api.Blob;
+import org.sonatype.nexus.common.hash.HashAlgorithm;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
+import org.sonatype.nexus.repository.storage.Asset;
+import org.sonatype.nexus.repository.storage.Bucket;
+import org.sonatype.nexus.repository.storage.StorageFacet;
+import org.sonatype.nexus.repository.storage.StorageTx;
+
+import com.google.common.hash.HashCode;
 
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.subject.support.SubjectThreadState;
@@ -243,8 +251,10 @@ public class PromotionService {
           result.setStatus(TaskStatus.COMPLETED.getValue());
           result.setEndTime(System.currentTimeMillis());
 
-          log.info("Promotion task {} completed: {} items from {} to {}",
-              taskId, promotedItems.size(), request.getSourceRepository(), request.getTargetRepository());
+          long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+          long promotedCount = promotedItems.size() - skippedCount;
+          log.info("Promotion task {} completed: {} items promoted, {} skipped from {} to {}",
+              taskId, promotedCount, skippedCount, request.getSourceRepository(), request.getTargetRepository());
         }
         catch (Exception e) {
           log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
@@ -449,6 +459,8 @@ public class PromotionService {
 
   /**
    * Core method: download a file from source repo and upload to target repo via HTTP.
+   * Implements incremental sync: compares MD5 checksums of source and target assets;
+   * if they match, the file is skipped (status="skipped") without re-uploading.
    */
   private PromotionTaskResult.FileItem promoteSingleFileViaHttp(
       final String sourceRepo,
@@ -460,6 +472,23 @@ public class PromotionService {
   {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.debug("Promoting via HTTP: {} -> {}/{}", fullSourcePath, targetRepo, filePath);
+
+    // Incremental check: compare MD5 of source and target assets via internal Java API
+    String sourceMd5 = getAssetMd5(sourceRepo, filePath);
+    String targetMd5 = getAssetMd5(targetRepo, filePath);
+
+    if (sourceMd5 != null && targetMd5 != null && sourceMd5.equalsIgnoreCase(targetMd5)) {
+      log.info("Skipping promotion (MD5 match): {} -> {}/{}, MD5={}",
+          fullSourcePath, targetRepo, filePath, sourceMd5);
+      PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(filePath, determineType(filePath));
+      skippedItem.setStatus("skipped");
+      skippedItem.setSourceMd5(sourceMd5);
+      skippedItem.setTargetMd5(targetMd5);
+      return skippedItem;
+    }
+
+    log.info("MD5 differs or missing, promoting: sourceMd5={}, targetMd5={}, path={}",
+        sourceMd5, targetMd5, filePath);
 
     // Download from source
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
@@ -514,7 +543,91 @@ public class PromotionService {
 
     log.info("Successfully promoted: {} -> {}/{}",
         fullSourcePath, targetRepo, filePath);
-    return new PromotionTaskResult.FileItem(filePath, determineType(filePath));
+    PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, determineType(filePath));
+    item.setSourceMd5(sourceMd5);
+    item.setTargetMd5(targetMd5);
+    return item;
+  }
+
+  // ========================================================================
+  // MD5 checksum retrieval via Nexus internal Java API
+  // ========================================================================
+
+  /**
+   * Get the MD5 checksum of an asset using Nexus internal StorageTx API.
+   * This is the most reliable way to get checksums — no HTTP roundtrip,
+   * no authentication issues, reads directly from the blob store.
+   * Returns null if the asset is not found or MD5 is not available.
+   */
+  private String getAssetMd5(final String repoName, final String assetPath) {
+    try {
+      Repository repo = repositoryManager.get(repoName);
+      if (repo == null) {
+        log.debug("Repository not found for MD5 lookup: {}", repoName);
+        return null;
+      }
+
+      StorageTx tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      try {
+        Bucket bucket = tx.findBucket(repo);
+        Asset asset = tx.findAssetWithProperty("name", assetPath, bucket);
+
+        // Fallback: try with leading slash
+        if (asset == null && !assetPath.startsWith("/")) {
+          asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
+        }
+
+        if (asset == null) {
+          log.debug("Asset not found for MD5 lookup: {}/{}", repoName, assetPath);
+          return null;
+        }
+
+        // Method 1: Use Asset.getChecksum(HashAlgorithm.MD5) — Nexus 3.7+
+        try {
+          HashCode md5Hash = asset.getChecksum(HashAlgorithm.MD5);
+          if (md5Hash != null) {
+            String md5 = md5Hash.toString();
+            if (!md5.isEmpty()) {
+              log.debug("Found MD5 via Asset.getChecksum() for {}/{}: {}", repoName, assetPath, md5);
+              return md5;
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Asset.getChecksum(MD5) not available or failed for {}/{}: {}", repoName, assetPath, e.getMessage());
+        }
+
+        // Method 2: Try blob headers for Content-Hash-MD5
+        try {
+          if (asset.requireBlobRef() != null) {
+            Blob blob = tx.requireBlob(asset.requireBlobRef());
+            if (blob != null) {
+              Map<String, String> headers = blob.getHeaders();
+              String md5 = headers.get("Content-Hash-MD5");
+              if (md5 == null || md5.isEmpty()) {
+                // Try alternate header key format used in some Nexus versions
+                md5 = headers.get("content-hash-md5");
+              }
+              if (md5 != null && !md5.isEmpty()) {
+                log.debug("Found MD5 via blob headers for {}/{}: {}", repoName, assetPath, md5);
+                return md5;
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Blob header MD5 lookup failed for {}/{}: {}", repoName, assetPath, e.getMessage());
+        }
+      }
+      finally {
+        tx.close();
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to get MD5 via internal API for {}/{}: {}", repoName, assetPath, e.getMessage());
+    }
+    return null;
   }
 
   // ==================== Helper Methods ====================
@@ -881,6 +994,8 @@ public class PromotionService {
         itemCopy.setType(item.getType());
         itemCopy.setStatus(item.getStatus());
         itemCopy.setErrorMessage(item.getErrorMessage());
+        itemCopy.setSourceMd5(item.getSourceMd5());
+        itemCopy.setTargetMd5(item.getTargetMd5());
         itemsCopy.add(itemCopy);
       }
       copy.setItems(itemsCopy);

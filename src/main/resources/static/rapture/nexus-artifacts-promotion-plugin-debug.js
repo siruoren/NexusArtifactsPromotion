@@ -58,6 +58,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.pending": "Pending",
     "promotion.progress.success": "Success",
     "promotion.progress.failed": "Failed",
+    "promotion.progress.skipped": "Skipped",
     "promotion.result.title.success": "Promotion Success",
     "promotion.result.title.failed": "Promotion Failed",
     "promotion.result.targetRepository": "Target Repository:",
@@ -137,6 +138,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.pending": "\u7b49\u5f85\u4e2d",
     "promotion.progress.success": "\u6210\u529f",
     "promotion.progress.failed": "\u5931\u8d25",
+    "promotion.progress.skipped": "\u672a\u66f4\u65b0",
     "promotion.result.title.success": "\u664b\u7ea7\u6210\u529f",
     "promotion.result.title.failed": "\u664b\u7ea7\u5931\u8d25",
     "promotion.result.targetRepository": "\u76ee\u6807\u4ed3\u5e93\uff1a",
@@ -757,15 +759,33 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     // Try to determine the current repository from the surrounding context
     Ext.defer(function () {
-      me.tryAddFullSyncButtonToAssetList(panel);
+      me.tryAddFullSyncButtonToAssetList(panel, 0);
     }, 300);
+
+    // Listen for hash changes to re-evaluate when navigating between repos
+    if (!panel._hashChangeListenerAdded) {
+      panel._hashChangeListenerAdded = true;
+      var hashHandler = function () {
+        Ext.defer(function () {
+          if (!panel.destroyed) {
+            me.tryAddFullSyncButtonToAssetList(panel, 0);
+          }
+        }, 200);
+      };
+      window.addEventListener('hashchange', hashHandler);
+      panel.on('beforedestroy', function () {
+        window.removeEventListener('hashchange', hashHandler);
+      });
+    }
   },
 
   /**
    * Try to add a full-sync button to the asset list panel.
    * Determines the repository from the browse context.
+   * @param {Object} panel The asset list panel
+   * @param {Number} retryCount Current retry attempt (0-based)
    */
-  tryAddFullSyncButtonToAssetList: function (panel) {
+  tryAddFullSyncButtonToAssetList: function (panel, retryCount) {
     var me = this;
     try {
       if (panel.destroyed) return;
@@ -777,47 +797,27 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var repoName = null;
       var format = null;
 
-      // Source 1: From the parent browse container's viewModel or state
-      var browsePanel = panel.up('nx-coreui-repositorybrowse') ||
-                        panel.up('nx-coreui-component-asset-tree') ||
-                        panel.up('[reference=browseContainer]');
-      if (browsePanel) {
-        // Try viewModel
-        try {
-          var vm = browsePanel.getViewModel();
-          if (vm) {
-            var repo = vm.get('repository') || vm.get('repoName');
-            if (repo) {
-              repoName = (typeof repo === 'object') ? (repo.name || repo.get('name')) : repo;
-              format = (typeof repo === 'object') ? (repo.format || repo.get('format')) : null;
-            }
-          }
-        } catch (e) { /* ignore */ }
-
-        // Try the tree's store to get the selected repository node
+      // Source 1: From browser URL hash (most reliable, works even for empty repos)
+      // Nexus URL hash format: #/browse/search|FORMAT|REPO_NAME or #/browse/browse|FORMAT|REPO_NAME
+      try {
+        var hash = window.location.hash || '';
+        // Pattern: browse/search|FORMAT|REPO_NAME or browse/browse|FORMAT|REPO_NAME
+        var hashMatch = hash.match(/browse\/(?:search|browse)\|([^|]+)\|([^|\/]+)/);
+        if (hashMatch && hashMatch[2]) {
+          repoName = decodeURIComponent(hashMatch[2]);
+          format = hashMatch[1] || null;
+        }
+        // Alternative pattern: #/browse/FORMAT/REPO_NAME
         if (!repoName) {
-          var tree = browsePanel.down('treepanel');
-          if (tree) {
-            var selected = tree.getSelectionModel().getSelection()[0];
-            if (selected) {
-              repoName = selected.get('repositoryName') || selected.get('text');
-              // The root node of the tree is typically the repository name
-              if (!repoName && selected.get('root')) {
-                repoName = selected.get('text');
-              }
-            }
-            // If nothing selected, try the tree store's root
-            if (!repoName) {
-              var root = tree.getStore().getRootNode();
-              if (root) {
-                repoName = root.get('repositoryName') || root.get('text');
-              }
-            }
+          var altMatch = hash.match(/browse\/([^\/]+)\/([^\/]+)/);
+          if (altMatch && altMatch[2]) {
+            repoName = decodeURIComponent(altMatch[2]);
+            format = altMatch[1] || null;
           }
         }
-      }
+      } catch (e) { /* ignore */ }
 
-      // Source 2: From the panel's own store (asset list store may contain repositoryName)
+      // Source 2: From the panel's own store (asset list store proxy URL contains repository param)
       if (!repoName && panel.store) {
         try {
           var proxy = panel.store.getProxy();
@@ -831,7 +831,47 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         } catch (e) { /* ignore */ }
       }
 
-      // Source 3: From the global NX.State or repository stores
+      // Source 3: From the parent browse container's viewModel or state
+      if (!repoName) {
+        var browsePanel = panel.up('nx-coreui-repositorybrowse') ||
+                          panel.up('nx-coreui-component-asset-tree') ||
+                          panel.up('[reference=browseContainer]');
+        if (browsePanel) {
+          // Try viewModel
+          try {
+            var vm = browsePanel.getViewModel();
+            if (vm) {
+              var repo = vm.get('repository') || vm.get('repoName');
+              if (repo) {
+                repoName = (typeof repo === 'object') ? (repo.name || repo.get('name')) : repo;
+                format = (typeof repo === 'object') ? (repo.format || repo.get('format')) : null;
+              }
+            }
+          } catch (e) { /* ignore */ }
+
+          // Try the tree's store to get the selected repository node
+          if (!repoName) {
+            var tree = browsePanel.down('treepanel');
+            if (tree) {
+              var selected = tree.getSelectionModel().getSelection()[0];
+              if (selected) {
+                repoName = selected.get('repositoryName') || selected.get('text');
+                if (!repoName && selected.get('root')) {
+                  repoName = selected.get('text');
+                }
+              }
+              if (!repoName) {
+                var root = tree.getStore().getRootNode();
+                if (root) {
+                  repoName = root.get('repositoryName') || root.get('text');
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Source 4: From the global NX.State or repository stores
       if (!repoName) {
         try {
           var featureBrowser = me.getFeatureBrowser();
@@ -841,7 +881,6 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               var menuSel = menuTree.getSelectionModel().getSelection()[0];
               if (menuSel) {
                 var segs = (menuSel.get('id') || menuSel.get('path') || '').split('/');
-                // Path like: browse/REPO_FORMAT/REPO_NAME
                 if (segs.length >= 3) {
                   repoName = segs[segs.length - 1];
                 }
@@ -849,6 +888,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             }
           }
         } catch (e) { /* ignore */ }
+      }
+
+      // Retry if repo name not found yet (store proxy URL may not be set immediately)
+      if (!repoName && retryCount < 6) {
+        Ext.defer(function () {
+          me.tryAddFullSyncButtonToAssetList(panel, retryCount + 1);
+        }, 500);
+        return;
       }
 
       if (!repoName) return;
@@ -1102,7 +1149,6 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     // Quick synchronous check first
     if (me.isProxyRepository(repoName)) {
       me.addSyncButton(panel, repoName, path, format, isDirectory);
-      me.addFullSyncButton(panel, repoName, format);
       return;
     }
 
@@ -1114,9 +1160,6 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         // Check panel still exists and no sync button already
         if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
           me.addSyncButton(panel, repoName, path, format, isDirectory);
-        }
-        if (!panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
-          me.addFullSyncButton(panel, repoName, format);
         }
       }
     })
@@ -1488,6 +1531,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         case 'failed':
           return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'skipped':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
         default:
           return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
       }
@@ -1679,7 +1724,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         var taskFailed = (result.status === 'FAILED');
         store.each(function (rec) {
           var st = rec.get('status');
-          if (st !== 'success' && st !== 'failed') {
+          if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
             rec.set('status', taskFailed ? 'failed' : 'success');
           }
         });
@@ -1696,7 +1741,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           total = gridStore ? gridStore.getCount() : totalFiles;
           if (gridStore) {
             gridStore.each(function (rec) {
-              if (rec.get('status') === 'success' || rec.get('status') === 'failed') done++;
+              var s = rec.get('status');
+              if (s === 'success' || s === 'failed' || s === 'skipped') done++;
             });
           }
         }
@@ -1769,14 +1815,18 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               if (!item.path) continue;
               var idx = store.findExact('path', item.path);
               if (idx >= 0) {
-                store.getAt(idx).set('status', item.status === 'failed' ? 'failed' : 'success');
+                var itemStatus = item.status;
+                if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
+                  itemStatus = 'success';
+                }
+                store.getAt(idx).set('status', itemStatus);
               }
             }
 
             // Mark any remaining pending/processing items
             store.each(function (rec) {
               var st = rec.get('status');
-              if (st !== 'success' && st !== 'failed') {
+              if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
                 rec.set('status', taskFailed ? 'failed' : 'success');
               }
             });
@@ -1807,14 +1857,19 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           if (!bi.path) continue;
           var bidx = store.findExact('path', bi.path);
           if (bidx >= 0) {
-            store.getAt(bidx).set('status', bi.status === 'failed' ? 'failed' : 'success');
+            var biStatus = bi.status;
+            if (biStatus !== 'failed' && biStatus !== 'skipped' && biStatus !== 'success') {
+              biStatus = 'success';
+            }
+            store.getAt(bidx).set('status', biStatus);
           }
         }
 
         // Mark first pending item as processing
         var hasProcessing = false;
         store.each(function (rec) {
-          if (!hasProcessing && rec.get('status') !== 'success' && rec.get('status') !== 'failed') {
+          var rs = rec.get('status');
+          if (!hasProcessing && rs !== 'success' && rs !== 'failed' && rs !== 'skipped') {
             rec.set('status', 'processing');
             hasProcessing = true;
           }
@@ -1824,7 +1879,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         var processedCount = 0;
         store.each(function (rec) {
           var st = rec.get('status');
-          if (st === 'success' || st === 'failed') { processedCount++; }
+          if (st === 'success' || st === 'failed' || st === 'skipped') { processedCount++; }
         });
 
         var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;

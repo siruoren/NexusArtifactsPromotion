@@ -59,8 +59,10 @@ public class PromotionTaskResult {
   public static class FileItem {
     private String path;
     private String type; // "directory", "file", "image"
-    private String status;
+    private String status; // "success", "failed", "skipped"
     private String errorMessage;
+    private String sourceMd5;
+    private String targetMd5;
 
     public FileItem() {}
 
@@ -81,6 +83,12 @@ public class PromotionTaskResult {
 
     public String getErrorMessage() { return errorMessage; }
     public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+
+    public String getSourceMd5() { return sourceMd5; }
+    public void setSourceMd5(String sourceMd5) { this.sourceMd5 = sourceMd5; }
+
+    public String getTargetMd5() { return targetMd5; }
+    public void setTargetMd5(String targetMd5) { this.targetMd5 = targetMd5; }
   }
 
 }

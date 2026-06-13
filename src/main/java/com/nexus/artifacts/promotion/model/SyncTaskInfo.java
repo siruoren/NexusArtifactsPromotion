@@ -79,8 +79,10 @@ public class SyncTaskInfo {
   public static class SyncFileDetail {
     private String path;
     private String type; // "directory", "file", "image"
-    private String status;
+    private String status; // "pending", "success", "failed", "skipped"
     private String errorMessage;
+    private String remoteMd5;
+    private String localMd5;
 
     public SyncFileDetail() {}
 
@@ -101,5 +103,11 @@ public class SyncTaskInfo {
 
     public String getErrorMessage() { return errorMessage; }
     public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+
+    public String getRemoteMd5() { return remoteMd5; }
+    public void setRemoteMd5(String remoteMd5) { this.remoteMd5 = remoteMd5; }
+
+    public String getLocalMd5() { return localMd5; }
+    public void setLocalMd5(String localMd5) { this.localMd5 = localMd5; }
   }
 }

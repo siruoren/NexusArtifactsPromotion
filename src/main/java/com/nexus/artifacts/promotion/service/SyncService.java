@@ -21,8 +21,14 @@ import javax.inject.Singleton;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.sonatype.nexus.blobstore.api.Blob;
+import org.sonatype.nexus.common.hash.HashAlgorithm;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
+import org.sonatype.nexus.repository.storage.Asset;
+import org.sonatype.nexus.repository.storage.Bucket;
+import org.sonatype.nexus.repository.storage.StorageFacet;
+import org.sonatype.nexus.repository.storage.StorageTx;
 import org.sonatype.nexus.repository.view.Content;
 import org.sonatype.nexus.repository.view.Request;
 import org.sonatype.nexus.repository.view.Response;
@@ -31,6 +37,8 @@ import org.sonatype.nexus.repository.view.ViewFacet;
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.subject.support.SubjectThreadState;
 import org.sonatype.nexus.security.SecurityHelper;
+
+import com.google.common.hash.HashCode;
 
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
@@ -180,10 +188,15 @@ public class SyncService {
           taskInfo.setFileDetails(syncedFiles);
           taskInfo.setStatus(TaskStatus.COMPLETED);
           taskInfo.setEndTime(System.currentTimeMillis());
-          taskInfo.setResult("Synced " + syncedFiles.size() + " items");
 
-          log.info("Sync task completed: {} items synced from {}:{}",
-              syncedFiles.size(), request.getRepositoryName(), request.getPath());
+          // Count skipped vs actually synced items
+          long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+          long syncedCount = syncedFiles.size() - skippedCount;
+          taskInfo.setResult("Synced " + syncedCount + " items" +
+              (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
+
+          log.info("Sync task completed: {} items synced, {} skipped from {}:{}",
+              syncedCount, skippedCount, request.getRepositoryName(), request.getPath());
 
         }
         catch (Exception e) {
@@ -319,7 +332,8 @@ public class SyncService {
    * Sync all files in a directory from remote using ContentFacet.
    * Flow:
    * 1. Get remote file list (from remote repo REST API or HTTP directory listing)
-   * 2. For each file, call ContentFacet.get(path) -> Nexus auto-fetches from remote if not cached
+   * 2. For each file, compare MD5 of remote vs local cached asset
+   * 3. If MD5 matches, skip (incremental sync); otherwise call ContentFacet.get(path)
    */
   private List<SyncTaskInfo.SyncFileDetail> syncDirectory(final Repository repo, final String directoryPath) {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
@@ -347,8 +361,23 @@ public class SyncService {
             assetPath, determineType(assetPath));
 
         try {
-          syncAssetViaContentFacet(repo, assetPath, repoAuth);
-          detail.setStatus("success");
+          // Incremental check: compare MD5 of remote and local assets
+          String remoteMd5 = getRemoteAssetMd5(repo, assetPath, repoAuth);
+          String localMd5 = getLocalAssetMd5(repo.getName(), assetPath, repoAuth);
+
+          detail.setRemoteMd5(remoteMd5);
+          detail.setLocalMd5(localMd5);
+
+          if (remoteMd5 != null && localMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
+            log.info("Skipping sync (MD5 match): {}/{}, MD5={}", repo.getName(), assetPath, remoteMd5);
+            detail.setStatus("skipped");
+          }
+          else {
+            log.info("MD5 differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
+                remoteMd5, localMd5, assetPath);
+            syncAssetViaContentFacet(repo, assetPath, repoAuth);
+            detail.setStatus("success");
+          }
         }
         catch (Exception e) {
           log.error("Failed to sync asset {}: {}", assetPath, e.getMessage());
@@ -381,8 +410,23 @@ public class SyncService {
           filePath, determineType(filePath));
 
       try {
-        syncAssetViaContentFacet(repo, filePath, repoAuth);
-        detail.setStatus("success");
+        // Incremental check: compare MD5 of remote and local assets
+        String remoteMd5 = getRemoteAssetMd5(repo, filePath, repoAuth);
+        String localMd5 = getLocalAssetMd5(repo.getName(), filePath, repoAuth);
+
+        detail.setRemoteMd5(remoteMd5);
+        detail.setLocalMd5(localMd5);
+
+        if (remoteMd5 != null && localMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
+          log.info("Skipping sync (MD5 match): {}/{}, MD5={}", repo.getName(), filePath, remoteMd5);
+          detail.setStatus("skipped");
+        }
+        else {
+          log.info("MD5 differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
+              remoteMd5, localMd5, filePath);
+          syncAssetViaContentFacet(repo, filePath, repoAuth);
+          detail.setStatus("success");
+        }
       }
       catch (Exception e) {
         detail.setStatus("failed");
@@ -418,15 +462,8 @@ public class SyncService {
     log.info("Syncing asset {} via ViewFacet.dispatch()", assetPath);
 
     try {
-      // Step 1: Only delete if asset already exists in local cache
-      String cachedAssetId = findAssetIdViaApi(repo.getName(), assetPath, repoAuth);
-      if (cachedAssetId != null) {
-        log.info("Asset {} exists in cache, deleting to force fresh download", assetPath);
-        deleteAssetByIdViaApi(cachedAssetId, assetPath, repoAuth);
-      }
-      else {
-        log.info("Asset {} not in cache, will fetch fresh from remote", assetPath);
-      }
+      // Step 1: Delete cached asset if it exists, using internal StorageTx API
+      deleteCachedAssetInternal(repo, assetPath);
 
       // Step 2: Invalidate negative cache so previously 404'd assets can be retried
       invalidateNegativeCache(repo, assetPath);
@@ -850,117 +887,43 @@ public class SyncService {
   // ========================================================================
 
   /**
-   * Delete a local cached asset by its ID via REST API.
-   * This is more efficient than deleteAssetViaApi as it skips the search step.
-   * Uses proxy-configured credentials if available, otherwise falls back to default admin credentials.
+   * Delete a locally cached asset using Nexus internal StorageTx API.
+   * If the asset exists in the repository's local cache, it is deleted to force
+   * a fresh download from remote during the subsequent ViewFacet.dispatch().
    */
-  private void deleteAssetByIdViaApi(final String assetId, final String assetPath,
-      final String[] repoAuth) {
+  private void deleteCachedAssetInternal(final Repository repo, final String assetPath) {
+    StorageTx tx = null;
     try {
-      String deleteUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/assets/" + assetId;
-      HttpURLConnection conn = (HttpURLConnection) new URL(deleteUrl).openConnection();
-      conn.setRequestMethod("DELETE");
-      conn.setConnectTimeout(15_000);
-      conn.setReadTimeout(30_000);
-      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(getEffectiveAuth(repoAuth)));
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      Asset asset = tx.findAssetWithProperty("name", assetPath, bucket);
 
-      int responseCode = conn.getResponseCode();
-      conn.disconnect();
+      // Fallback: try with leading slash
+      if (asset == null && !assetPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
+      }
 
-      if (responseCode == 204 || responseCode == 200) {
-        log.info("Deleted cached asset via API: {}", assetPath);
+      if (asset != null) {
+        log.info("Asset {} exists in cache, deleting to force fresh download", assetPath);
+        tx.deleteAsset(asset);
+        tx.commit();
       }
       else {
-        log.warn("Failed to delete asset via API: HTTP {} for {}", responseCode, assetPath);
+        log.info("Asset {} not in cache, will fetch fresh from remote", assetPath);
       }
     }
     catch (Exception e) {
-      log.warn("Failed to delete cached asset {} via API: {}", assetPath, e.getMessage());
-    }
-  }
-
-  /**
-   * Find an asset ID by path using the Nexus Search API.
-   * Uses group and name filters to search only within the target scope,
-   * avoiding scanning all assets in the repository.
-   * Uses proxy-configured credentials if available, otherwise falls back to default admin credentials.
-   */
-  private String findAssetIdViaApi(final String repoName, final String assetPath,
-      final String[] repoAuth) throws Exception {
-    // Split path into group (directory) and name (filename)
-    // e.g. "2/test_network_daemon.sh" -> group="2", name="test_network_daemon.sh"
-    String group = null;
-    String name = null;
-    int lastSlash = assetPath.lastIndexOf('/');
-    if (lastSlash > 0) {
-      group = assetPath.substring(0, lastSlash);
-      name = assetPath.substring(lastSlash + 1);
-    }
-    else if (lastSlash == 0) {
-      name = assetPath.substring(1);
-    }
-    else {
-      name = assetPath;
-    }
-
-    // Use Search API with group and name filters for targeted search
-    StringBuilder apiUrl = new StringBuilder(LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName);
-    if (group != null && !group.isEmpty()) {
-      apiUrl.append("&group=").append(java.net.URLEncoder.encode(group, "UTF-8"));
-    }
-    if (name != null && !name.isEmpty()) {
-      apiUrl.append("&name=").append(java.net.URLEncoder.encode(name, "UTF-8"));
-    }
-
-    String continuationToken = null;
-
-    do {
-      String url = apiUrl.toString();
-      if (continuationToken != null) {
-        url += "&continuationToken=" + continuationToken;
+      log.warn("Failed to delete cached asset {} via internal API: {}", assetPath, e.getMessage());
+      if (tx != null) {
+        try { tx.rollback(); } catch (Exception ex) { /* ignore */ }
       }
-
-      HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(15_000);
-      conn.setReadTimeout(30_000);
-      conn.setRequestProperty("Accept", "application/json");
-      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(getEffectiveAuth(repoAuth)));
-
-      if (conn.getResponseCode() != 200) {
-        log.debug("Search API returned HTTP {} for {}", conn.getResponseCode(), url);
-        conn.disconnect();
-        return null;
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception e) { /* ignore */ }
       }
-
-      String json = readResponse(conn);
-
-      String itemsSection = extractJsonArray(json, "items");
-      if (itemsSection != null) {
-        int pos = 0;
-        while (pos < itemsSection.length()) {
-          int objStart = itemsSection.indexOf("{", pos);
-          if (objStart < 0) break;
-          int objEnd = findMatchingBrace(itemsSection, objStart);
-          if (objEnd < 0) break;
-
-          String item = itemsSection.substring(objStart, objEnd + 1);
-          String path = extractJsonValue(item, "path");
-          String id = extractJsonValue(item, "id");
-
-          if (path != null && path.equals(assetPath)) {
-            return id;
-          }
-
-          pos = objEnd + 1;
-        }
-      }
-
-      continuationToken = extractJsonValue(json, "continuationToken");
-
-    } while (continuationToken != null && !continuationToken.isEmpty());
-
-    return null;
+    }
   }
 
   /**
@@ -1001,6 +964,135 @@ public class SyncService {
     catch (Exception e) {
       log.debug("Negative cache invalidation skipped: {}", e.getMessage());
     }
+  }
+
+  // ========================================================================
+  // MD5 checksum retrieval via Nexus internal Java API
+  // ========================================================================
+
+  /**
+   * Get the MD5 checksum of an asset from the remote (source) repository.
+   * For proxy repos whose remote URL points to a local Nexus repo, this uses
+   * the internal StorageTx API. Otherwise returns null (no MD5 available for
+   * external HTTP remotes via directory listing).
+   */
+  private String getRemoteAssetMd5(final Repository proxyRepo, final String assetPath,
+      final String[] repoAuth) {
+    try {
+      // Get remote URL from repository configuration
+      org.sonatype.nexus.repository.config.Configuration config = proxyRepo.getConfiguration();
+      if (config == null) return null;
+
+      Map<String, Map<String, Object>> attributes = config.getAttributes();
+      if (attributes == null || !attributes.containsKey("proxy")) return null;
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = attributes.get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return null;
+
+      // If remote URL points to a local Nexus repo, use internal API to get MD5
+      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
+      if (remoteRepoName != null) {
+        Repository remoteRepo = repositoryManager.get(remoteRepoName);
+        if (remoteRepo != null) {
+          return getAssetMd5(remoteRepoName, assetPath);
+        }
+      }
+
+      // For external HTTP remotes, we cannot easily get MD5 from directory listing
+      // Return null so sync will always proceed (full sync behavior)
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 for {}/{}: {}", proxyRepo.getName(), assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get the MD5 checksum of a locally cached asset in the proxy repository.
+   * Uses Nexus internal StorageTx API. Returns null if the asset is not cached locally.
+   */
+  private String getLocalAssetMd5(final String repoName, final String assetPath,
+      final String[] repoAuth) {
+    return getAssetMd5(repoName, assetPath);
+  }
+
+  /**
+   * Get the MD5 checksum of an asset using Nexus internal StorageTx API.
+   * This is the most reliable way to get checksums — no HTTP roundtrip,
+   * no authentication issues, reads directly from the blob store.
+   * Returns null if the asset is not found or MD5 is not available.
+   */
+  private String getAssetMd5(final String repoName, final String assetPath) {
+    try {
+      Repository repo = repositoryManager.get(repoName);
+      if (repo == null) {
+        log.debug("Repository not found for MD5 lookup: {}", repoName);
+        return null;
+      }
+
+      StorageTx tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      try {
+        Bucket bucket = tx.findBucket(repo);
+        Asset asset = tx.findAssetWithProperty("name", assetPath, bucket);
+
+        // Fallback: try with leading slash
+        if (asset == null && !assetPath.startsWith("/")) {
+          asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
+        }
+
+        if (asset == null) {
+          log.debug("Asset not found for MD5 lookup: {}/{}", repoName, assetPath);
+          return null;
+        }
+
+        // Method 1: Use Asset.getChecksum(HashAlgorithm.MD5) — Nexus 3.7+
+        try {
+          HashCode md5Hash = asset.getChecksum(HashAlgorithm.MD5);
+          if (md5Hash != null) {
+            String md5 = md5Hash.toString();
+            if (!md5.isEmpty()) {
+              log.debug("Found MD5 via Asset.getChecksum() for {}/{}: {}", repoName, assetPath, md5);
+              return md5;
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Asset.getChecksum(MD5) not available or failed for {}/{}: {}", repoName, assetPath, e.getMessage());
+        }
+
+        // Method 2: Try blob headers for Content-Hash-MD5
+        try {
+          if (asset.requireBlobRef() != null) {
+            Blob blob = tx.requireBlob(asset.requireBlobRef());
+            if (blob != null) {
+              Map<String, String> headers = blob.getHeaders();
+              String md5 = headers.get("Content-Hash-MD5");
+              if (md5 == null || md5.isEmpty()) {
+                md5 = headers.get("content-hash-md5");
+              }
+              if (md5 != null && !md5.isEmpty()) {
+                log.debug("Found MD5 via blob headers for {}/{}: {}", repoName, assetPath, md5);
+                return md5;
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Blob header MD5 lookup failed for {}/{}: {}", repoName, assetPath, e.getMessage());
+        }
+      }
+      finally {
+        tx.close();
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to get MD5 via internal API for {}/{}: {}", repoName, assetPath, e.getMessage());
+    }
+    return null;
   }
 
   // ========================================================================
