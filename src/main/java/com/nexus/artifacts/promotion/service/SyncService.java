@@ -325,7 +325,9 @@ public class SyncService {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
-      log.info("Starting directory sync for {}:{}", repo.getName(), directoryPath);
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      log.info("Starting {} for {}:{}", isFullSync ? "full repository sync" : "directory sync",
+          repo.getName(), isFullSync ? "/" : directoryPath);
 
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
@@ -500,6 +502,8 @@ public class SyncService {
       String authUsername = (repoAuth != null) ? repoAuth[0] : null;
       String authPassword = (repoAuth != null) ? repoAuth[1] : null;
 
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+
       // Strategy 1: Check if remote URL points to a local Nexus repo
       String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
       if (remoteRepoName != null) {
@@ -508,8 +512,10 @@ public class SyncService {
           if (remoteRepo != null) {
             log.info("Remote URL points to local Nexus repo: {}, listing via REST API (auth: {})",
                 remoteRepoName, authUsername != null ? authUsername : "default");
-            List<String> assets = listAssetsViaApi(remoteRepoName, directoryPath, authUsername, authPassword);
-            log.info("Found {} assets from local repo {} in path {}", assets.size(), remoteRepoName, directoryPath);
+            List<String> assets = listAssetsViaApi(remoteRepoName,
+                isFullSync ? "" : directoryPath, authUsername, authPassword);
+            log.info("Found {} assets from local repo {} in path {}",
+                assets.size(), remoteRepoName, isFullSync ? "/" : directoryPath);
             return assets;
           }
         }
@@ -519,6 +525,11 @@ public class SyncService {
       }
 
       // Strategy 2: Fall back to HTTP directory listing
+      if (isFullSync) {
+        // For full sync via HTTP, we need to recursively crawl the root directory
+        log.info("Falling back to HTTP recursive directory listing for full repo sync: {}", remoteUrl);
+        return listRemoteAssetsViaHttpRecursive("", remoteUrl, authUsername, authPassword);
+      }
       log.info("Falling back to HTTP directory listing for remote: {}", remoteUrl);
       return listRemoteAssetsViaHttp(directoryPath, remoteUrl, authUsername, authPassword);
 
@@ -558,14 +569,28 @@ public class SyncService {
   /**
    * List assets from a local Nexus repository via Search API.
    * Strategy:
-   * 1. First try with group filter (works for Maven2 format where group = groupId)
-   * 2. If group filter returns 0 results (common for raw/hosted format where group doesn't
-   *    match directory path), fall back to listing all assets and filtering by path prefix
+   * - If directoryPath is empty: full repo sync — list all assets without group/path filter
+   * - Otherwise:
+   *   1. First try with group filter (works for Maven2 format where group = groupId)
+   *   2. If group filter returns 0 results (common for raw/hosted format where group doesn't
+   *      match directory path), fall back to listing all assets and filtering by path prefix
    * Handles pagination via continuationToken.
    * Uses proxy-configured credentials if provided, falls back to default admin credentials.
    */
   private List<String> listAssetsViaApi(final String repoName, final String directoryPath,
       final String authUsername, final String authPassword) throws Exception {
+    String effectiveAuth = (authUsername != null && authPassword != null)
+        ? authUsername + ":" + authPassword : getAdminAuth();
+
+    // Full repository sync — list all assets without any path filter
+    boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+    if (isFullSync) {
+      String allApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName;
+      List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
+      log.info("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
+      return allAssets;
+    }
+
     String normalizedDir = directoryPath;
     if (normalizedDir.endsWith("/")) {
       normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
@@ -574,9 +599,6 @@ public class SyncService {
     String pathPrefix = normalizedDir;
 
     // Step 1: Try with group filter first (efficient for Maven2 repos)
-    String effectiveAuth = (authUsername != null && authPassword != null)
-        ? authUsername + ":" + authPassword : getAdminAuth();
-
     String groupApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName
         + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
     List<String> assetsWithGroup = listAssetsViaApiUrl(groupApiUrl, effectiveAuth);
@@ -683,6 +705,74 @@ public class SyncService {
       }
     }
     return filtered;
+  }
+
+  /**
+   * Recursively list all remote assets via HTTP directory listing.
+   * Used for full-repository sync when the remote is not a local Nexus repo.
+   * Crawls subdirectories recursively to find all files.
+   */
+  private List<String> listRemoteAssetsViaHttpRecursive(final String currentPath,
+      final String remoteUrl, final String authUsername, final String authPassword) {
+    List<String> allAssets = new ArrayList<>();
+
+    try {
+      String dirUrl = remoteUrl + currentPath;
+      if (!dirUrl.endsWith("/")) {
+        dirUrl += "/";
+      }
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(15_000);
+      conn.setReadTimeout(30_000);
+      conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
+
+      if (authUsername != null && authPassword != null) {
+        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+      }
+
+      if (conn.getResponseCode() != 200) {
+        conn.disconnect();
+        return allAssets;
+      }
+
+      String html = readResponse(conn);
+
+      Pattern linkPattern = Pattern.compile(
+          "<a[^>]+href\\s*=\\s*[\"'](?!(?:mailto:|javascript:|\\?|/|#))([^\"']+)[\"']",
+          Pattern.CASE_INSENSITIVE);
+      Matcher matcher = linkPattern.matcher(html);
+
+      while (matcher.find()) {
+        String href = matcher.group(1);
+        if (href.startsWith("./")) {
+          href = href.substring(2);
+        }
+        if (href.equals("../") || href.equals("/") || href.equals(".")) {
+          continue;
+        }
+        if (href.contains("?") || href.contains("#")) {
+          continue;
+        }
+
+        String assetPath = currentPath + (currentPath.endsWith("/") || currentPath.isEmpty() ? "" : "/") + href;
+
+        if (href.endsWith("/")) {
+          // Subdirectory — recurse into it
+          List<String> subAssets = listRemoteAssetsViaHttpRecursive(assetPath, remoteUrl, authUsername, authPassword);
+          allAssets.addAll(subAssets);
+        }
+        else {
+          allAssets.add(assetPath);
+        }
+      }
+    }
+    catch (Exception e) {
+      log.warn("Failed to list remote directory via HTTP for {}: {}", currentPath, e.getMessage());
+    }
+
+    return allAssets;
   }
 
   /**

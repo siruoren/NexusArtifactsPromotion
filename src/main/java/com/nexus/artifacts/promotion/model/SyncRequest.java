@@ -29,26 +29,33 @@ public class SyncRequest {
 
   /**
    * Validate the request.
+   * An empty or "/" path is allowed for full-repository sync (isDirectory must be true).
    */
   public void validate() {
     if (repositoryName == null || repositoryName.trim().isEmpty()) {
       throw new IllegalArgumentException("repositoryName is required");
     }
-    if (path == null || path.trim().isEmpty()) {
-      throw new IllegalArgumentException("path is required");
-    }
     if (format == null || format.trim().isEmpty()) {
       throw new IllegalArgumentException("format is required");
     }
     // Normalize path
+    if (path == null) {
+      path = "";
+    }
     if (path.startsWith("./")) {
       path = path.substring(2);
     }
     while (path.startsWith("/")) {
       path = path.substring(1);
     }
+    // Empty path is allowed for full-repository sync (isDirectory=true)
     if (path.trim().isEmpty()) {
-      throw new IllegalArgumentException("Invalid path: path is empty after normalization");
+      if (!isDirectory) {
+        throw new IllegalArgumentException("path is required for non-directory sync");
+      }
+      // Full repository sync — path remains empty
+      this.path = "";
+      return;
     }
     if (path.contains("..") || path.contains("\0")) {
       throw new IllegalArgumentException("Invalid path: path traversal detected");

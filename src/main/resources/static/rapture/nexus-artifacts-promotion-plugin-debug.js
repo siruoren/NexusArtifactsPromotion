@@ -75,6 +75,10 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
     "sync.button.text": "Sync",
     "sync.button.text.directory": "Sync Directory",
+    "sync.button.text.full": "Sync All",
+    "sync.full.confirm.title": "Full Repository Sync",
+    "sync.full.confirm.message": "This will sync all assets from the remote repository '{0}'. Continue?",
+    "sync.full.path": "/ (Full Repository)",
     "sync.permission.denied": "You do not have sync permission for this repository.",
     "sync.permission.denied.admin": "You do not have sync permission. Please contact your administrator.",
     "sync.execute.failed": "Sync Failed",
@@ -150,6 +154,10 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
     "sync.button.text": "\u540c\u6b65",
     "sync.button.text.directory": "\u540c\u6b65\u76ee\u5f55",
+    "sync.button.text.full": "\u6574\u5e93\u540c\u6b65",
+    "sync.full.confirm.title": "\u6574\u5e93\u540c\u6b65",
+    "sync.full.confirm.message": "\u5c06\u4ece\u8fdc\u7a0b\u4ed3\u5e93 '{0}' \u540c\u6b65\u6240\u6709\u5236\u54c1\uff0c\u662f\u5426\u7ee7\u7eed\uff1f",
+    "sync.full.path": "/ (\u6574\u5e93\u540c\u6b65)",
     "sync.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u540c\u6b65\u6743\u9650\u3002",
     "sync.permission.denied.admin": "\u60a8\u6ca1\u6709\u540c\u6b65\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
     "sync.execute.failed": "\u540c\u6b65\u5931\u8d25",
@@ -639,6 +647,11 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       },
       'nx-coreui-component-componentfolderinfo': {
         afterrender: me.onFolderInfoRender
+      },
+      // Listen for the repository browse list panel to add full-sync button
+      // This covers the case when a proxy repo is empty (no assets/folders to click)
+      'nx-coreui-component-asset-list': {
+        afterrender: me.onAssetListRender
       }
     });
 
@@ -734,6 +747,149 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   },
 
   /**
+   * Called when the asset list panel (browse view) renders.
+   * Adds a "Sync All" button for proxy repositories.
+   * This handles the case where a new proxy repo has no assets/folders yet.
+   */
+  onAssetListRender: function (panel) {
+    var me = this;
+    me._currentAssetListPanel = panel;
+
+    // Try to determine the current repository from the surrounding context
+    Ext.defer(function () {
+      me.tryAddFullSyncButtonToAssetList(panel);
+    }, 300);
+  },
+
+  /**
+   * Try to add a full-sync button to the asset list panel.
+   * Determines the repository from the browse context.
+   */
+  tryAddFullSyncButtonToAssetList: function (panel) {
+    var me = this;
+    try {
+      if (panel.destroyed) return;
+
+      // Avoid duplicate buttons
+      if (panel.query('button[cls=fullsync-btn]').length > 0) return;
+
+      // Get repository name from multiple sources
+      var repoName = null;
+      var format = null;
+
+      // Source 1: From the parent browse container's viewModel or state
+      var browsePanel = panel.up('nx-coreui-repositorybrowse') ||
+                        panel.up('nx-coreui-component-asset-tree') ||
+                        panel.up('[reference=browseContainer]');
+      if (browsePanel) {
+        // Try viewModel
+        try {
+          var vm = browsePanel.getViewModel();
+          if (vm) {
+            var repo = vm.get('repository') || vm.get('repoName');
+            if (repo) {
+              repoName = (typeof repo === 'object') ? (repo.name || repo.get('name')) : repo;
+              format = (typeof repo === 'object') ? (repo.format || repo.get('format')) : null;
+            }
+          }
+        } catch (e) { /* ignore */ }
+
+        // Try the tree's store to get the selected repository node
+        if (!repoName) {
+          var tree = browsePanel.down('treepanel');
+          if (tree) {
+            var selected = tree.getSelectionModel().getSelection()[0];
+            if (selected) {
+              repoName = selected.get('repositoryName') || selected.get('text');
+              // The root node of the tree is typically the repository name
+              if (!repoName && selected.get('root')) {
+                repoName = selected.get('text');
+              }
+            }
+            // If nothing selected, try the tree store's root
+            if (!repoName) {
+              var root = tree.getStore().getRootNode();
+              if (root) {
+                repoName = root.get('repositoryName') || root.get('text');
+              }
+            }
+          }
+        }
+      }
+
+      // Source 2: From the panel's own store (asset list store may contain repositoryName)
+      if (!repoName && panel.store) {
+        try {
+          var proxy = panel.store.getProxy();
+          if (proxy && proxy.url) {
+            // URL pattern: /service/rest/v1/assets?repository=REPO_NAME
+            var match = proxy.url.match(/[?&]repository=([^&]+)/);
+            if (match) {
+              repoName = decodeURIComponent(match[1]);
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      // Source 3: From the global NX.State or repository stores
+      if (!repoName) {
+        try {
+          var featureBrowser = me.getFeatureBrowser();
+          if (featureBrowser) {
+            var menuTree = featureBrowser.down('treepanel');
+            if (menuTree) {
+              var menuSel = menuTree.getSelectionModel().getSelection()[0];
+              if (menuSel) {
+                var segs = (menuSel.get('id') || menuSel.get('path') || '').split('/');
+                // Path like: browse/REPO_FORMAT/REPO_NAME
+                if (segs.length >= 3) {
+                  repoName = segs[segs.length - 1];
+                }
+              }
+            }
+          }
+        } catch (e) { /* ignore */ }
+      }
+
+      if (!repoName) return;
+
+      // Get format if not already determined
+      if (!format) {
+        format = me.getRepositoryFormat(repoName);
+      }
+
+      // Check if this is a proxy repository and add the button
+      me.addFullSyncButtonIfProxy(panel, repoName, format);
+    } catch (e) {
+      // Silently fail
+    }
+  },
+
+  /**
+   * Add full-sync button if the repository is a proxy type.
+   * Async check via API.
+   */
+  addFullSyncButtonIfProxy: function (panel, repoName, format) {
+    var me = this;
+
+    // Quick synchronous check first
+    if (me.isProxyRepository(repoName)) {
+      me.addFullSyncButton(panel, repoName, format);
+      return;
+    }
+
+    // Async API check
+    apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
+    .then(function (result) {
+      var isProxy = result.isProxy === true;
+      if (isProxy && !panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
+        me.addFullSyncButton(panel, repoName, format);
+      }
+    })
+    .catch(function () { /* ignore */ });
+  },
+
+  /**
    * Try to add promotion/sync buttons to a folder info panel.
    * @param {Object} panel The ComponentFolderInfo panel
    * @return {boolean} true if buttons were added (or already exist), false if folderModel was missing
@@ -792,7 +948,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (!repoName || !path) return false;
 
       // Remove existing buttons to avoid duplicates
-      var existingBtns = panel.query('button[cls=promotion-btn], button[cls=sync-btn]');
+      var existingBtns = panel.query('button[cls=promotion-btn], button[cls=sync-btn], button[cls=fullsync-btn]');
       Ext.each(existingBtns, function (btn) { btn.destroy(); });
 
       // Get format from repository state
@@ -894,7 +1050,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (!repoName || !path) return;
 
       // Remove existing promotion/sync buttons to avoid duplicates
-      var existingBtns = panel.query('button[cls=promotion-btn], button[cls=sync-btn]');
+      var existingBtns = panel.query('button[cls=promotion-btn], button[cls=sync-btn], button[cls=fullsync-btn]');
       Ext.each(existingBtns, function (btn) { btn.destroy(); });
 
       // Add promotion button for all repository types
@@ -946,6 +1102,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     // Quick synchronous check first
     if (me.isProxyRepository(repoName)) {
       me.addSyncButton(panel, repoName, path, format, isDirectory);
+      me.addFullSyncButton(panel, repoName, format);
       return;
     }
 
@@ -957,6 +1114,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         // Check panel still exists and no sync button already
         if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
           me.addSyncButton(panel, repoName, path, format, isDirectory);
+        }
+        if (!panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
+          me.addFullSyncButton(panel, repoName, format);
         }
       }
     })
@@ -1026,6 +1186,40 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     }
   },
 
+  /**
+   * Add "Sync All" (full repository sync) button to a panel.
+   * Only shown for proxy repositories. Triggers sync of the entire remote repository.
+   */
+  addFullSyncButton: function (panel, repoName, format) {
+    var me = this;
+
+    var btn = Ext.create('Ext.button.Button', {
+      text: _t('sync.button.text.full'),
+      iconCls: 'x-fa fa-cloud-download',
+      cls: 'fullsync-btn',
+      handler: function () {
+        me.handleFullSyncClick(repoName, format);
+      }
+    });
+
+    var actions = panel.down('nx-actions');
+    if (actions) {
+      actions.add(btn);
+    } else {
+      // Try to find any existing toolbar (created by addPromotionButton/addSyncButton or native)
+      var toolbar = panel.down('toolbar');
+      if (toolbar) {
+        toolbar.add(btn);
+      } else {
+        panel.addDocked({
+          xtype: 'toolbar',
+          dock: 'top',
+          items: [btn]
+        });
+      }
+    }
+  },
+
   handlePromotionClick: function (repoName, path, isDirectory, format) {
     var me = this;
     // Directly show promotion modal - target repo list is filtered by write permission
@@ -1051,6 +1245,42 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       .catch(function (err) {
         showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
       });
+    });
+  },
+
+  /**
+   * Handle full repository sync click.
+   * Shows a confirmation dialog before syncing the entire repository.
+   */
+  handleFullSyncClick: function (repoName, format) {
+    var me = this;
+    checkSyncPermission(repoName, format).then(function (hasPermission) {
+      if (!hasPermission) {
+        showAlertDialog(_t('common.noPermission'), _t('sync.permission.denied'));
+        return;
+      }
+
+      // Show confirmation dialog
+      Ext.Msg.confirm(
+        _t('sync.full.confirm.title'),
+        _t('sync.full.confirm.message', repoName),
+        function (btn) {
+          if (btn !== 'yes') return;
+
+          apiRequest('POST', '/sync/execute', {
+            repositoryName: repoName,
+            path: '',
+            isDirectory: true,
+            format: format
+          })
+          .then(function (result) {
+            me.showSyncProgressWindow(result, repoName, _t('sync.full.path'), true);
+          })
+          .catch(function (err) {
+            showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
+          });
+        }
+      );
     });
   },
 
