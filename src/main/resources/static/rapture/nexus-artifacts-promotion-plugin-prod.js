@@ -795,11 +795,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       // Add promotion button for directory
       me.addPromotionButton(panel, repoName, path, format, true);
 
-      // Add sync button for proxy repositories
-      var isProxy = me.isProxyRepository(repoName);
-      if (isProxy) {
-        me.addSyncButton(panel, repoName, path, format, true);
-      }
+      // Add sync button for proxy repositories (async check via API)
+      me.addSyncButtonIfProxy(panel, repoName, path, format, true);
       return true;
     } catch (e) {
       // Silently fail
@@ -897,23 +894,25 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var isDirectory = path && path.endsWith('/');
       me.addPromotionButton(panel, repoName, path, format, isDirectory);
 
-      // Add sync button for proxy repositories
-      var isProxy = me.isProxyRepository(repoName);
-      if (isProxy) {
-        me.addSyncButton(panel, repoName, path, format, isDirectory);
-      }
+      // Add sync button for proxy repositories (async check via API)
+      me.addSyncButtonIfProxy(panel, repoName, path, format, isDirectory);
     } catch (e) {
       // Silently fail - don't break the UI
     }
   },
 
   isProxyRepository: function (repoName) {
+    // Try to determine from local stores first (synchronous)
     try {
-      var store = Ext.getStore('Repository');
-      if (store) {
-        var record = store.findRecord('name', repoName, 0, false, true, true);
-        if (record) {
-          return record.get('type') === 'proxy';
+      var storeIds = ['Repository', 'nx-coreui-repository', 'RepositoryList',
+                       'nx-coreui-repository-list', 'coreui_Repository'];
+      for (var s = 0; s < storeIds.length; s++) {
+        var s2 = Ext.getStore(storeIds[s]);
+        if (s2) {
+          var r = s2.findRecord('name', repoName, 0, false, true, true);
+          if (r && r.get('type') === 'proxy') {
+            return true;
+          }
         }
       }
     } catch (e) { /* ignore */ }
@@ -921,40 +920,42 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var repos = NX.State.getValue('repositories');
       if (repos) {
         for (var i = 0; i < repos.length; i++) {
-          if (repos[i].name === repoName) {
-            return repos[i].type === 'proxy';
+          if (repos[i].name === repoName && repos[i].type === 'proxy') {
+            return true;
           }
         }
       }
     } catch (e) { /* ignore */ }
-    try {
-      // Fallback: try NX.coreui store
-      var coreStore = Ext.getStore('nx-coreui-repository') || Ext.getStore('RepositoryList');
-      if (coreStore) {
-        var rec = coreStore.findRecord('name', repoName, 0, false, true, true);
-        if (rec) {
-          return rec.get('type') === 'proxy';
+    return false;
+  },
+
+  /**
+   * Async check if repository is proxy via API, then add sync button.
+   * Falls back to synchronous isProxyRepository if API fails.
+   */
+  addSyncButtonIfProxy: function (panel, repoName, path, format, isDirectory) {
+    var me = this;
+
+    // Quick synchronous check first
+    if (me.isProxyRepository(repoName)) {
+      me.addSyncButton(panel, repoName, path, format, isDirectory);
+      return;
+    }
+
+    // Async API check as fallback
+    checkSyncPermission(repoName, format).then(function (result) {
+      // result.hasPermission is true only for proxy repos with edit permission
+      // result.isProxy tells us if it's a proxy repo
+      var isProxy = result.isProxy === true;
+      if (isProxy) {
+        // Check panel still exists and no sync button already
+        if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
+          me.addSyncButton(panel, repoName, path, format, isDirectory);
         }
       }
-    } catch (e) { /* ignore */ }
-    try {
-      // Fallback: check all known stores for repository info
-      var storeIds = ['Repository', 'nx-coreui-repository', 'RepositoryList',
-                       'nx-coreui-repository-list', 'coreui_Repository'];
-      for (var s = 0; s < storeIds.length; s++) {
-        var s2 = Ext.getStore(storeIds[s]);
-        if (s2) {
-          var r = s2.findRecord('name', repoName, 0, false, true, true);
-          if (r) {
-            return r.get('type') === 'proxy';
-          }
-        }
-      }
-    } catch (e) { /* ignore */ }
-    // Last fallback: use sync permission API to determine if this is a proxy repo
-    // If sync permission returns true, it's likely a proxy repo
-    // We can't do async here, so return true and let the backend handle permission
-    return true;
+    }).catch(function () {
+      // API failed, don't add sync button
+    });
   },
 
   addPromotionButton: function (panel, repoName, path, format, isDirectory) {

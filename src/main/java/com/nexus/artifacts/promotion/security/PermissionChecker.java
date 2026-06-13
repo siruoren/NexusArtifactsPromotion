@@ -160,10 +160,25 @@ public class PermissionChecker {
 
   /**
    * Check if the current user has sync permission for the given repository.
-   * Sync requires edit permission on the repository.
+   * Sync requires edit permission on the repository AND the repository must be a proxy type.
    */
   public boolean hasSyncPermission(final String repositoryName, final String format) {
+    if (!isProxyRepository(repositoryName)) {
+      log.debug("Sync permission denied: {} is not a proxy repository", repositoryName);
+      return false;
+    }
     return hasRepositoryWritePermission(repositoryName, format);
+  }
+
+  /**
+   * Check if a repository is of proxy type.
+   */
+  public boolean isProxyRepository(final String repositoryName) {
+    Repository repo = repositoryManager.get(repositoryName);
+    if (repo == null) {
+      return false;
+    }
+    return "proxy".equals(repo.getType().getValue());
   }
 
   /**

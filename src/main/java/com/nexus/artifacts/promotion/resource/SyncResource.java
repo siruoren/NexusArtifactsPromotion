@@ -62,9 +62,12 @@ public class SyncResource implements Resource {
   {
     try {
       boolean hasPermission = permissionChecker.hasSyncPermission(repository, format);
+      boolean isProxy = permissionChecker.isProxyRepository(repository);
       return Response.ok()
-          .entity("{\"hasPermission\":" + hasPermission + ",\"repository\":\""
-              + sanitize(repository) + "\",\"format\":\"" + sanitize(format) + "\"}")
+          .entity("{\"hasPermission\":" + hasPermission
+              + ",\"isProxy\":" + isProxy
+              + ",\"repository\":\"" + sanitize(repository) + "\""
+              + ",\"format\":\"" + sanitize(format) + "\"}")
           .build();
     }
     catch (Exception e) {
