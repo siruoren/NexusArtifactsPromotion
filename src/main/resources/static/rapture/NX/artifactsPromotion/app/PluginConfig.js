@@ -656,6 +656,17 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       // This covers the case when a proxy repo is empty (no assets/folders to click)
       'nx-coreui-component-asset-list': {
         afterrender: me.onAssetListRender
+      },
+      // Also listen for the repository browse container itself
+      'nx-coreui-repositorybrowse': {
+        afterrender: me.onBrowseContainerRender
+      },
+      // Nexus 3.45+ may use different component names for asset list
+      'nx-coreui-component-assetlist': {
+        afterrender: me.onAssetListRender
+      },
+      'nx-coreui-asset-list': {
+        afterrender: me.onAssetListRender
       }
     });
 
@@ -698,6 +709,29 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         folderupdated: me.onFolderInfoUpdated
       }
     });
+
+    // Global approach: detect browse page changes via hash and periodic check
+    // This ensures the full-sync button appears even if specific component events don't fire
+    me._lastFullSyncRepoName = null;
+
+    // Listen for hash changes globally
+    var globalHashHandler = function () {
+      Ext.defer(function () {
+        me.detectAndAddFullSyncButton();
+      }, 500);
+    };
+    window.addEventListener('hashchange', globalHashHandler);
+
+    // Also do a periodic check for the first 15 seconds (covers slow page loads)
+    var checkCount = 0;
+    me._fullSyncHashCheckInterval = setInterval(function () {
+      me.detectAndAddFullSyncButton();
+      checkCount++;
+      if (checkCount >= 30) {
+        clearInterval(me._fullSyncHashCheckInterval);
+        me._fullSyncHashCheckInterval = null;
+      }
+    }, 500);
   },
 
   onAssetInfoRender: function (panel) {
@@ -750,6 +784,114 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     me.tryAddFolderButtons(panel);
   },
 
+  onBrowseContainerRender: function (panel) {
+    var me = this;
+    console.log('[Promotion] Browse container rendered:', panel.xtype);
+    me._browseContainer = panel;
+    Ext.defer(function () {
+      me.detectAndAddFullSyncButton();
+    }, 500);
+  },
+
+  detectAndAddFullSyncButton: function () {
+    var me = this;
+    try {
+      var hash = window.location.hash || '';
+      console.log('[Promotion] detectAndAddFullSyncButton, hash:', hash);
+
+      if (hash.indexOf('browse') < 0) {
+        return;
+      }
+
+      var repoName = null;
+      var format = null;
+
+      var hashMatch = hash.match(/browse\/(?:search|browse)\|([^|]+)\|([^|\/]+)/);
+      if (hashMatch && hashMatch[2]) {
+        repoName = decodeURIComponent(hashMatch[2]);
+        format = hashMatch[1] || null;
+      }
+
+      if (!repoName) {
+        var altMatch = hash.match(/browse\/([^\/]+)\/([^\/]+)/);
+        if (altMatch && altMatch[2]) {
+          repoName = decodeURIComponent(altMatch[2]);
+          format = altMatch[1] || null;
+        }
+      }
+
+      console.log('[Promotion] Parsed from hash - repoName:', repoName, 'format:', format);
+      if (!repoName) return;
+
+      var targetPanel = me.findAssetListPanel();
+      if (!targetPanel) {
+        console.log('[Promotion] No target panel found for full-sync button');
+        return;
+      }
+
+      if (targetPanel.query('button[cls=fullsync-btn]').length > 0) {
+        console.log('[Promotion] Full-sync button already exists on panel for:', repoName);
+        return;
+      }
+
+      if (!format) {
+        format = me.getRepositoryFormat(repoName);
+      }
+
+      console.log('[Promotion] Adding full-sync button for:', repoName, 'format:', format, 'panel:', targetPanel.xtype);
+      me.addFullSyncButtonIfProxy(targetPanel, repoName, format);
+    } catch (e) {
+      console.error('[Promotion] detectAndAddFullSyncButton error:', e);
+    }
+  },
+
+  findAssetListPanel: function () {
+    var me = this;
+
+    if (me._currentAssetListPanel && !me._currentAssetListPanel.destroyed) {
+      return me._currentAssetListPanel;
+    }
+
+    var selectors = [
+      'nx-coreui-component-asset-list',
+      'nx-coreui-component-assetlist',
+      'nx-coreui-asset-list',
+      'nx-coreui-repositorybrowse',
+      'nx-coreui-component-asset-tree'
+    ];
+
+    for (var i = 0; i < selectors.length; i++) {
+      try {
+        var panel = Ext.ComponentQuery.query(selectors[i])[0];
+        if (panel && !panel.destroyed) {
+          console.log('[Promotion] Found panel via selector:', selectors[i]);
+          return panel;
+        }
+      } catch (e) { /* ignore */ }
+    }
+
+    try {
+      var browseContainer = Ext.ComponentQuery.query('nx-coreui-repositorybrowse')[0];
+      if (browseContainer && !browseContainer.destroyed) {
+        console.log('[Promotion] Using repositorybrowse container');
+        return browseContainer;
+      }
+    } catch (e) { /* ignore */ }
+
+    try {
+      var featureBrowser = me.getFeatureBrowser();
+      if (featureBrowser) {
+        var contentPanel = featureBrowser.down('panel');
+        if (contentPanel && !contentPanel.destroyed) {
+          console.log('[Promotion] Using feature browser content panel');
+          return contentPanel;
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    return null;
+  },
+
   /**
    * Called when the asset list panel (browse view) renders.
    * Adds a "Sync All" button for proxy repositories.
@@ -757,6 +899,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
    */
   onAssetListRender: function (panel) {
     var me = this;
+    console.log('[Promotion] Asset list panel rendered:', panel.xtype, 'id:', panel.id);
     me._currentAssetListPanel = panel;
 
     // Try to determine the current repository from the surrounding context
@@ -920,33 +1063,46 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
    */
   addFullSyncButtonIfProxy: function (panel, repoName, format) {
     var me = this;
+    console.log('[Promotion] addFullSyncButtonIfProxy called, repoName:', repoName, 'format:', format);
 
     // Avoid duplicate buttons
-    if (panel.query('button[cls=fullsync-btn]').length > 0) return;
+    if (panel.query('button[cls=fullsync-btn]').length > 0) {
+      console.log('[Promotion] Full-sync button already exists, skipping');
+      return;
+    }
 
-    // Quick synchronous check: if not proxy at all, skip
-    if (!me.isProxyRepository(repoName)) {
+    // Quick synchronous check: if not proxy at all, try async API
+    var isProxySync = me.isProxyRepository(repoName);
+    console.log('[Promotion] isProxyRepository sync check result:', isProxySync);
+
+    if (!isProxySync) {
       // Async API check as fallback (in case NX.State doesn't have the repo info)
+      console.log('[Promotion] Sync check says not proxy, trying async API check');
       apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
       .then(function (result) {
+        console.log('[Promotion] /sync/permission API result:', JSON.stringify(result));
         var isProxy = result.isProxy === true;
         if (isProxy && !panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
           var hasDeletePerm = result.hasDeletePermission === true;
           me.addFullSyncButton(panel, repoName, format, !hasDeletePerm);
         }
       })
-      .catch(function () { /* ignore */ });
+      .catch(function (err) { console.error('[Promotion] /sync/permission API error:', err); });
       return;
     }
 
     // Is proxy - always show button, check delete permission via API
+    console.log('[Promotion] Is proxy repo, checking delete permission via API');
     apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
     .then(function (result) {
+      console.log('[Promotion] /sync/permission API result:', JSON.stringify(result));
       if (panel.destroyed || panel.query('button[cls=fullsync-btn]').length > 0) return;
       var hasDeletePerm = result.hasDeletePermission === true;
+      console.log('[Promotion] hasDeletePermission:', hasDeletePerm, 'disabled:', !hasDeletePerm);
       me.addFullSyncButton(panel, repoName, format, !hasDeletePerm);
     })
-    .catch(function () {
+    .catch(function (err) {
+      console.error('[Promotion] /sync/permission API error:', err);
       // API failed - add button anyway but disabled (no permission info)
       if (!panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
         me.addFullSyncButton(panel, repoName, format, true);
@@ -1268,6 +1424,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
    */
   addFullSyncButton: function (panel, repoName, format, disabled) {
     var me = this;
+    console.log('[Promotion] addFullSyncButton called, repoName:', repoName, 'disabled:', !!disabled, 'panel:', panel.xtype);
 
     var btn = Ext.create('Ext.button.Button', {
       text: _t('sync.button.text.full'),
@@ -1282,13 +1439,16 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     var actions = panel.down('nx-actions');
     if (actions) {
+      console.log('[Promotion] Adding full-sync button to nx-actions');
       actions.add(btn);
     } else {
       // Try to find any existing toolbar (created by addPromotionButton/addSyncButton or native)
       var toolbar = panel.down('toolbar');
       if (toolbar) {
+        console.log('[Promotion] Adding full-sync button to existing toolbar');
         toolbar.add(btn);
       } else {
+        console.log('[Promotion] Creating new toolbar for full-sync button');
         panel.addDocked({
           xtype: 'toolbar',
           dock: 'top',
