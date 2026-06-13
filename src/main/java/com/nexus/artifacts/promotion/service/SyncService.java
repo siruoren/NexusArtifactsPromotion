@@ -1,11 +1,20 @@
 package com.nexus.artifacts.promotion.service;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -15,12 +24,16 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
+import org.sonatype.nexus.repository.proxy.ProxyFacet;
 import org.sonatype.nexus.repository.storage.Asset;
 import org.sonatype.nexus.repository.storage.Bucket;
 import org.sonatype.nexus.repository.storage.Query;
 import org.sonatype.nexus.repository.storage.StorageFacet;
 import org.sonatype.nexus.repository.storage.StorageTx;
 import org.sonatype.nexus.transaction.UnitOfWork;
+import org.sonatype.nexus.repository.view.Content;
+import org.sonatype.nexus.repository.view.Context;
+import org.sonatype.nexus.repository.view.Request;
 
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.subject.support.SubjectThreadState;
@@ -33,12 +46,12 @@ import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 /**
  * Service for remote repository sync.
- * Supports sync of directories, files, and images from remote (proxy) repositories.
+ * Uses Nexus official ProxyFacet to re-fetch assets from remote storage.
  * Features:
+ * - Uses ProxyFacet.get() to trigger re-download from remote
+ * - Clears local cache (blob reference) before re-fetch to force fresh download
+ * - Clears negative cache entries so previously 404 assets can be retried
  * - Dedup: same source directory re-submitted keeps only latest task
- * - Old tasks are cancelled and marked as migrated to new task ID
- * - Thread pool managed execution
- * - Permission checks at both submission and execution time
  * - Automatic cleanup of completed task info to prevent memory leaks
  */
 @Named
@@ -82,7 +95,7 @@ public class SyncService {
   public String sync(final SyncRequest request) {
     request.validate();
 
-    // Check sync permission
+    // Check sync permission (also verifies it's a proxy repo)
     permissionChecker.checkSyncPermission(request.getRepositoryName(), request.getFormat());
 
     // Check queue capacity
@@ -118,21 +131,24 @@ public class SyncService {
         taskInfo.setStatus(TaskStatus.RUNNING);
 
         try {
-          // No need to re-check permission here - already checked at REST layer
-
           Repository repo = repositoryManager.get(request.getRepositoryName());
           if (repo == null) {
             throw new IllegalArgumentException("Repository not found: " + request.getRepositoryName());
           }
 
+          // Verify it's a proxy repository
+          if (!"proxy".equals(repo.getType().getValue())) {
+            throw new IllegalArgumentException("Repository is not a proxy type: " + request.getRepositoryName());
+          }
+
           // Determine target repository (local cache of the proxy repo)
-          String targetRepo = determineLocalCacheRepo(repo);
+          String targetRepo = repo.getName();
           taskInfo.setTargetRepository(targetRepo);
 
           // Create task cache
           cacheManager.createTaskCache(preTaskId);
 
-          // Execute sync
+          // Execute sync using official ProxyFacet
           List<SyncTaskInfo.SyncFileDetail> syncedFiles;
           if (request.isDirectory()) {
             syncedFiles = syncDirectory(repo, request.getPath());
@@ -285,45 +301,56 @@ public class SyncService {
   }
 
   /**
-   * Sync all files in a directory from remote.
+   * Sync all files in a directory from remote using ProxyFacet.
+   * Steps:
+   * 1. Get the remote URL from repository configuration
+   * 2. Fetch remote directory listing to discover ALL files (including uncached)
+   * 3. Also list locally cached assets
+   * 4. Merge both lists (dedup)
+   * 5. For each file, delete local cache, invalidate negative cache, and re-fetch via ProxyFacet
    */
   private List<SyncTaskInfo.SyncFileDetail> syncDirectory(final Repository repo, final String directoryPath) {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
-      StorageFacet storageFacet = repo.facet(StorageFacet.class);
-      UnitOfWork.begin(storageFacet.txSupplier());
-      try {
-        StorageTx tx = UnitOfWork.currentTx();
-        Bucket bucket = tx.findBucket(repo);
+      Set<String> allAssetNames = new LinkedHashSet<>();
 
-        // Use Query.builder() with where/like pattern
-        Query query = Query.builder()
-            .where("name").like(escapeLike(directoryPath) + "%")
-            .build();
+      log.info("Starting directory sync for {}:{}", repo.getName(), directoryPath);
 
-        Iterable<Asset> assets = tx.findAssets(query, Collections.singletonList(repo));
+      // Step 1: List locally cached assets
+      List<String> localAssets = listLocalAssets(repo, directoryPath);
+      allAssetNames.addAll(localAssets);
+      log.info("Found {} local assets in {}:{}", localAssets.size(), repo.getName(), directoryPath);
 
-        for (Asset asset : assets) {
-          SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(
-              asset.name(), determineType(asset.name()));
+      // Step 2: Fetch remote directory listing to discover uncached files
+      List<String> remoteAssets = listRemoteAssets(repo, directoryPath);
+      allAssetNames.addAll(remoteAssets);
+      log.info("Found {} remote assets in {}:{}", remoteAssets.size(), repo.getName(), directoryPath);
 
-          try {
-            // Trigger re-download / cache refresh from remote
-            syncSingleAsset(repo, asset, tx);
-            detail.setStatus("success");
-          }
-          catch (Exception e) {
-            log.error("Failed to sync asset {}: {}", asset.name(), e.getMessage());
-            detail.setStatus("failed");
-            detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-          }
+      log.info("Sync directory {}: {} local assets, {} remote assets, {} total unique",
+          directoryPath, localAssets.size(), remoteAssets.size(), allAssetNames.size());
 
-          details.add(detail);
+      // Step 3: Sync each asset using ProxyFacet
+      for (String assetName : allAssetNames) {
+        // Skip directory entries (ending with /)
+        if (assetName.endsWith("/")) {
+          continue;
         }
-      }
-      finally {
-        UnitOfWork.end();
+
+        SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(
+            assetName, determineType(assetName));
+
+        try {
+          syncAssetViaProxy(repo, assetName);
+          detail.setStatus("success");
+        }
+        catch (Exception e) {
+          log.error("Failed to sync asset {}: {}", assetName, e.getMessage());
+          detail.setStatus("failed");
+          detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        }
+
+        details.add(detail);
       }
     }
     catch (Exception e) {
@@ -335,11 +362,10 @@ public class SyncService {
   }
 
   /**
-   * Sync a single file from remote.
+   * List locally cached assets in a directory.
    */
-  private List<SyncTaskInfo.SyncFileDetail> syncFile(final Repository repo, final String filePath) {
-    List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
-
+  private List<String> listLocalAssets(final Repository repo, final String directoryPath) {
+    List<String> assetNames = new ArrayList<>();
     try {
       StorageFacet storageFacet = repo.facet(StorageFacet.class);
       UnitOfWork.begin(storageFacet.txSupplier());
@@ -347,28 +373,193 @@ public class SyncService {
         StorageTx tx = UnitOfWork.currentTx();
         Bucket bucket = tx.findBucket(repo);
 
-        Asset asset = tx.findAssetWithProperty("name", filePath, bucket);
-        if (asset == null) {
-          throw new IllegalArgumentException("Asset not found: " + filePath);
-        }
+        Query query = Query.builder()
+            .where("name").like(escapeLike(directoryPath) + "%")
+            .build();
 
-        SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(
-            filePath, determineType(filePath));
-
-        try {
-          syncSingleAsset(repo, asset, tx);
-          detail.setStatus("success");
+        Iterable<Asset> assets = tx.findAssets(query, Collections.singletonList(repo));
+        for (Asset asset : assets) {
+          assetNames.add(asset.name());
         }
-        catch (Exception e) {
-          detail.setStatus("failed");
-          detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-        }
-
-        details.add(detail);
       }
       finally {
         UnitOfWork.end();
       }
+    }
+    catch (Exception e) {
+      log.warn("Failed to list local assets for {}: {}", directoryPath, e.getMessage());
+    }
+    return assetNames;
+  }
+
+  /**
+   * List remote assets by fetching the remote directory listing.
+   * Parses HTML directory index pages to extract file links.
+   * Also tries to use proxy repo's configured HTTP client for authentication.
+   */
+  private List<String> listRemoteAssets(final Repository repo, final String directoryPath) {
+    List<String> remoteAssets = new ArrayList<>();
+
+    try {
+      // Get remote URL from repository configuration
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null) {
+        log.warn("No configuration found for repository {}", repo.getName());
+        return remoteAssets;
+      }
+
+      Map<String, Map<String, Object>> attributes = config.getAttributes();
+      if (attributes == null || !attributes.containsKey("proxy")) {
+        log.warn("No proxy configuration found for repository {}", repo.getName());
+        return remoteAssets;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = attributes.get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) {
+        log.warn("No remote URL configured for proxy repository {}", repo.getName());
+        return remoteAssets;
+      }
+
+      // Get authentication config if available
+      String authUsername = null;
+      String authPassword = null;
+      if (attributes.containsKey("httpclient")) {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> httpClientAttrs = attributes.get("httpclient");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> authAttrs = (Map<String, Object>) httpClientAttrs.get("authentication");
+        if (authAttrs != null) {
+          authUsername = (String) authAttrs.get("username");
+          authPassword = (String) authAttrs.get("password");
+        }
+      }
+
+      // Normalize URLs
+      if (!remoteUrl.endsWith("/")) {
+        remoteUrl += "/";
+      }
+      String dirUrl = remoteUrl + directoryPath;
+      if (!dirUrl.endsWith("/")) {
+        dirUrl += "/";
+      }
+
+      log.info("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? "yes" : "no");
+
+      // Fetch remote directory listing
+      HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(15_000);
+      conn.setReadTimeout(30_000);
+      conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
+
+      // Add basic auth if configured
+      if (authUsername != null && authPassword != null) {
+        String auth = authUsername + ":" + authPassword;
+        String encoded = java.util.Base64.getEncoder().encodeToString(auth.getBytes("UTF-8"));
+        conn.setRequestProperty("Authorization", "Basic " + encoded);
+      }
+
+      int responseCode = conn.getResponseCode();
+      log.info("Remote directory listing response: HTTP {} for {}", responseCode, dirUrl);
+
+      if (responseCode != 200) {
+        log.warn("Failed to fetch remote directory listing: HTTP {} for {}", responseCode, dirUrl);
+        // Try reading error stream for more info
+        try {
+          if (conn.getErrorStream() != null) {
+            byte[] errorBytes = new byte[512];
+            int read = conn.getErrorStream().read(errorBytes);
+            if (read > 0) {
+              log.warn("Error response: {}", new String(errorBytes, 0, read, "UTF-8"));
+            }
+          }
+        }
+        catch (Exception ignored) { }
+        conn.disconnect();
+        return remoteAssets;
+      }
+
+      // Parse HTML to extract links
+      StringBuilder html = new StringBuilder();
+      try (BufferedReader reader = new BufferedReader(new InputStreamReader(conn.getInputStream(), "UTF-8"))) {
+        String line;
+        while ((line = reader.readLine()) != null) {
+          html.append(line).append("\n");
+        }
+      }
+      conn.disconnect();
+
+      String htmlStr = html.toString();
+      log.debug("Remote directory HTML (first 500 chars): {}", htmlStr.substring(0, Math.min(500, htmlStr.length())));
+
+      // Extract href links from HTML - common patterns:
+      // <a href="filename">, <a href='./filename'>, <a href="filename">
+      Pattern linkPattern = Pattern.compile(
+          "<a[^>]+href\\s*=\\s*[\"'](?!(?:mailto:|javascript:|\\?|/|#))([^\"']+)[\"']",
+          Pattern.CASE_INSENSITIVE);
+      Matcher matcher = linkPattern.matcher(htmlStr);
+
+      while (matcher.find()) {
+        String href = matcher.group(1);
+        // Remove leading ./ if present
+        if (href.startsWith("./")) {
+          href = href.substring(2);
+        }
+        // Skip parent directory link and root
+        if (href.equals("../") || href.equals("/") || href.equals(".")) {
+          continue;
+        }
+        // Skip query strings and anchors
+        if (href.contains("?") || href.contains("#")) {
+          continue;
+        }
+
+        // Build full asset path
+        String assetPath;
+        if (href.endsWith("/")) {
+          // Subdirectory - include it for recursive sync
+          assetPath = directoryPath + (directoryPath.endsWith("/") ? "" : "/") + href;
+        }
+        else {
+          // File
+          assetPath = directoryPath + (directoryPath.endsWith("/") ? "" : "/") + href;
+        }
+
+        remoteAssets.add(assetPath);
+      }
+
+      log.info("Found {} remote assets in directory {}", remoteAssets.size(), directoryPath);
+
+    }
+    catch (Exception e) {
+      log.error("Failed to list remote assets for {}: {}", directoryPath, e.getMessage(), e);
+    }
+
+    return remoteAssets;
+  }
+
+  /**
+   * Sync a single file from remote using ProxyFacet.
+   */
+  private List<SyncTaskInfo.SyncFileDetail> syncFile(final Repository repo, final String filePath) {
+    List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
+
+    try {
+      SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(
+          filePath, determineType(filePath));
+
+      try {
+        syncAssetViaProxy(repo, filePath);
+        detail.setStatus("success");
+      }
+      catch (Exception e) {
+        detail.setStatus("failed");
+        detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      }
+
+      details.add(detail);
     }
     catch (Exception e) {
       log.error("Failed to sync file {}: {}", filePath, e.getMessage(), e);
@@ -379,29 +570,122 @@ public class SyncService {
   }
 
   /**
-   * Sync a single asset by invalidating its cache and re-fetching from remote.
-   * For proxy repositories, we mark the asset as requiring re-download
-   * by clearing its blob reference.
-   *
-   * IMPORTANT: This method must be called within an active UnitOfWork transaction.
-   * It does NOT start its own transaction - it uses the caller's transaction.
+   * Sync a single asset using Nexus official ProxyFacet.
+   * This method:
+   * 1. Deletes the local cached asset (clears blob reference) to force re-download
+   * 2. Invalidates negative cache for the path
+   * 3. Uses ProxyFacet to re-fetch the asset from the remote storage
    */
-  private void syncSingleAsset(final Repository repo, final Asset asset, final StorageTx tx) throws Exception {
-    // Mark asset as requiring re-download by clearing blob reference
-    if (asset.blobRef() != null) {
-      asset.blobRef(null);
-      tx.saveAsset(asset);
+  private void syncAssetViaProxy(final Repository repo, final String assetName) throws Exception {
+    log.debug("Syncing asset {} from remote via ProxyFacet", assetName);
+
+    // Step 1: Delete the local cached asset to force re-download
+    deleteAssetCache(repo, assetName);
+
+    // Step 2: Invalidate negative cache for this path
+    invalidateNegativeCache(repo, assetName);
+
+    // Step 3: Use ProxyFacet to re-fetch from remote
+    try {
+      ProxyFacet proxyFacet = repo.facet(ProxyFacet.class);
+      if (proxyFacet != null) {
+        // Build a GET request to trigger proxy fetch
+        Request request = new Request.Builder()
+            .action("GET")
+            .path("/" + assetName)
+            .build();
+
+        // Create context and invoke proxy get
+        Context context = new Context(repo, request);
+        Content content = proxyFacet.get(context);
+
+        if (content != null) {
+          log.info("Successfully re-fetched asset {} from remote", assetName);
+        }
+        else {
+          log.warn("ProxyFacet.get() returned null for asset {}, asset may not exist on remote", assetName);
+        }
+      }
+      else {
+        log.warn("Repository {} does not have ProxyFacet, skipping proxy fetch", repo.getName());
+      }
     }
-    tx.commit();
+    catch (IOException e) {
+      log.error("Failed to re-fetch asset {} from remote: {}", assetName, e.getMessage());
+      throw new RuntimeException("Failed to re-fetch from remote: " + e.getMessage(), e);
+    }
   }
 
   /**
-   * Determine the local cache repository name for a proxy repository.
+   * Delete the local cached asset (clear blob reference) to force re-download.
+   * This removes the asset's blob reference so that ProxyFacet will re-download it.
    */
-  private String determineLocalCacheRepo(final Repository repo) {
-    // For proxy repos, the local cache is typically the same repo
-    // In some configurations, there may be a separate cache repo
-    return repo.getName() + "-cache";
+  private void deleteAssetCache(final Repository repo, final String assetName) throws Exception {
+    StorageFacet storageFacet = repo.facet(StorageFacet.class);
+    UnitOfWork.begin(storageFacet.txSupplier());
+    try {
+      StorageTx tx = UnitOfWork.currentTx();
+      Bucket bucket = tx.findBucket(repo);
+
+      Asset asset = tx.findAssetWithProperty("name", assetName, bucket);
+      if (asset != null) {
+        // Delete the asset completely so it will be re-created from remote
+        tx.deleteAsset(asset);
+        tx.commit();
+        log.debug("Deleted cached asset: {}", assetName);
+      }
+      else {
+        log.debug("Asset {} not found in local cache, will be fetched fresh from remote", assetName);
+      }
+    }
+    finally {
+      UnitOfWork.end();
+    }
+  }
+
+  /**
+   * Invalidate negative cache entries for a given path.
+   * This allows previously 404'd assets to be retried from remote.
+   */
+  @SuppressWarnings("unchecked")
+  private void invalidateNegativeCache(final Repository repo, final String assetName) {
+    try {
+      // Try to get NegativeCacheFacet if available
+      Class<?> negCacheFacetClass = null;
+      try {
+        negCacheFacetClass = Class.forName("org.sonatype.nexus.repository.cache.NegativeCacheFacet");
+      }
+      catch (ClassNotFoundException e) {
+        // NegativeCacheFacet not available in this Nexus version, skip
+        log.debug("NegativeCacheFacet not available, skipping negative cache invalidation");
+        return;
+      }
+
+      Object negCacheFacet = repo.facet((Class) negCacheFacetClass);
+      if (negCacheFacet != null) {
+        // Use reflection to call invalidate() method
+        try {
+          java.lang.reflect.Method invalidateMethod = negCacheFacet.getClass().getMethod("invalidate", String.class);
+          invalidateMethod.invoke(negCacheFacet, assetName);
+          log.debug("Invalidated negative cache for: {}", assetName);
+        }
+        catch (NoSuchMethodException e) {
+          // Try no-arg invalidate for entire repository
+          try {
+            java.lang.reflect.Method invalidateAllMethod = negCacheFacet.getClass().getMethod("invalidate");
+            invalidateAllMethod.invoke(negCacheFacet);
+            log.debug("Invalidated all negative cache entries for repo {}", repo.getName());
+          }
+          catch (Exception e2) {
+            log.debug("Could not invalidate negative cache: {}", e2.getMessage());
+          }
+        }
+      }
+    }
+    catch (Exception e) {
+      // Negative cache invalidation is best-effort, don't fail the sync
+      log.debug("Negative cache invalidation skipped: {}", e.getMessage());
+    }
   }
 
   /**

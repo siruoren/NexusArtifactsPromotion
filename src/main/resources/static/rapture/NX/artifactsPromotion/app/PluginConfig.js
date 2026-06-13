@@ -611,14 +611,21 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       authenticationRequired: true,
       visible: function () {
         // Only visible to admin users
-        var user = NX.State.getValue('user');
-        if (!user) return false;
-        // Check if user has admin role
-        if (user.admin === true) return true;
-        var roles = user.roles || [];
-        for (var i = 0; i < roles.length; i++) {
-          if (roles[i] === 'nx-admin' || roles[i] === 'admin') return true;
-        }
+        try {
+          var user = NX.State.getValue('user');
+          if (!user) return false;
+          // NX.State user may be a string (username) or object
+          if (typeof user === 'string') {
+            return user === 'admin';
+          }
+          if (typeof user === 'object') {
+            if (user.admin === true) return true;
+            var roles = user.roles || [];
+            for (var i = 0; i < roles.length; i++) {
+              if (roles[i] === 'nx-admin' || roles[i] === 'admin') return true;
+            }
+          }
+        } catch (e) { /* ignore */ }
         return false;
       }
     }, me);
@@ -1050,91 +1057,35 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   showSyncProgressWindow: function (result, repoName, path, isDirectory) {
     var me = this;
     var taskId = result.taskId || '';
-
-    var statusRenderer = function (val) {
-      switch (val) {
-        case 'RUNNING':
-        case 'running':
-        case 'processing':
-          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
-        case 'COMPLETED':
-        case 'completed':
-        case 'success':
-          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
-        case 'FAILED':
-        case 'failed':
-          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
-        case 'PENDING':
-        case 'pending':
-          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
-        default:
-          return '<span style="color:#999;">' + sanitize(val || '') + '</span>';
-      }
-    };
-
-    var fileStore = Ext.create('Ext.data.Store', {
-      fields: ['path', 'type', 'status'],
-      data: []
-    });
+    var fullPath = repoName + '/' + path;
 
     var win = Ext.create('Ext.window.Window', {
       title: isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text'),
-      width: 650,
-      height: 420,
+      width: 450,
+      height: 220,
       modal: true,
       closable: true,
       layout: 'fit',
       items: [{
         xtype: 'panel',
         layout: { type: 'vbox', align: 'stretch' },
-        bodyPadding: 10,
+        bodyPadding: 15,
         items: [
           {
             xtype: 'displayfield',
             fieldLabel: _t('sync.queue.created.repository'),
-            value: '<b>' + sanitize(repoName) + '</b>'
-          },
-          {
-            xtype: 'displayfield',
-            fieldLabel: _t('sync.queue.created.path'),
-            value: '<b>' + sanitize(path) + '</b>'
+            value: '<b>' + sanitize(fullPath) + '</b>'
           },
           {
             xtype: 'displayfield',
             fieldLabel: _t('sync.queue.created.queueId'),
-            value: sanitize(taskId)
+            value: '<b>' + sanitize(taskId) + '</b>'
           },
           {
-            xtype: 'container',
-            itemId: 'progressContainer',
-            hidden: true,
-            margin: '8 0',
-            layout: { type: 'hbox', align: 'middle' },
-            items: [
-              {
-                xtype: 'progressbar',
-                itemId: 'syncProgress',
-                flex: 1,
-                value: 0,
-                text: _t('promotion.progress.pending'),
-                animate: true
-              }
-            ]
-          },
-          {
-            xtype: 'gridpanel',
-            title: _t('promotion.modal.filesToPromote'),
-            flex: 1,
-            itemId: 'fileGrid',
-            store: fileStore,
-            columns: [
-              { text: 'Path', dataIndex: 'path', flex: 2, cellWrap: true },
-              { text: 'Type', dataIndex: 'type', width: 80 },
-              {
-                text: _t('promotion.result.status'), dataIndex: 'status', width: 100,
-                renderer: statusRenderer
-              }
-            ]
+            xtype: 'displayfield',
+            fieldLabel: _t('promotion.result.status'),
+            itemId: 'syncStatusField',
+            value: '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>'
           }
         ]
       }],
@@ -1154,10 +1105,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     win.show();
 
     // Start polling for sync task status
-    me.startSyncPolling(win, taskId, fileStore);
+    me.startSyncPolling(win, taskId);
   },
 
-  startSyncPolling: function (win, taskId, fileStore) {
+  startSyncPolling: function (win, taskId) {
     var isFinished = false;
     var pollCount = 0;
     var MAX_POLLS = 400;
@@ -1213,51 +1164,19 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         } catch (e) { return; }
 
         var statusStr = (result.status || '').toLowerCase();
-        var progressBar = win.down('#syncProgress');
-        var progressContainer = win.down('#progressContainer');
-        var grid = win.down('#fileGrid');
+        var statusField = win.down('#syncStatusField');
 
-        // Update file list from backend fileDetails
-        var fileDetails = result.fileDetails || [];
-        if (fileDetails.length > 0 && fileStore.getCount() === 0) {
-          // First time receiving file details - populate store
-          var data = [];
-          for (var i = 0; i < fileDetails.length; i++) {
-            data.push({
-              path: fileDetails[i].path || '',
-              type: fileDetails[i].type || 'file',
-              status: fileDetails[i].status || 'pending'
-            });
+        // Update status display
+        if (statusField) {
+          if (statusStr === 'running') {
+            statusField.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>');
+          } else if (statusStr === 'completed') {
+            statusField.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>');
+          } else if (statusStr === 'failed') {
+            statusField.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>');
+          } else if (statusStr === 'pending') {
+            statusField.setValue('<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>');
           }
-          fileStore.loadData(data);
-          if (progressContainer) progressContainer.show();
-        } else if (fileDetails.length > 0) {
-          // Update existing store items
-          for (var j = 0; j < fileDetails.length; j++) {
-            var fd = fileDetails[j];
-            if (!fd.path) continue;
-            var idx = fileStore.findExact('path', fd.path);
-            if (idx >= 0) {
-              fileStore.getAt(idx).set('status', fd.status || 'pending');
-            }
-          }
-        }
-
-        // Calculate progress
-        var total = fileStore.getCount();
-        var done = 0;
-        fileStore.each(function (rec) {
-          var st = rec.get('status');
-          if (st === 'success' || st === 'COMPLETED' || st === 'completed' ||
-              st === 'failed' || st === 'FAILED') {
-            done++;
-          }
-        });
-
-        if (total > 0 && progressBar) {
-          var pct = done / total;
-          progressBar.setValue(pct);
-          progressBar.updateText(_t('promotion.progress.completed', done, total));
         }
 
         // Check if task is finished
@@ -1265,31 +1184,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           isFinished = true;
           stopPolling();
 
-          // Mark any remaining items
-          var taskFailed = (statusStr === 'failed');
-          fileStore.each(function (rec) {
-            var st = rec.get('status');
-            if (st !== 'success' && st !== 'failed' && st !== 'COMPLETED' && st !== 'FAILED' && st !== 'completed') {
-              rec.set('status', taskFailed ? 'failed' : 'success');
-            }
-          });
-
-          // Final progress update
-          if (progressBar) {
-            progressBar.setValue(1);
-            var finalDone = 0;
-            fileStore.each(function (rec) {
-              var st = rec.get('status');
-              if (st === 'success' || st === 'COMPLETED' || st === 'completed' ||
-                  st === 'failed' || st === 'FAILED') {
-                finalDone++;
-              }
-            });
-            progressBar.updateText(_t('promotion.progress.completed', finalDone, total || finalDone));
-          }
-
           // Update window title
-          if (taskFailed) {
+          if (statusStr === 'failed') {
             win.setTitle(_t('promotion.progress.failed'));
           } else {
             win.setTitle(_t('promotion.progress.success'));
