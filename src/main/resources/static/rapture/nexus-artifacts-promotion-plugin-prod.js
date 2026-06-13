@@ -385,15 +385,44 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     var me = this;
 
     me.store = Ext.create('Ext.data.Store', {
-      fields: ['queueId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
-        'status', 'startTime', 'endTime', 'username', 'result'],
+      fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+        'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
       proxy: {
         type: 'ajax',
         url: '/service/rest/v1/sync/queue',
-        reader: { type: 'json', rootProperty: 'tasks' }
+        reader: { type: 'json' }
       },
-      autoLoad: true
+      autoLoad: true,
+      listeners: {
+        load: function () {
+          me.updateStatusColumn();
+          me.checkAllFinished();
+        }
+      }
     });
+
+    var statusRenderer = function (val) {
+      switch ((val || '').toLowerCase()) {
+        case 'running':
+          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
+        case 'completed':
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
+        case 'failed':
+          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'migrated':
+          return '<span style="color:#999;">Migrated</span>';
+        case 'pending':
+          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
+        default:
+          return '<span style="color:#999;">' + sanitize(val || '') + '</span>';
+      }
+    };
+
+    var timeRenderer = function (val) {
+      if (!val) return '';
+      var d = new Date(val);
+      return d.toLocaleString();
+    };
 
     // Config form
     me.configForm = Ext.create('Ext.form.Panel', {
@@ -459,7 +488,6 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
       ],
       listeners: {
         expand: function () {
-          // Load current config when panel is expanded
           apiRequest('GET', '/sync/queue/config')
             .then(function (config) {
               me.configForm.getForm().setValues({
@@ -481,12 +509,12 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
           xtype: 'gridpanel',
           store: me.store,
           columns: [
-            { text: _t('sync.queue.table.queueId'), dataIndex: 'queueId', width: 120 },
+            { text: _t('sync.queue.table.queueId'), dataIndex: 'taskId', width: 180 },
             { text: _t('sync.queue.table.sourceRepository'), dataIndex: 'sourceRepository', flex: 1 },
             { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1 },
-            { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100 },
-            { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150 },
-            { text: _t('sync.queue.table.endTime'), dataIndex: 'endTime', width: 150 },
+            { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100, renderer: statusRenderer },
+            { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150, renderer: timeRenderer },
+            { text: _t('sync.queue.table.endTime'), dataIndex: 'endTime', width: 150, renderer: timeRenderer },
             { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100 },
             { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1 }
           ],
@@ -495,6 +523,12 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
               text: _t('sync.queue.table.refresh'),
               iconCls: 'x-fa fa-refresh',
               handler: function () { me.store.reload(); }
+            },
+            {
+              text: _t('promotion.progress.pending'),
+              iconCls: 'x-fa fa-circle-o',
+              itemId: 'activeCountBtn',
+              disabled: true
             }
           ]
         }
@@ -502,6 +536,54 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     });
 
     me.callParent(arguments);
+
+    // Start auto-refresh for active tasks
+    me._queuePollInterval = setInterval(function () {
+      if (!me.destroyed) {
+        me.store.reload();
+      } else {
+        clearInterval(me._queuePollInterval);
+      }
+    }, 3000);
+  },
+
+  updateStatusColumn: function () {
+    // Force grid to re-render status column
+  },
+
+  checkAllFinished: function () {
+    var me = this;
+    var hasActive = false;
+    me.store.each(function (rec) {
+      var st = (rec.get('status') || '').toLowerCase();
+      if (st === 'running' || st === 'pending') {
+        hasActive = true;
+      }
+    });
+
+    var activeBtn = me.down('#activeCountBtn');
+    if (activeBtn) {
+      var activeCount = 0;
+      me.store.each(function (rec) {
+        var st = (rec.get('status') || '').toLowerCase();
+        if (st === 'running' || st === 'pending') activeCount++;
+      });
+      activeBtn.setText('Active: ' + activeCount);
+    }
+
+    // If all tasks are finished, stop auto-refresh to release resources
+    if (!hasActive && me._queuePollInterval) {
+      clearInterval(me._queuePollInterval);
+      me._queuePollInterval = null;
+    }
+  },
+
+  beforeDestroy: function () {
+    if (this._queuePollInterval) {
+      clearInterval(this._queuePollInterval);
+      this._queuePollInterval = null;
+    }
+    this.callParent(arguments);
   }
 });
 
@@ -895,24 +977,283 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   },
 
   handleSyncClick: function (repoName, path, isDirectory, format) {
+    var me = this;
     checkSyncPermission(repoName, format).then(function (hasPermission) {
       if (!hasPermission) {
         showAlertDialog(_t('common.noPermission'), _t('sync.permission.denied'));
         return;
       }
       apiRequest('POST', '/sync/execute', {
-        repository: repoName,
+        repositoryName: repoName,
         path: path,
         isDirectory: isDirectory,
         format: format
       })
       .then(function (result) {
-        showSyncQueueCreatedDialog(result);
+        me.showSyncProgressWindow(result, repoName, path, isDirectory);
       })
       .catch(function (err) {
         showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
       });
     });
+  },
+
+  showSyncProgressWindow: function (result, repoName, path, isDirectory) {
+    var me = this;
+    var taskId = result.taskId || '';
+
+    var statusRenderer = function (val) {
+      switch (val) {
+        case 'RUNNING':
+        case 'running':
+        case 'processing':
+          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
+        case 'COMPLETED':
+        case 'completed':
+        case 'success':
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
+        case 'FAILED':
+        case 'failed':
+          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'PENDING':
+        case 'pending':
+          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
+        default:
+          return '<span style="color:#999;">' + sanitize(val || '') + '</span>';
+      }
+    };
+
+    var fileStore = Ext.create('Ext.data.Store', {
+      fields: ['path', 'type', 'status'],
+      data: []
+    });
+
+    var win = Ext.create('Ext.window.Window', {
+      title: isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text'),
+      width: 650,
+      height: 420,
+      modal: true,
+      closable: true,
+      layout: 'fit',
+      items: [{
+        xtype: 'panel',
+        layout: { type: 'vbox', align: 'stretch' },
+        bodyPadding: 10,
+        items: [
+          {
+            xtype: 'displayfield',
+            fieldLabel: _t('sync.queue.created.repository'),
+            value: '<b>' + sanitize(repoName) + '</b>'
+          },
+          {
+            xtype: 'displayfield',
+            fieldLabel: _t('sync.queue.created.path'),
+            value: '<b>' + sanitize(path) + '</b>'
+          },
+          {
+            xtype: 'displayfield',
+            fieldLabel: _t('sync.queue.created.queueId'),
+            value: sanitize(taskId)
+          },
+          {
+            xtype: 'container',
+            itemId: 'progressContainer',
+            hidden: true,
+            margin: '8 0',
+            layout: { type: 'hbox', align: 'middle' },
+            items: [
+              {
+                xtype: 'progressbar',
+                itemId: 'syncProgress',
+                flex: 1,
+                value: 0,
+                text: _t('promotion.progress.pending'),
+                animate: true
+              }
+            ]
+          },
+          {
+            xtype: 'gridpanel',
+            title: _t('promotion.modal.filesToPromote'),
+            flex: 1,
+            itemId: 'fileGrid',
+            store: fileStore,
+            columns: [
+              { text: 'Path', dataIndex: 'path', flex: 2, cellWrap: true },
+              { text: 'Type', dataIndex: 'type', width: 80 },
+              {
+                text: _t('promotion.result.status'), dataIndex: 'status', width: 100,
+                renderer: statusRenderer
+              }
+            ]
+          }
+        ]
+      }],
+      buttons: [
+        {
+          text: _t('promotion.result.close'),
+          handler: function () {
+            if (win._syncPollInterval) {
+              clearInterval(win._syncPollInterval);
+              win._syncPollInterval = null;
+            }
+            win.close();
+          }
+        }
+      ]
+    });
+    win.show();
+
+    // Start polling for sync task status
+    me.startSyncPolling(win, taskId, fileStore);
+  },
+
+  startSyncPolling: function (win, taskId, fileStore) {
+    var isFinished = false;
+    var pollCount = 0;
+    var MAX_POLLS = 400;
+
+    var stopPolling = function () {
+      if (win._syncPollInterval) {
+        clearInterval(win._syncPollInterval);
+        win._syncPollInterval = null;
+      }
+    };
+
+    var doPoll = function () {
+      if (isFinished || win.destroyed) {
+        stopPolling();
+        return;
+      }
+
+      pollCount++;
+      if (pollCount > MAX_POLLS) {
+        isFinished = true;
+        stopPolling();
+        return;
+      }
+
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', '/service/rest/v1/sync/task/' + encodeURIComponent(taskId), true);
+      xhr.setRequestHeader('Accept', 'application/json');
+
+      var csrfToken = null;
+      var cookies = document.cookie.split(';');
+      for (var ci = 0; ci < cookies.length; ci++) {
+        var cookie = cookies[ci].trim();
+        if (cookie.indexOf('NX-ANTI-CSRF-TOKEN=') === 0) {
+          csrfToken = cookie.substring('NX-ANTI-CSRF-TOKEN='.length);
+          break;
+        }
+      }
+      if (csrfToken) {
+        xhr.setRequestHeader('NX-ANTI-CSRF-TOKEN', csrfToken);
+      }
+
+      xhr.onreadystatechange = function () {
+        if (xhr.readyState !== 4) return;
+        if (isFinished || win.destroyed) {
+          stopPolling();
+          return;
+        }
+        if (xhr.status !== 200) return;
+
+        var result = {};
+        try {
+          result = JSON.parse(xhr.responseText);
+        } catch (e) { return; }
+
+        var statusStr = (result.status || '').toLowerCase();
+        var progressBar = win.down('#syncProgress');
+        var progressContainer = win.down('#progressContainer');
+        var grid = win.down('#fileGrid');
+
+        // Update file list from backend fileDetails
+        var fileDetails = result.fileDetails || [];
+        if (fileDetails.length > 0 && fileStore.getCount() === 0) {
+          // First time receiving file details - populate store
+          var data = [];
+          for (var i = 0; i < fileDetails.length; i++) {
+            data.push({
+              path: fileDetails[i].path || '',
+              type: fileDetails[i].type || 'file',
+              status: fileDetails[i].status || 'pending'
+            });
+          }
+          fileStore.loadData(data);
+          if (progressContainer) progressContainer.show();
+        } else if (fileDetails.length > 0) {
+          // Update existing store items
+          for (var j = 0; j < fileDetails.length; j++) {
+            var fd = fileDetails[j];
+            if (!fd.path) continue;
+            var idx = fileStore.findExact('path', fd.path);
+            if (idx >= 0) {
+              fileStore.getAt(idx).set('status', fd.status || 'pending');
+            }
+          }
+        }
+
+        // Calculate progress
+        var total = fileStore.getCount();
+        var done = 0;
+        fileStore.each(function (rec) {
+          var st = rec.get('status');
+          if (st === 'success' || st === 'COMPLETED' || st === 'completed' ||
+              st === 'failed' || st === 'FAILED') {
+            done++;
+          }
+        });
+
+        if (total > 0 && progressBar) {
+          var pct = done / total;
+          progressBar.setValue(pct);
+          progressBar.updateText(_t('promotion.progress.completed', done, total));
+        }
+
+        // Check if task is finished
+        if (statusStr === 'completed' || statusStr === 'failed') {
+          isFinished = true;
+          stopPolling();
+
+          // Mark any remaining items
+          var taskFailed = (statusStr === 'failed');
+          fileStore.each(function (rec) {
+            var st = rec.get('status');
+            if (st !== 'success' && st !== 'failed' && st !== 'COMPLETED' && st !== 'FAILED' && st !== 'completed') {
+              rec.set('status', taskFailed ? 'failed' : 'success');
+            }
+          });
+
+          // Final progress update
+          if (progressBar) {
+            progressBar.setValue(1);
+            var finalDone = 0;
+            fileStore.each(function (rec) {
+              var st = rec.get('status');
+              if (st === 'success' || st === 'COMPLETED' || st === 'completed' ||
+                  st === 'failed' || st === 'FAILED') {
+                finalDone++;
+              }
+            });
+            progressBar.updateText(_t('promotion.progress.completed', finalDone, total || finalDone));
+          }
+
+          // Update window title
+          if (taskFailed) {
+            win.setTitle(_t('promotion.progress.failed'));
+          } else {
+            win.setTitle(_t('promotion.progress.success'));
+          }
+        }
+      };
+
+      xhr.send();
+    };
+
+    win._syncPollInterval = setInterval(doPoll, 1500);
+    // Initial poll after delay
+    setTimeout(doPoll, 1000);
   },
 
   showPromotionModal: function (repoName, path, isDirectory, format) {

@@ -277,6 +277,30 @@ public class TaskExecutorService {
   }
 
   /**
+   * Remove a completed sync task handle to prevent memory leaks.
+   * Only removes tasks that are in a terminal state (COMPLETED, FAILED, MIGRATED).
+   */
+  public void cleanupSyncTaskHandle(final String taskId) {
+    TaskHandle handle = syncTasks.get(taskId);
+    if (handle != null && handle.status != TaskStatus.PENDING && handle.status != TaskStatus.RUNNING) {
+      syncTasks.remove(taskId);
+      log.debug("Cleaned up sync task handle: {}", taskId);
+    }
+  }
+
+  /**
+   * Remove a completed promotion task handle to prevent memory leaks.
+   * Only removes tasks that are in a terminal state (COMPLETED, FAILED).
+   */
+  public void cleanupPromotionTaskHandle(final String taskId) {
+    TaskHandle handle = promotionTasks.get(taskId);
+    if (handle != null && handle.status != TaskStatus.PENDING && handle.status != TaskStatus.RUNNING) {
+      promotionTasks.remove(taskId);
+      log.debug("Cleaned up promotion task handle: {}", taskId);
+    }
+  }
+
+  /**
    * Get all promotion tasks.
    */
   public Map<String, TaskHandle> getPromotionTasks() {

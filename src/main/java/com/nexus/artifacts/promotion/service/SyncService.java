@@ -38,12 +38,16 @@ import com.nexus.artifacts.promotion.security.PermissionChecker;
  * - Old tasks are cancelled and marked as migrated to new task ID
  * - Thread pool managed execution
  * - Permission checks at both submission and execution time
+ * - Automatic cleanup of completed task info to prevent memory leaks
  */
 @Named
 @Singleton
 public class SyncService {
 
   private static final Logger log = LoggerFactory.getLogger(SyncService.class);
+
+  /** Maximum time (ms) to keep completed task info before cleanup (30 minutes) */
+  private static final long TASK_INFO_TTL_MS = 30 * 60 * 1000L;
 
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
@@ -188,8 +192,10 @@ public class SyncService {
 
   /**
    * Get sync task info by ID.
+   * Also triggers cleanup of expired task info entries.
    */
   public SyncTaskInfo getTaskInfo(final String taskId) {
+    cleanupExpiredTaskInfos();
     SyncTaskInfo info = taskInfos.get(taskId);
     if (info != null) {
       // Update status from executor
@@ -197,14 +203,20 @@ public class SyncService {
       if (status != null) {
         info.setStatus(status);
       }
+      // If task is in terminal state, clean up the executor handle
+      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED) {
+        taskExecutor.cleanupSyncTaskHandle(taskId);
+      }
     }
     return info;
   }
 
   /**
    * Get all sync tasks (for queue display).
+   * Also triggers cleanup of expired task info entries.
    */
   public List<SyncTaskInfo> getAllSyncTasks() {
+    cleanupExpiredTaskInfos();
     List<SyncTaskInfo> tasks = new ArrayList<>();
     for (Map.Entry<String, SyncTaskInfo> entry : taskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
@@ -212,6 +224,10 @@ public class SyncService {
       TaskStatus status = taskExecutor.getSyncTaskStatus(entry.getKey());
       if (status != null) {
         info.setStatus(status);
+      }
+      // Clean up executor handles for terminal tasks
+      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED) {
+        taskExecutor.cleanupSyncTaskHandle(entry.getKey());
       }
       tasks.add(info);
     }
@@ -231,6 +247,36 @@ public class SyncService {
       }
     }
     return active;
+  }
+
+  /**
+   * Clean up task info entries that have been completed for longer than TASK_INFO_TTL_MS.
+   * This prevents memory leaks from accumulated completed task data.
+   */
+  private void cleanupExpiredTaskInfos() {
+    long now = System.currentTimeMillis();
+    List<String> expiredTaskIds = new ArrayList<>();
+
+    for (Map.Entry<String, SyncTaskInfo> entry : taskInfos.entrySet()) {
+      SyncTaskInfo info = entry.getValue();
+      TaskStatus status = info.getStatus();
+      // Only clean up terminal state tasks that have expired
+      if ((status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED)
+          && info.getEndTime() > 0
+          && (now - info.getEndTime()) > TASK_INFO_TTL_MS) {
+        expiredTaskIds.add(entry.getKey());
+      }
+    }
+
+    for (String taskId : expiredTaskIds) {
+      taskInfos.remove(taskId);
+      taskExecutor.cleanupSyncTaskHandle(taskId);
+      log.debug("Expired task info cleaned up: {}", taskId);
+    }
+
+    if (!expiredTaskIds.isEmpty()) {
+      log.info("Cleaned up {} expired sync task info entries", expiredTaskIds.size());
+    }
   }
 
   /**

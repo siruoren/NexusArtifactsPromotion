@@ -97,6 +97,9 @@ public class SyncResource implements Resource {
       String taskId = syncService.sync(request);
       return Response.ok()
           .entity("{\"taskId\":\"" + sanitize(taskId) + "\",\"status\":\"submitted\","
+              + "\"repository\":\"" + sanitize(request.getRepositoryName()) + "\","
+              + "\"path\":\"" + sanitize(request.getPath()) + "\","
+              + "\"isDirectory\":" + request.isDirectory() + ","
               + "\"message\":\"Sync queue task created\"}")
           .build();
     }

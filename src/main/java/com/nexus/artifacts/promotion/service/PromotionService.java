@@ -49,6 +49,9 @@ public class PromotionService {
 
   private static final Logger log = LoggerFactory.getLogger(PromotionService.class);
 
+  /** Maximum time (ms) to keep completed task results before cleanup (30 minutes) */
+  private static final long TASK_RESULT_TTL_MS = 30 * 60 * 1000L;
+
   /** Connection/read timeout in milliseconds */
   private static final int TIMEOUT_MS = 300_000; // 5 minutes
 
@@ -269,9 +272,19 @@ public class PromotionService {
 
   /**
    * Get promotion task result.
+   * Also triggers cleanup of expired task results.
    */
   public PromotionTaskResult getTaskResult(final String taskId) {
-    return taskResults.get(taskId);
+    cleanupExpiredTaskResults();
+    PromotionTaskResult result = taskResults.get(taskId);
+    if (result != null) {
+      // Clean up executor handle for terminal tasks
+      String statusStr = result.getStatus();
+      if ("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr)) {
+        taskExecutor.cleanupPromotionTaskHandle(taskId);
+      }
+    }
+    return result;
   }
 
   /**
@@ -279,6 +292,35 @@ public class PromotionService {
    */
   public TaskStatus getTaskExecutorStatus(final String taskId) {
     return taskExecutor.getPromotionTaskStatus(taskId);
+  }
+
+  /**
+   * Clean up task results that have been completed for longer than TASK_RESULT_TTL_MS.
+   * This prevents memory leaks from accumulated completed task data.
+   */
+  private void cleanupExpiredTaskResults() {
+    long now = System.currentTimeMillis();
+    List<String> expiredTaskIds = new ArrayList<>();
+
+    for (Map.Entry<String, PromotionTaskResult> entry : taskResults.entrySet()) {
+      PromotionTaskResult result = entry.getValue();
+      String statusStr = result.getStatus();
+      if (("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr))
+          && result.getEndTime() > 0
+          && (now - result.getEndTime()) > TASK_RESULT_TTL_MS) {
+        expiredTaskIds.add(entry.getKey());
+      }
+    }
+
+    for (String taskId : expiredTaskIds) {
+      taskResults.remove(taskId);
+      taskExecutor.cleanupPromotionTaskHandle(taskId);
+      log.debug("Expired promotion task result cleaned up: {}", taskId);
+    }
+
+    if (!expiredTaskIds.isEmpty()) {
+      log.info("Cleaned up {} expired promotion task results", expiredTaskIds.size());
+    }
   }
 
   // ==================== HTTP-based Promotion Logic ====================
