@@ -245,6 +245,93 @@ public class SyncService {
   }
 
   /**
+   * Execute sync of a remote repository path synchronously (for scheduled tasks).
+   * Unlike {@link #sync(SyncRequest)}, this method:
+   * - Skips permission checks (scheduled tasks are created by administrators)
+   * - Executes synchronously in the calling thread (no thread pool)
+   * - Returns the full SyncTaskInfo with results
+   *
+   * @param request the sync request
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncScheduled(final SyncRequest request) {
+    request.validate();
+
+    // No permission check for scheduled tasks — tasks are created by administrators
+
+    Repository repo = repositoryManager.get(request.getRepositoryName());
+    if (repo == null) {
+      throw new IllegalArgumentException("Repository not found: " + request.getRepositoryName());
+    }
+
+    // Verify it's a proxy repository
+    if (!"proxy".equals(repo.getType().getValue())) {
+      throw new IllegalArgumentException("Repository is not a proxy type: " + request.getRepositoryName());
+    }
+
+    String taskId = "scheduled-sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
+
+    SyncTaskInfo taskInfo = new SyncTaskInfo();
+    taskInfo.setTaskId(taskId);
+    taskInfo.setSourceRepository(request.getRepositoryName());
+    taskInfo.setPath(request.getPath());
+    taskInfo.setDirectory(request.isDirectory());
+    taskInfo.setFormat(request.getFormat());
+    taskInfo.setUsername("system");
+    taskInfo.setStartTime(System.currentTimeMillis());
+    taskInfo.setStatus(TaskStatus.RUNNING);
+    taskInfo.setTargetRepository(repo.getName());
+
+    // Store initial state
+    taskInfos.put(taskId, taskInfo);
+
+    try {
+      cacheManager.createTaskCache(taskId);
+
+      boolean isFullSync = (request.getPath() == null || request.getPath().trim().isEmpty());
+      log.info("Starting scheduled {} for {}:{}",
+          isFullSync ? "full repository sync" : "directory sync",
+          request.getRepositoryName(),
+          isFullSync ? "/" : request.getPath());
+
+      // Execute sync using ContentFacet
+      List<SyncTaskInfo.SyncFileDetail> syncedFiles;
+      if (request.isDirectory()) {
+        syncedFiles = syncDirectory(repo, request.getPath());
+      }
+      else {
+        syncedFiles = syncFile(repo, request.getPath());
+      }
+
+      taskInfo.setFileDetails(syncedFiles);
+      taskInfo.setStatus(TaskStatus.COMPLETED);
+      taskInfo.setEndTime(System.currentTimeMillis());
+
+      // Count skipped vs actually synced items
+      long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+      long syncedCount = syncedFiles.size() - skippedCount;
+      taskInfo.setResult("Synced " + syncedCount + " items" +
+          (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
+
+      log.info("Scheduled sync task completed: {} items synced, {} skipped from {}:{}",
+          syncedCount, skippedCount, request.getRepositoryName(),
+          isFullSync ? "/" : request.getPath());
+    }
+    catch (Exception e) {
+      log.error("Scheduled sync task failed: {}", e.getMessage(), e);
+      taskInfo.setStatus(TaskStatus.FAILED);
+      taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setEndTime(System.currentTimeMillis());
+      taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
+    }
+
+    // Update stored info with final state
+    taskInfos.put(taskId, taskInfo);
+
+    return taskInfo;
+  }
+
+  /**
    * Get sync task info by ID.
    */
   public SyncTaskInfo getTaskInfo(final String taskId) {

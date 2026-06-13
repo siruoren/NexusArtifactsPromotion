@@ -15,5 +15,7 @@ com.nexus.artifacts.promotion.service.PromotionService
 com.nexus.artifacts.promotion.service.SyncService
 com.nexus.artifacts.promotion.service.TaskCacheManager
 com.nexus.artifacts.promotion.service.TaskExecutorService
+com.nexus.artifacts.promotion.task.ProxySyncTask
+com.nexus.artifacts.promotion.task.ProxySyncTaskDescriptor
 com.nexus.artifacts.promotion.task.SyncQueueSizeTask
 com.nexus.artifacts.promotion.task.SyncQueueSizeTaskDescriptor

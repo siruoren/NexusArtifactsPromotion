@@ -14,6 +14,8 @@ import javax.ws.rs.core.Response;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.sonatype.nexus.repository.Repository;
+import org.sonatype.nexus.repository.manager.RepositoryManager;
 import org.sonatype.nexus.rest.Resource;
 
 import com.nexus.artifacts.promotion.model.SyncRequest;
@@ -40,13 +42,16 @@ public class SyncResource implements Resource {
 
   private final SyncService syncService;
   private final PermissionChecker permissionChecker;
+  private final RepositoryManager repositoryManager;
 
   @Inject
   public SyncResource(final SyncService syncService,
-                       final PermissionChecker permissionChecker)
+                       final PermissionChecker permissionChecker,
+                       final RepositoryManager repositoryManager)
   {
     this.syncService = syncService;
     this.permissionChecker = permissionChecker;
+    this.repositoryManager = repositoryManager;
   }
 
   /**
@@ -153,6 +158,65 @@ public class SyncResource implements Resource {
       log.error("Failed to get sync task status: {}", e.getMessage());
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
           .entity("{\"error\":\"Failed to get task status\"}")
+          .build();
+    }
+  }
+
+  /**
+   * List all proxy repositories.
+   * Returns repository name, format, and remote URL for each proxy repository.
+   */
+  @GET
+  @Path("/proxy-repositories")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("List all proxy repositories")
+  public Response listProxyRepositories()
+  {
+    try {
+      StringBuilder json = new StringBuilder("[");
+      boolean first = true;
+      for (Repository repo : repositoryManager.browse()) {
+        if ("proxy".equals(repo.getType().getValue())) {
+          if (!first) {
+            json.append(",");
+          }
+          first = false;
+
+          String format = repo.getFormat() != null ? repo.getFormat().getValue() : "unknown";
+          String remoteUrl = "";
+          try {
+            org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+            if (config != null && config.getAttributes() != null
+                && config.getAttributes().containsKey("proxy")) {
+              @SuppressWarnings("unchecked")
+              java.util.Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
+              Object urlObj = proxyAttrs.get("remoteUrl");
+              if (urlObj != null) {
+                remoteUrl = urlObj.toString();
+              }
+            }
+          }
+          catch (Exception ignored) {
+            // ignore
+          }
+
+          boolean hasDeletePerm = permissionChecker.hasRepositoryDeletePermission(repo.getName(), format);
+
+          json.append("{")
+              .append("\"name\":\"").append(sanitize(repo.getName())).append("\",")
+              .append("\"format\":\"").append(sanitize(format)).append("\",")
+              .append("\"remoteUrl\":\"").append(sanitize(remoteUrl)).append("\",")
+              .append("\"hasDeletePermission\":").append(hasDeletePerm)
+              .append("}");
+        }
+      }
+      json.append("]");
+      return Response.ok().entity(json.toString()).build();
+    }
+    catch (Exception e) {
+      log.error("Failed to list proxy repositories: {}", e.getMessage());
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to list proxy repositories\"}")
           .build();
     }
   }

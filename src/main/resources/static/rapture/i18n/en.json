@@ -26,6 +26,7 @@
   "sync.button.text": "Sync",
   "sync.permission.denied": "You do not have sync permission for this repository.",
   "sync.permission.denied.admin": "You do not have sync permission. Please contact your administrator.",
+  "sync.permission.disabled.tooltip": "You do not have delete permission for this repository. Contact admin for access.",
   "sync.execute.failed": "Sync Failed",
   "sync.queue.created.title": "Sync Queue Created",
   "sync.queue.created.queueId": "Queue ID:",
