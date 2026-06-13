@@ -942,10 +942,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       return;
     }
 
-    // Async API check as fallback
-    checkSyncPermission(repoName, format).then(function (result) {
-      // result.hasPermission is true only for proxy repos with edit permission
-      // result.isProxy tells us if it's a proxy repo
+    // Async API check as fallback - call /sync/permission directly to get isProxy
+    apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
+    .then(function (result) {
       var isProxy = result.isProxy === true;
       if (isProxy) {
         // Check panel still exists and no sync button already
@@ -953,7 +952,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           me.addSyncButton(panel, repoName, path, format, isDirectory);
         }
       }
-    }).catch(function () {
+    })
+    .catch(function () {
       // API failed, don't add sync button
     });
   },
