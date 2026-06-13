@@ -557,22 +557,59 @@ public class SyncService {
 
   /**
    * List assets from a local Nexus repository via Search API.
-   * Uses group filter to search only within the target directory,
-   * avoiding scanning all assets in the repository.
+   * Strategy:
+   * 1. First try with group filter (works for Maven2 format where group = groupId)
+   * 2. If group filter returns 0 results (common for raw/hosted format where group doesn't
+   *    match directory path), fall back to listing all assets and filtering by path prefix
    * Handles pagination via continuationToken.
    * Uses proxy-configured credentials if provided, falls back to default admin credentials.
    */
   private List<String> listAssetsViaApi(final String repoName, final String directoryPath,
       final String authUsername, final String authPassword) throws Exception {
-    List<String> assetNames = new ArrayList<>();
     String normalizedDir = directoryPath;
     if (normalizedDir.endsWith("/")) {
       normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
     }
+    // Ensure normalizedDir starts without leading slash for consistent path matching
+    String pathPrefix = normalizedDir;
 
-    // Use Search API with group filter to only list assets in the target directory
-    String apiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName
+    // Step 1: Try with group filter first (efficient for Maven2 repos)
+    String effectiveAuth = (authUsername != null && authPassword != null)
+        ? authUsername + ":" + authPassword : getAdminAuth();
+
+    String groupApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName
         + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
+    List<String> assetsWithGroup = listAssetsViaApiUrl(groupApiUrl, effectiveAuth);
+
+    // Check if group filter returned results — if yes, return them directly
+    // but still filter by path prefix to ensure accuracy
+    if (!assetsWithGroup.isEmpty()) {
+      List<String> filtered = filterByPathPrefix(assetsWithGroup, pathPrefix);
+      log.info("Search with group filter returned {} assets, {} matched path prefix '{}'",
+          assetsWithGroup.size(), filtered.size(), pathPrefix);
+      return filtered;
+    }
+
+    // Step 2: Group filter returned 0 results — fall back to listing all assets
+    // and filtering by path prefix. This handles raw/hosted repos where the Search API's
+    // group parameter doesn't correspond to the file system directory path.
+    log.info("Group filter returned 0 results for '{}', falling back to path-prefix filter", normalizedDir);
+    String allApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName;
+    List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
+    List<String> filtered = filterByPathPrefix(allAssets, pathPrefix);
+
+    log.info("Total assets in repo {}: {}, matched path prefix '{}': {}",
+        repoName, allAssets.size(), pathPrefix, filtered.size());
+
+    return filtered;
+  }
+
+  /**
+   * List assets from a Search API URL, handling pagination.
+   * Returns all asset paths found across all pages.
+   */
+  private List<String> listAssetsViaApiUrl(final String apiUrl, final String effectiveAuth) throws Exception {
+    List<String> assetNames = new ArrayList<>();
     String continuationToken = null;
 
     do {
@@ -586,9 +623,6 @@ public class SyncService {
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
       conn.setRequestProperty("Accept", "application/json");
-      // Use proxy-configured credentials if available, otherwise fall back to default admin credentials
-      String effectiveAuth = (authUsername != null && authPassword != null)
-          ? authUsername + ":" + authPassword : getAdminAuth();
       conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
 
       if (conn.getResponseCode() != 200) {
@@ -625,6 +659,30 @@ public class SyncService {
     } while (continuationToken != null && !continuationToken.isEmpty());
 
     return assetNames;
+  }
+
+  /**
+   * Filter asset paths by a path prefix (directory).
+   * Ensures that only assets directly under or within the specified directory are included.
+   * For example, pathPrefix "2" matches "2/file.txt" and "2/sub/file.txt"
+   * but not "20/file.txt" or "1/file.txt".
+   */
+  private List<String> filterByPathPrefix(final List<String> assetPaths, final String pathPrefix) {
+    List<String> filtered = new ArrayList<>();
+    // Normalize: remove leading slash from both for consistent matching
+    String normalizedPrefix = pathPrefix.startsWith("/") ? pathPrefix.substring(1) : pathPrefix;
+
+    for (String path : assetPaths) {
+      // Remove leading slash from path for matching
+      String normalizedPath = path.startsWith("/") ? path.substring(1) : path;
+
+      // Path must start with the prefix followed by '/' or be exactly the prefix
+      if (normalizedPath.equals(normalizedPrefix) ||
+          normalizedPath.startsWith(normalizedPrefix + "/")) {
+        filtered.add(path);
+      }
+    }
+    return filtered;
   }
 
   /**
