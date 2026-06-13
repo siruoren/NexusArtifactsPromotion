@@ -610,7 +610,16 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       weight: 200,
       authenticationRequired: true,
       visible: function () {
-        return NX.State.getValue('user') !== undefined;
+        // Only visible to admin users
+        var user = NX.State.getValue('user');
+        if (!user) return false;
+        // Check if user has admin role
+        if (user.admin === true) return true;
+        var roles = user.roles || [];
+        for (var i = 0; i < roles.length; i++) {
+          if (roles[i] === 'nx-admin' || roles[i] === 'admin') return true;
+        }
+        return false;
       }
     }, me);
 
@@ -918,7 +927,34 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         }
       }
     } catch (e) { /* ignore */ }
-    return false;
+    try {
+      // Fallback: try NX.coreui store
+      var coreStore = Ext.getStore('nx-coreui-repository') || Ext.getStore('RepositoryList');
+      if (coreStore) {
+        var rec = coreStore.findRecord('name', repoName, 0, false, true, true);
+        if (rec) {
+          return rec.get('type') === 'proxy';
+        }
+      }
+    } catch (e) { /* ignore */ }
+    try {
+      // Fallback: check all known stores for repository info
+      var storeIds = ['Repository', 'nx-coreui-repository', 'RepositoryList',
+                       'nx-coreui-repository-list', 'coreui_Repository'];
+      for (var s = 0; s < storeIds.length; s++) {
+        var s2 = Ext.getStore(storeIds[s]);
+        if (s2) {
+          var r = s2.findRecord('name', repoName, 0, false, true, true);
+          if (r) {
+            return r.get('type') === 'proxy';
+          }
+        }
+      }
+    } catch (e) { /* ignore */ }
+    // Last fallback: use sync permission API to determine if this is a proxy repo
+    // If sync permission returns true, it's likely a proxy repo
+    // We can't do async here, so return true and let the backend handle permission
+    return true;
   },
 
   addPromotionButton: function (panel, repoName, path, format, isDirectory) {
@@ -967,6 +1003,18 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var actions = panel.down('nx-actions');
     if (actions) {
       actions.add(btn);
+    } else {
+      // Try to find any existing toolbar (created by addPromotionButton or native)
+      var toolbar = panel.down('toolbar');
+      if (toolbar) {
+        toolbar.add(btn);
+      } else {
+        panel.addDocked({
+          xtype: 'toolbar',
+          dock: 'top',
+          items: [btn]
+        });
+      }
     }
   },
 

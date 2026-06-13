@@ -4,6 +4,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
@@ -96,6 +97,9 @@ public class SyncService {
     final SubjectThreadState threadState = (subject != null && subject.isAuthenticated())
         ? new SubjectThreadState(subject) : null;
 
+    // Pre-generate taskId so it's available inside the lambda
+    final String preTaskId = "sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
+
     // Submit to thread pool with dedup handling
     String taskId = taskExecutor.submitSyncTask(() -> {
       // Bind Shiro subject to this thread to preserve security context
@@ -104,6 +108,7 @@ public class SyncService {
       }
       try {
         SyncTaskInfo taskInfo = new SyncTaskInfo();
+        taskInfo.setTaskId(preTaskId);
         taskInfo.setSourceRepository(request.getRepositoryName());
         taskInfo.setPath(request.getPath());
         taskInfo.setDirectory(request.isDirectory());
@@ -125,7 +130,7 @@ public class SyncService {
           taskInfo.setTargetRepository(targetRepo);
 
           // Create task cache
-          cacheManager.createTaskCache("sync-" + System.currentTimeMillis());
+          cacheManager.createTaskCache(preTaskId);
 
           // Execute sync
           List<SyncTaskInfo.SyncFileDetail> syncedFiles;
@@ -171,7 +176,7 @@ public class SyncService {
         }
       }
     }, String.format("Sync %s from %s", request.getPath(), request.getRepositoryName()),
-        request.getRepositoryName(), request.getPath());
+        request.getRepositoryName(), request.getPath(), preTaskId);
 
     // Create initial task info record
     SyncTaskInfo initialInfo = new SyncTaskInfo();
@@ -305,7 +310,7 @@ public class SyncService {
 
           try {
             // Trigger re-download / cache refresh from remote
-            syncSingleAsset(repo, asset);
+            syncSingleAsset(repo, asset, tx);
             detail.setStatus("success");
           }
           catch (Exception e) {
@@ -351,7 +356,7 @@ public class SyncService {
             filePath, determineType(filePath));
 
         try {
-          syncSingleAsset(repo, asset);
+          syncSingleAsset(repo, asset, tx);
           detail.setStatus("success");
         }
         catch (Exception e) {
@@ -377,24 +382,17 @@ public class SyncService {
    * Sync a single asset by invalidating its cache and re-fetching from remote.
    * For proxy repositories, we mark the asset as requiring re-download
    * by clearing its blob reference.
+   *
+   * IMPORTANT: This method must be called within an active UnitOfWork transaction.
+   * It does NOT start its own transaction - it uses the caller's transaction.
    */
-  private void syncSingleAsset(final Repository repo, final Asset asset) throws Exception {
-    StorageFacet storageFacet = repo.facet(StorageFacet.class);
-    UnitOfWork.begin(storageFacet.txSupplier());
-    try {
-      StorageTx tx = UnitOfWork.currentTx();
-
-      // Mark asset as requiring re-download by clearing blob reference
-      if (asset.blobRef() != null) {
-        asset.blobRef(null);
-        tx.saveAsset(asset);
-      }
-
-      tx.commit();
+  private void syncSingleAsset(final Repository repo, final Asset asset, final StorageTx tx) throws Exception {
+    // Mark asset as requiring re-download by clearing blob reference
+    if (asset.blobRef() != null) {
+      asset.blobRef(null);
+      tx.saveAsset(asset);
     }
-    finally {
-      UnitOfWork.end();
-    }
+    tx.commit();
   }
 
   /**

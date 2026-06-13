@@ -52,15 +52,21 @@ public class SyncQueueResource implements Resource {
   }
 
   /**
-   * Check if the current user is authenticated (not anonymous).
-   * Returns 401 if the user is not logged in.
+   * Check if the current user is an admin.
+   * Returns 401 if not authenticated, 403 if not admin.
    */
-  private Response requireAuthentication() {
+  private Response requireAdmin() {
     Subject subject = SecurityUtils.getSubject();
     if (subject == null || !subject.isAuthenticated() || isAnonymous(subject)) {
       log.warn("Unauthenticated access attempt to sync queue API");
       return Response.status(Response.Status.UNAUTHORIZED)
           .entity("{\"error\":\"Authentication required\",\"message\":\"Please log in to access sync queue\"}")
+          .build();
+    }
+    if (!subject.hasRole("nx-admin")) {
+      log.warn("Non-admin access attempt to sync queue API by user: {}", subject.getPrincipal());
+      return Response.status(Response.Status.FORBIDDEN)
+          .entity("{\"error\":\"Admin required\",\"message\":\"Only administrators can access sync queue\"}")
           .build();
     }
     return null;
@@ -90,7 +96,7 @@ public class SyncQueueResource implements Resource {
       @QueryParam("start") @DefaultValue("0") int start,
       @QueryParam("limit") @DefaultValue("25") int limit
   ) {
-    Response authError = requireAuthentication();
+    Response authError = requireAdmin();
     if (authError != null) {
       return authError;
     }
@@ -115,7 +121,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("List all sync queue tasks")
   public Response listAllTasksAlias()
   {
-    Response authError = requireAuthentication();
+    Response authError = requireAdmin();
     if (authError != null) {
       return authError;
     }
@@ -140,7 +146,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("List active sync queue tasks")
   public Response listActiveTasks()
   {
-    Response authError = requireAuthentication();
+    Response authError = requireAdmin();
     if (authError != null) {
       return authError;
     }
@@ -165,7 +171,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("Get sync task details")
   public Response getTask(@javax.ws.rs.PathParam("taskId") final String taskId)
   {
-    Response authError = requireAuthentication();
+    Response authError = requireAdmin();
     if (authError != null) {
       return authError;
     }
@@ -195,7 +201,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("Get sync queue configuration")
   public Response getQueueConfig()
   {
-    Response authError = requireAuthentication();
+    Response authError = requireAdmin();
     if (authError != null) {
       return authError;
     }
@@ -226,7 +232,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("Update sync queue configuration")
   public Response updateQueueConfig(final Map<String, Object> config)
   {
-    Response authError = requireAuthentication();
+    Response authError = requireAdmin();
     if (authError != null) {
       return authError;
     }

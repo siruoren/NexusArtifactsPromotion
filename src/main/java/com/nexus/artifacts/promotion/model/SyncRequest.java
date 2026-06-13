@@ -40,6 +40,16 @@ public class SyncRequest {
     if (format == null || format.trim().isEmpty()) {
       throw new IllegalArgumentException("format is required");
     }
+    // Normalize path
+    if (path.startsWith("./")) {
+      path = path.substring(2);
+    }
+    while (path.startsWith("/")) {
+      path = path.substring(1);
+    }
+    if (path.trim().isEmpty()) {
+      throw new IllegalArgumentException("Invalid path: path is empty after normalization");
+    }
     if (path.contains("..") || path.contains("\0")) {
       throw new IllegalArgumentException("Invalid path: path traversal detected");
     }

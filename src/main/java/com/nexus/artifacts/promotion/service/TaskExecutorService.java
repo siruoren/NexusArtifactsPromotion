@@ -119,6 +119,18 @@ public class TaskExecutorService {
                                 final String sourcePath)
   {
     final String taskId = generateTaskId("sync");
+    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, taskId);
+  }
+
+  /**
+   * Submit a sync task with a pre-defined taskId.
+   */
+  public String submitSyncTask(final Callable<SyncTaskCallback> task,
+                                final String taskDescription,
+                                final String sourceRepository,
+                                final String sourcePath,
+                                final String taskId)
+  {
     log.info("Submitting sync task {}: {}", taskId, taskDescription);
 
     // Check for duplicate source directory sync - cancel old task

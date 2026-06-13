@@ -58,6 +58,20 @@ public class PromotionRequest {
     if (path == null || path.trim().isEmpty()) {
       throw new IllegalArgumentException("path is required");
     }
+    // Normalize path: strip leading "./" or "." as it's meaningless and causes upload failures
+    if (path.equals(".") || path.equals("./")) {
+      throw new IllegalArgumentException("Invalid path: root directory path is not a valid file path");
+    }
+    if (path.startsWith("./")) {
+      path = path.substring(2);
+    }
+    // Strip leading slash
+    while (path.startsWith("/")) {
+      path = path.substring(1);
+    }
+    if (path.trim().isEmpty()) {
+      throw new IllegalArgumentException("Invalid path: path is empty after normalization");
+    }
     if (format == null || format.trim().isEmpty()) {
       throw new IllegalArgumentException("format is required");
     }
