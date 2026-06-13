@@ -182,6 +182,33 @@ public class PermissionChecker {
   }
 
   /**
+   * Check if the current user has delete permission on a repository.
+   * Uses Nexus system permission: nexus:repository-view:{format}:{repoName}:delete
+   */
+  public boolean hasRepositoryDeletePermission(final String repositoryName, final String format) {
+    Subject subject = SecurityUtils.getSubject();
+    if (subject == null || !subject.isAuthenticated()) {
+      return false;
+    }
+    String fmt = (format != null && !format.isEmpty()) ? format : "raw";
+    String permission = "nexus:repository-view:" + fmt + ":" + repositoryName + ":delete";
+    return subject.isPermitted(permission);
+  }
+
+  /**
+   * Check if the current user has delete permission on a repository.
+   * Reads the format from the repository directly.
+   */
+  public boolean hasRepositoryDeletePermission(final String repositoryName) {
+    Repository repo = repositoryManager.get(repositoryName);
+    if (repo == null) {
+      log.warn("Repository not found for delete permission check: {}", repositoryName);
+      return false;
+    }
+    return hasRepositoryDeletePermission(repositoryName, repo.getFormat().getValue());
+  }
+
+  /**
    * Assert sync permission, throwing exception if not authorized.
    */
   public void checkSyncPermission(final String repositoryName, final String format) {

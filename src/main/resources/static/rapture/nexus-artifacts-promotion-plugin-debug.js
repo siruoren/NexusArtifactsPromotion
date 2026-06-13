@@ -82,6 +82,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.full.path": "/ (Full Repository)",
     "sync.permission.denied": "You do not have sync permission for this repository.",
     "sync.permission.denied.admin": "You do not have sync permission. Please contact your administrator.",
+    "sync.permission.disabled.tooltip": "You do not have delete permission for this repository. Sync requires delete permission.",
     "sync.execute.failed": "Sync Failed",
     "sync.queue.created.title": "Sync Queue Created",
     "sync.queue.created.queueId": "Queue ID:",
@@ -162,6 +163,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.full.path": "/ (\u6574\u5e93\u540c\u6b65)",
     "sync.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u540c\u6b65\u6743\u9650\u3002",
     "sync.permission.denied.admin": "\u60a8\u6ca1\u6709\u540c\u6b65\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
+    "sync.permission.disabled.tooltip": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u5220\u9664\u6743\u9650\uff0c\u540c\u6b65\u9700\u8981\u5220\u9664\u6743\u9650\u624d\u80fd\u6267\u884c\u3002",
     "sync.execute.failed": "\u540c\u6b65\u5931\u8d25",
     "sync.queue.created.title": "\u540c\u6b65\u961f\u5217\u5df2\u521b\u5efa",
     "sync.queue.created.queueId": "\u961f\u5217ID\uff1a",
@@ -919,21 +921,37 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   addFullSyncButtonIfProxy: function (panel, repoName, format) {
     var me = this;
 
-    // Quick synchronous check first
-    if (me.isProxyRepository(repoName)) {
-      me.addFullSyncButton(panel, repoName, format);
+    // Avoid duplicate buttons
+    if (panel.query('button[cls=fullsync-btn]').length > 0) return;
+
+    // Quick synchronous check: if not proxy at all, skip
+    if (!me.isProxyRepository(repoName)) {
+      // Async API check as fallback (in case NX.State doesn't have the repo info)
+      apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
+      .then(function (result) {
+        var isProxy = result.isProxy === true;
+        if (isProxy && !panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
+          var hasDeletePerm = result.hasDeletePermission === true;
+          me.addFullSyncButton(panel, repoName, format, !hasDeletePerm);
+        }
+      })
+      .catch(function () { /* ignore */ });
       return;
     }
 
-    // Async API check
+    // Is proxy - always show button, check delete permission via API
     apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
     .then(function (result) {
-      var isProxy = result.isProxy === true;
-      if (isProxy && !panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
-        me.addFullSyncButton(panel, repoName, format);
-      }
+      if (panel.destroyed || panel.query('button[cls=fullsync-btn]').length > 0) return;
+      var hasDeletePerm = result.hasDeletePermission === true;
+      me.addFullSyncButton(panel, repoName, format, !hasDeletePerm);
     })
-    .catch(function () { /* ignore */ });
+    .catch(function () {
+      // API failed - add button anyway but disabled (no permission info)
+      if (!panel.destroyed && panel.query('button[cls=fullsync-btn]').length === 0) {
+        me.addFullSyncButton(panel, repoName, format, true);
+      }
+    });
   },
 
   /**
@@ -1148,7 +1166,19 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     // Quick synchronous check first
     if (me.isProxyRepository(repoName)) {
-      me.addSyncButton(panel, repoName, path, format, isDirectory);
+      // Always show sync button for proxy repos, check delete permission via API
+      apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
+      .then(function (result) {
+        if (panel.destroyed || panel.query('button[cls=sync-btn]').length > 0) return;
+        var hasDeletePerm = result.hasDeletePermission === true;
+        me.addSyncButton(panel, repoName, path, format, isDirectory, !hasDeletePerm);
+      })
+      .catch(function () {
+        // API failed - add button disabled
+        if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
+          me.addSyncButton(panel, repoName, path, format, isDirectory, true);
+        }
+      });
       return;
     }
 
@@ -1159,7 +1189,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (isProxy) {
         // Check panel still exists and no sync button already
         if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
-          me.addSyncButton(panel, repoName, path, format, isDirectory);
+          var hasDeletePerm = result.hasDeletePermission === true;
+          me.addSyncButton(panel, repoName, path, format, isDirectory, !hasDeletePerm);
         }
       }
     })
@@ -1196,7 +1227,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     }
   },
 
-  addSyncButton: function (panel, repoName, path, format, isDirectory) {
+  addSyncButton: function (panel, repoName, path, format, isDirectory, disabled) {
     var me = this;
     if (typeof isDirectory === 'undefined') {
       isDirectory = path && path.endsWith('/');
@@ -1206,6 +1237,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       text: isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text'),
       iconCls: 'x-fa fa-sync',
       cls: 'sync-btn',
+      disabled: !!disabled,
+      tooltip: disabled ? _t('sync.permission.disabled.tooltip') : '',
       handler: function () {
         me.handleSyncClick(repoName, path, isDirectory, format);
       }
@@ -1233,13 +1266,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
    * Add "Sync All" (full repository sync) button to a panel.
    * Only shown for proxy repositories. Triggers sync of the entire remote repository.
    */
-  addFullSyncButton: function (panel, repoName, format) {
+  addFullSyncButton: function (panel, repoName, format, disabled) {
     var me = this;
 
     var btn = Ext.create('Ext.button.Button', {
       text: _t('sync.button.text.full'),
       iconCls: 'x-fa fa-cloud-download',
       cls: 'fullsync-btn',
+      disabled: !!disabled,
+      tooltip: disabled ? _t('sync.permission.disabled.tooltip') : '',
       handler: function () {
         me.handleFullSyncClick(repoName, format);
       }
