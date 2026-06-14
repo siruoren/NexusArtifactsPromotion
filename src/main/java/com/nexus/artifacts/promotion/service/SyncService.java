@@ -43,6 +43,7 @@ import com.google.common.hash.HashCode;
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
+import com.nexus.artifacts.promotion.security.CredentialEncryptor;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 /**
@@ -72,6 +73,9 @@ public class SyncService {
   private static final String DEFAULT_ADMIN_USERNAME = "admin";
   private static final String DEFAULT_ADMIN_PASSWORD = "admin123";
 
+  /** Maximum retry attempts for individual asset sync operations */
+  private static final int SYNC_RETRY_ATTEMPTS = 2;
+
   private volatile String adminUsername = DEFAULT_ADMIN_USERNAME;
   private volatile String adminPassword = DEFAULT_ADMIN_PASSWORD;
 
@@ -99,22 +103,29 @@ public class SyncService {
 
   /**
    * Update admin credentials from capability configuration.
+   * Credentials are stored in encrypted form for security.
    */
   public void updateAdminCredentials(final String username, final String password) {
     if (username != null && !username.isEmpty()) {
       this.adminUsername = username;
     }
     if (password != null && !password.isEmpty()) {
-      this.adminPassword = password;
+      // Encrypt the password for storage
+      this.adminPassword = CredentialEncryptor.encrypt(password);
+      log.info("Admin credentials updated for sync service (password encrypted)");
     }
-    log.info("Admin credentials updated for sync service");
   }
 
   /**
    * Get the current admin auth string (username:password).
+   * Decrypts the password if it was stored encrypted.
    */
   private String getAdminAuth() {
-    return adminUsername + ":" + adminPassword;
+    String password = adminPassword;
+    if (CredentialEncryptor.isEncrypted(password)) {
+      password = CredentialEncryptor.decrypt(password);
+    }
+    return adminUsername + ":" + password;
   }
 
   /**
@@ -462,7 +473,10 @@ public class SyncService {
           else {
             log.info("MD5 differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
                 remoteMd5, localMd5, assetPath);
-            syncAssetViaContentFacet(repo, assetPath, repoAuth);
+            // Use retry for sync operations
+            RetryableOperation.executeRun("sync asset " + assetPath,
+                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
+                SYNC_RETRY_ATTEMPTS);
             detail.setStatus("success");
           }
         }

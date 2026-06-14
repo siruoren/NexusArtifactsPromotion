@@ -45,6 +45,7 @@ import com.nexus.artifacts.promotion.model.DockerImageRequest;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
+import com.nexus.artifacts.promotion.security.CredentialEncryptor;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 /**
@@ -76,6 +77,9 @@ public class DockerService {
 
   /** Buffer size for streaming */
   private static final int BUFFER_SIZE = 8192;
+
+  /** Maximum retry attempts for individual blob/manifest operations */
+  private static final int DOCKER_RETRY_ATTEMPTS = 3;
 
   /** Nexus local base URL for internal API calls */
   private static final String LOCAL_NEXUS_BASE = "http://localhost:8081";
@@ -112,18 +116,23 @@ public class DockerService {
 
   /**
    * Update admin credentials from capability configuration.
+   * Credentials are stored in encrypted form for security.
    */
   public void updateAdminCredentials(final String username, final String password) {
     if (username != null && !username.isEmpty()) {
       this.adminUsername = username;
     }
     if (password != null && !password.isEmpty()) {
-      this.adminPassword = password;
+      this.adminPassword = CredentialEncryptor.encrypt(password);
     }
   }
 
   private String getAdminAuth() {
-    return adminUsername + ":" + adminPassword;
+    String password = adminPassword;
+    if (CredentialEncryptor.isEncrypted(password)) {
+      password = CredentialEncryptor.decrypt(password);
+    }
+    return adminUsername + ":" + password;
   }
 
   // ==================== Docker Image Listing ====================
@@ -438,6 +447,32 @@ public class DockerService {
       return item;
     }
 
+    // Use retry for blob transfer
+    try {
+      return RetryableOperation.execute("promote blob " + blobPath,
+          () -> doPromoteBlobTransfer(sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5),
+          DOCKER_RETRY_ATTEMPTS);
+    }
+    catch (Exception e) {
+      if (e instanceof IOException) {
+        throw (IOException) e;
+      }
+      throw new IOException("Blob promotion failed after retries: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Perform the actual blob transfer (download + upload) for Docker promotion.
+   * Separated from promoteDockerBlob to enable retry.
+   * Uses Transfer-Encoding: chunked for large blob streaming.
+   */
+  private PromotionTaskResult.FileItem doPromoteBlobTransfer(
+      final String sourceRepo, final String targetRepo,
+      final String blobPath,
+      final String cookieHeader, final String csrfToken,
+      final String nexusBaseUrl,
+      final String sourceMd5, final String targetMd5) throws IOException
+  {
     // Download from source, upload to target
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + blobPath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
@@ -453,7 +488,7 @@ public class DockerService {
       throw new IOException("Download blob failed: HTTP " + responseCode + " - " + error);
     }
 
-    // Upload to target
+    // Upload to target — use chunked streaming for large Docker blobs
     URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + blobPath);
     HttpURLConnection uploadConn = (HttpURLConnection) targetUrl.openConnection();
     uploadConn.setRequestMethod("PUT");
@@ -461,6 +496,8 @@ public class DockerService {
     uploadConn.setConnectTimeout(TIMEOUT_MS);
     uploadConn.setReadTimeout(TIMEOUT_MS);
     setAuthHeaders(uploadConn, cookieHeader, csrfToken);
+    // Enable chunked streaming with 64KB chunks — critical for large Docker blobs (GBs)
+    uploadConn.setChunkedStreamingMode(64 * 1024);
 
     try (InputStream input = downloadConn.getInputStream();
          OutputStream output = uploadConn.getOutputStream()) {
@@ -493,6 +530,28 @@ public class DockerService {
    * Upload a Docker manifest to target repository.
    */
   private PromotionTaskResult.FileItem uploadDockerManifest(
+      final String targetRepo, final String manifestPath,
+      final String manifestContent,
+      final String cookieHeader, final String csrfToken,
+      final String nexusBaseUrl) throws IOException
+  {
+    try {
+      return RetryableOperation.execute("upload manifest " + manifestPath,
+          () -> doUploadManifest(targetRepo, manifestPath, manifestContent, cookieHeader, csrfToken, nexusBaseUrl),
+          DOCKER_RETRY_ATTEMPTS);
+    }
+    catch (Exception e) {
+      if (e instanceof IOException) {
+        throw (IOException) e;
+      }
+      throw new IOException("Manifest upload failed after retries: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Perform the actual manifest upload. Separated for retry support.
+   */
+  private PromotionTaskResult.FileItem doUploadManifest(
       final String targetRepo, final String manifestPath,
       final String manifestContent,
       final String cookieHeader, final String csrfToken,
@@ -824,6 +883,24 @@ public class DockerService {
             tags = parseDockerTagsList(json);
             log.info("Found {} tags for image {} via Docker Registry API", tags.size(), imageName);
             return tags;
+          }
+          else if (code == 401) {
+            log.warn("Docker Registry API returned 401 Unauthorized for image {} — check authentication config", imageName);
+          }
+          else if (code == 404) {
+            log.info("Docker Registry API returned 404 for image {} — image may not exist on remote", imageName);
+          }
+          else if (RetryableOperation.isRetryableHttpCode(code)) {
+            log.warn("Docker Registry API returned retryable HTTP {} for image {}, will retry", code, imageName);
+            try {
+              String errorBody = readErrorResponse(conn);
+              log.debug("Docker Registry API error response: {}", errorBody);
+            }
+            catch (Exception ignored) {}
+            // Retry via RetryableOperation at the caller level
+          }
+          else {
+            log.warn("Docker Registry API returned HTTP {} for image {}: {}", code, imageName, readErrorResponse(conn));
           }
           conn.disconnect();
         }

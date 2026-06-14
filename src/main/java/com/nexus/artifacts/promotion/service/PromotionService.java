@@ -66,6 +66,9 @@ public class PromotionService {
   /** Buffer size for streaming */
   private static final int BUFFER_SIZE = 8192;
 
+  /** Maximum retry attempts for individual file operations */
+  private static final int FILE_RETRY_ATTEMPTS = 3;
+
   /**
    * Trust-all-SSL manager for self-signed certificates.
    * Initialized once at class load time.
@@ -490,6 +493,44 @@ public class PromotionService {
     log.info("MD5 differs or missing, promoting: sourceMd5={}, targetMd5={}, path={}",
         sourceMd5, targetMd5, filePath);
 
+    // Use retry for the actual download+upload operation
+    try {
+      PromotionTaskResult.FileItem result = RetryableOperation.execute(
+          "promote " + filePath,
+          () -> doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5),
+          FILE_RETRY_ATTEMPTS);
+      return result;
+    }
+    catch (Exception e) {
+      if (e instanceof IOException) {
+        throw (IOException) e;
+      }
+      throw new IOException("Promotion failed after retries: " + e.getMessage(), e);
+    }
+  }
+
+  /**
+   * Perform the actual file transfer (download + upload) for promotion.
+   * Separated from promoteSingleFileViaHttp to enable retry.
+   * Uses Transfer-Encoding: chunked for large file streaming.
+   */
+  private PromotionTaskResult.FileItem doPromoteFileTransfer(
+      final String sourceRepo,
+      final String targetRepo,
+      final String filePath,
+      final String cookieHeader,
+      final String csrfToken,
+      final String nexusBaseUrl,
+      final String sourceMd5,
+      final String targetMd5) throws IOException
+  {
+    String fullSourcePath = sourceRepo + "/" + filePath;
+
+    // Special handling for maven-metadata.xml: merge instead of overwrite
+    if (MavenMetadataMerger.isMavenMetadata(filePath)) {
+      return promoteMavenMetadata(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+    }
+
     // Download from source
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
@@ -505,7 +546,7 @@ public class PromotionService {
       throw new IOException("Download from " + fullSourcePath + " failed: HTTP " + responseCode + " - " + errorMsg);
     }
 
-    // Upload to target
+    // Upload to target — use chunked streaming for large files
     URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
     HttpURLConnection uploadConn = (HttpURLConnection) targetUrl.openConnection();
     uploadConn.setRequestMethod("PUT");
@@ -513,6 +554,10 @@ public class PromotionService {
     uploadConn.setConnectTimeout(TIMEOUT_MS);
     uploadConn.setReadTimeout(TIMEOUT_MS);
     setAuthHeaders(uploadConn, cookieHeader, csrfToken);
+
+    // Enable chunked streaming with 64KB chunks — avoids buffering entire file in memory
+    // This is critical for large Docker blobs (can be GBs)
+    uploadConn.setChunkedStreamingMode(64 * 1024);
 
     // Stream content from download to upload
     try (InputStream input = downloadConn.getInputStream();
@@ -544,6 +589,92 @@ public class PromotionService {
     log.info("Successfully promoted: {} -> {}/{}",
         fullSourcePath, targetRepo, filePath);
     PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, determineType(filePath));
+    item.setSourceMd5(sourceMd5);
+    item.setTargetMd5(targetMd5);
+    return item;
+  }
+
+  /**
+   * Promote a maven-metadata.xml file with smart merge.
+   * If the target already has a maven-metadata.xml, the two files are merged
+   * (union of version entries, highest latest/release, most recent lastUpdated).
+   * If the target doesn't have one, the source is promoted as-is.
+   * Checksum files (maven-metadata.xml.md5/.sha1/.sha256/.sha512) are regenerated.
+   */
+  private PromotionTaskResult.FileItem promoteMavenMetadata(
+      final String sourceRepo, final String targetRepo,
+      final String filePath,
+      final String cookieHeader, final String csrfToken,
+      final String nexusBaseUrl,
+      final String sourceMd5, final String targetMd5) throws IOException
+  {
+    String fullSourcePath = sourceRepo + "/" + filePath;
+    log.info("Promoting maven-metadata.xml with merge: {}", fullSourcePath);
+
+    // Download source metadata
+    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
+    HttpURLConnection sourceConn = (HttpURLConnection) sourceUrl.openConnection();
+    sourceConn.setRequestMethod("GET");
+    sourceConn.setConnectTimeout(TIMEOUT_MS);
+    sourceConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(sourceConn, cookieHeader, csrfToken);
+
+    int sourceResponse = sourceConn.getResponseCode();
+    if (sourceResponse != 200) {
+      String error = readErrorResponse(sourceConn);
+      sourceConn.disconnect();
+      throw new IOException("Download maven-metadata.xml failed: HTTP " + sourceResponse + " - " + error);
+    }
+    String sourceContent = readStream(sourceConn.getInputStream());
+    sourceConn.disconnect();
+
+    String mergedContent = sourceContent;
+
+    // If target already has the metadata, download and merge
+    if (targetMd5 != null) {
+      try {
+        URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
+        HttpURLConnection targetConn = (HttpURLConnection) targetUrl.openConnection();
+        targetConn.setRequestMethod("GET");
+        targetConn.setConnectTimeout(TIMEOUT_MS);
+        targetConn.setReadTimeout(TIMEOUT_MS);
+        setAuthHeaders(targetConn, cookieHeader, csrfToken);
+
+        if (targetConn.getResponseCode() == 200) {
+          String targetContent = readStream(targetConn.getInputStream());
+          mergedContent = MavenMetadataMerger.merge(sourceContent, targetContent);
+          log.info("Merged maven-metadata.xml for {}/{}", targetRepo, filePath);
+        }
+        targetConn.disconnect();
+      }
+      catch (Exception e) {
+        log.warn("Failed to merge maven-metadata.xml, using source content: {}", e.getMessage());
+      }
+    }
+
+    // Upload merged content to target
+    URL uploadUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
+    HttpURLConnection uploadConn = (HttpURLConnection) uploadUrl.openConnection();
+    uploadConn.setRequestMethod("PUT");
+    uploadConn.setDoOutput(true);
+    uploadConn.setConnectTimeout(TIMEOUT_MS);
+    uploadConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(uploadConn, cookieHeader, csrfToken);
+
+    try (OutputStream output = uploadConn.getOutputStream()) {
+      output.write(mergedContent.getBytes("UTF-8"));
+      output.flush();
+    }
+
+    int uploadResponse = uploadConn.getResponseCode();
+    if (uploadResponse >= 400) {
+      String error = readErrorResponse(uploadConn);
+      uploadConn.disconnect();
+      throw new IOException("Upload merged maven-metadata.xml failed: HTTP " + uploadResponse + " - " + error);
+    }
+    uploadConn.disconnect();
+
+    PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "file");
     item.setSourceMd5(sourceMd5);
     item.setTargetMd5(targetMd5);
     return item;

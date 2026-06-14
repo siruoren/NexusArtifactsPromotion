@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.0.0-SNAPSHOT] - 2026-06-13
+## [1.0.0-SNAPSHOT] - 2026-06-14
 
 ### Added
 
@@ -12,6 +12,9 @@ All notable changes to this project will be documented in this file.
   - Permission control: requires write permission on target repository
   - Async execution with real-time progress polling
   - File preview before promotion
+  - **Retry with exponential backoff**: failed file transfers automatically retry up to 3 times with 1s/2s/4s delays
+  - **Chunked streaming transfer**: uses Transfer-Encoding: chunked (64KB chunks) for large file uploads, avoids OOM
+  - **Maven metadata smart merge**: maven-metadata.xml files are merged instead of overwritten, preserving all version entries
 - **Proxy Repository Sync**: sync remote proxy repositories using Nexus ContentFacet API
   - Support single file, directory and full repository sync
   - MD5 incremental sync: compare remote/local MD5, skip unchanged assets
@@ -20,12 +23,15 @@ All notable changes to this project will be documented in this file.
   - Delete local cache before sync to force fresh download from remote
   - Permission control: requires delete permission on proxy repository
   - Async execution with queue management and progress tracking
+  - **Retry with exponential backoff**: failed asset sync operations automatically retry up to 2 times
 - **Docker Image Promotion**: efficient Docker image promotion between repositories
   - Parse Docker manifest to identify all referenced blobs (config + layers)
   - Only promote blobs actually needed by the manifest (not all blobs in repo)
   - Support promoting all tags or specific tags of an image
   - MD5 incremental check for blobs: skip unchanged layers automatically
   - Manifest-aware: promote manifest after all blobs are transferred
+  - **Retry with exponential backoff**: blob and manifest transfers retry up to 3 times
+  - **Chunked streaming**: large Docker blobs use chunked upload (64KB chunks) to avoid OOM
 - **Docker Proxy Sync**: efficient Docker image sync from proxy repositories
   - Parse manifest to determine blob dependencies before syncing
   - Sync only referenced blobs instead of blindly syncing all files
@@ -43,6 +49,15 @@ All notable changes to this project will be documented in this file.
   - Tag selection grid with checkboxes (select specific tags or all)
   - Progress polling during Docker promote/sync
   - Docker-specific button text on asset/folder panels
+  - **Docker Registry API v2 error handling**: detailed error parsing for 401/404/429/5xx, retry on transient failures
+- **Credential Encryption**: admin credentials stored with AES-256-GCM encryption
+  - Passwords encrypted with ENC: prefix before storage in memory
+  - Derived key via PBKDF2 with instance-specific passphrase
+  - Automatic decrypt-on-use, backward compatible with plaintext passwords
+- **Task State Persistence**: async task results survive Nexus restarts
+  - TaskStateStore persists completed/failed task states to disk as JSON
+  - Automatic loading of persisted states on startup
+  - TTL-based cleanup of expired task state files
 - **Scheduled Task Template**: `Proxy Repository Scheduled Sync`
   - Register as Nexus system task template (System → Tasks)
   - Support specifying proxy repository name and sync directory path
