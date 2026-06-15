@@ -243,7 +243,7 @@ public class PromotionService {
             promotedItems = promoteDirectoryViaHttp(
                 request.getSourceRepository(), request.getTargetRepository(),
                 request.getPath(), cookieHeader, csrfToken, result, nexusBaseUrl,
-                request.getFiles());
+                request.getFiles(), request.getFormat());
           } else {
             promotedItems = promoteFileViaHttp(
                 request.getSourceRepository(), request.getTargetRepository(),
@@ -350,7 +350,8 @@ public class PromotionService {
       final String csrfToken,
       final PromotionTaskResult taskResult,
       final String nexusBaseUrl,
-      final List<String> providedFiles) throws IOException
+      final List<String> providedFiles,
+      final String format) throws IOException
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
 
@@ -401,6 +402,22 @@ public class PromotionService {
       if (assetNames.isEmpty()) {
         throw new IOException("No files found under directory '" + directoryPath +
             "' in repository " + sourceRepo + ". Cannot promote an empty directory.");
+      }
+
+      // For Docker format: sort to ensure blobs are promoted before manifests
+      // Docker registries require all referenced blobs to exist before a manifest can be pushed
+      if ("docker".equalsIgnoreCase(format)) {
+        assetNames.sort((a, b) -> {
+          boolean aBlob = a.contains("/blobs/");
+          boolean bBlob = b.contains("/blobs/");
+          boolean aManifest = a.contains("/manifests/");
+          boolean bManifest = b.contains("/manifests/");
+          // Blobs first, then manifests, then other
+          int aOrder = aBlob ? 0 : (aManifest ? 2 : 1);
+          int bOrder = bBlob ? 0 : (bManifest ? 2 : 1);
+          return Integer.compare(aOrder, bOrder);
+        });
+        log.info("Docker promotion: sorted files to push blobs before manifests");
       }
 
       int total = assetNames.size();
@@ -1277,8 +1294,7 @@ public class PromotionService {
           cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
     }
     else if (blobsIdx >= 0) {
-      return promoteDockerBlob(sourceRepo, targetRepo, pathWithoutV2, blobsIdx,
-          cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+      return promoteDockerBlob(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
     }
     else {
       throw new IOException("Unknown Docker asset path format: " + filePath);
@@ -1287,7 +1303,8 @@ public class PromotionService {
 
   /**
    * Promote a Docker manifest using Docker v2 API.
-   * Downloads the manifest from source, then pushes it to target via PUT /v2/<name>/manifests/<tag>.
+   * Downloads the manifest from source, parses referenced blobs and pushes them first,
+   * then pushes the manifest to target via PUT /v2/<name>/manifests/<tag>.
    */
   private PromotionTaskResult.FileItem promoteDockerManifest(
       final String sourceRepo,
@@ -1340,7 +1357,25 @@ public class PromotionService {
       downloadConn.disconnect();
     }
 
-    // Step 2: Push manifest to target via Docker v2 API
+    // Step 2: Parse manifest to find referenced blobs and push them first
+    // Docker registries require all referenced blobs to exist before accepting a manifest
+    String manifestJson = new String(manifestBytes, "UTF-8");
+    List<String> blobDigests = extractDockerBlobDigests(manifestJson, contentType);
+
+    for (String blobDigest : blobDigests) {
+      String blobPath = "v2/" + imageName + "/blobs/" + blobDigest;
+      log.info("Pre-pushing Docker blob for manifest {}: {}", filePath, blobDigest);
+      try {
+        promoteDockerBlob(sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl, null, null);
+      }
+      catch (IOException e) {
+        // Blob might already exist, or push might fail - log but continue
+        // The manifest push will fail with BLOB_UNKNOWN if a blob is truly missing
+        log.warn("Failed to pre-push blob {} for manifest {}: {}", blobDigest, filePath, e.getMessage());
+      }
+    }
+
+    // Step 3: Push manifest to target via Docker v2 API
     URL pushUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/manifests/" + tag);
     HttpURLConnection pushConn = (HttpURLConnection) pushUrl.openConnection();
     pushConn.setRequestMethod("PUT");
@@ -1380,21 +1415,26 @@ public class PromotionService {
   /**
    * Promote a Docker blob using Docker v2 API.
    * Downloads the blob from source, then pushes it to target via the blob upload process.
+   * @param filePath full path including "v2/" prefix, e.g. "v2/myapp/blobs/sha256:abc"
    */
   private PromotionTaskResult.FileItem promoteDockerBlob(
       final String sourceRepo,
       final String targetRepo,
-      final String pathWithoutV2,
-      final int blobsIdx,
+      final String filePath,
       final String cookieHeader,
       final String csrfToken,
       final String nexusBaseUrl,
       final String sourceMd5,
       final String targetMd5) throws IOException
   {
+    // Parse path: v2/<image>/blobs/<digest>
+    String pathWithoutV2 = filePath.startsWith("v2/") ? filePath.substring(3) : filePath;
+    int blobsIdx = pathWithoutV2.indexOf("/blobs/");
+    if (blobsIdx < 0) {
+      throw new IOException("Invalid Docker blob path: " + filePath);
+    }
     String imageName = pathWithoutV2.substring(0, blobsIdx);
     String digest = pathWithoutV2.substring(blobsIdx + "/blobs/".length());
-    String filePath = "v2/" + pathWithoutV2;
 
     // Step 1: Initiate blob upload - POST /v2/<name>/blobs/uploads/
     URL initUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/blobs/uploads/");
@@ -1500,8 +1540,133 @@ public class PromotionService {
   }
 
   /**
-   * Read all bytes from an InputStream.
+   * Extract blob digests referenced by a Docker manifest.
+   * Supports Docker v2 manifest, manifest list, and OCI manifest formats.
    */
+  private List<String> extractDockerBlobDigests(final String manifestJson, final String contentType) {
+    List<String> digests = new ArrayList<>();
+    if (manifestJson == null || manifestJson.isEmpty()) return digests;
+
+    // Extract config digest
+    String configDigest = extractJsonKeyValue(manifestJson, "config", "digest");
+    if (configDigest != null && !configDigest.isEmpty()) {
+      digests.add(configDigest);
+    }
+
+    // Extract layer digests from "layers" array
+    extractArrayValues(manifestJson, "layers", "digest", digests);
+
+    // For manifest list (fat manifest), extract manifests array
+    if (contentType != null && contentType.contains("manifest.list")) {
+      extractArrayValues(manifestJson, "manifests", "digest", digests);
+    }
+
+    // Also try "fsLayers" for v1 manifests
+    extractArrayValues(manifestJson, "fsLayers", "blobSum", digests);
+
+    log.debug("Extracted {} blob digests from manifest (contentType={})", digests.size(), contentType);
+    return digests;
+  }
+
+  /**
+   * Extract values from a JSON array of objects.
+   * e.g., from {"layers": [{"digest": "sha256:abc"}, {"digest": "sha256:def"}]}
+   * extracts ["sha256:abc", "sha256:def"]
+   */
+  private void extractArrayValues(final String json, final String arrayKey, final String valueKey,
+      final List<String> results) {
+    // Find the array: "arrayKey" : [
+    String arrayPattern = "\"" + arrayKey + "\"";
+    int arrayIdx = json.indexOf(arrayPattern);
+    if (arrayIdx < 0) return;
+
+    // Find the opening bracket
+    int openBracket = json.indexOf('[', arrayIdx);
+    if (openBracket < 0) return;
+
+    // Find matching closing bracket
+    int depth = 1;
+    int closeBracket = openBracket + 1;
+    while (closeBracket < json.length() && depth > 0) {
+      char c = json.charAt(closeBracket);
+      if (c == '[') depth++;
+      else if (c == ']') depth--;
+      closeBracket++;
+    }
+
+    String arrayContent = json.substring(openBracket, closeBracket);
+
+    // Find all occurrences of "valueKey" : "value"
+    String valuePattern = "\"" + valueKey + "\"";
+    int searchIdx = 0;
+    while (searchIdx < arrayContent.length()) {
+      int valueIdx = arrayContent.indexOf(valuePattern, searchIdx);
+      if (valueIdx < 0) break;
+
+      // Find the colon after the key
+      int colonIdx = arrayContent.indexOf(':', valueIdx + valuePattern.length());
+      if (colonIdx < 0) break;
+
+      // Find the opening quote of the value
+      int openQuote = arrayContent.indexOf('"', colonIdx + 1);
+      if (openQuote < 0) break;
+
+      // Find the closing quote
+      int closeQuote = arrayContent.indexOf('"', openQuote + 1);
+      if (closeQuote < 0) break;
+
+      String value = arrayContent.substring(openQuote + 1, closeQuote);
+      if (!value.isEmpty()) {
+        results.add(value);
+      }
+
+      searchIdx = closeQuote + 1;
+    }
+  }
+
+  /**
+   * Extract a value from a nested JSON object by finding the parent key and then the child key.
+   * e.g., extractJsonKeyValue(json, "config", "digest") finds "config":{"digest":"sha256:abc"}
+   * and returns "sha256:abc"
+   */
+  private String extractJsonKeyValue(final String json, final String parentKey, final String childKey) {
+    String parentPattern = "\"" + parentKey + "\"";
+    int parentIdx = json.indexOf(parentPattern);
+    if (parentIdx < 0) return null;
+
+    // Find the opening brace of the parent object
+    int openBrace = json.indexOf('{', parentIdx + parentPattern.length());
+    if (openBrace < 0) return null;
+
+    // Find matching closing brace
+    int depth = 1;
+    int closeBrace = openBrace + 1;
+    while (closeBrace < json.length() && depth > 0) {
+      char c = json.charAt(closeBrace);
+      if (c == '{') depth++;
+      else if (c == '}') depth--;
+      closeBrace++;
+    }
+
+    String parentContent = json.substring(openBrace, closeBrace);
+
+    // Find the child key within the parent object
+    String childPattern = "\"" + childKey + "\"";
+    int childIdx = parentContent.indexOf(childPattern);
+    if (childIdx < 0) return null;
+
+    int colonIdx = parentContent.indexOf(':', childIdx + childPattern.length());
+    if (colonIdx < 0) return null;
+
+    int openQuote = parentContent.indexOf('"', colonIdx + 1);
+    if (openQuote < 0) return null;
+
+    int closeQuote = parentContent.indexOf('"', openQuote + 1);
+    if (closeQuote < 0) return null;
+
+    return parentContent.substring(openQuote + 1, closeQuote);
+  }
+
   private byte[] readAllBytes(final InputStream input) throws IOException {
     byte[] buffer = new byte[8192];
     java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
