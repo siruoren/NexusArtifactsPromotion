@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.0.0-SNAPSHOT] - 2026-06-14
+## [1.0.0-SNAPSHOT] - 2026-06-15
 
 ### Added
 
@@ -15,6 +15,7 @@ All notable changes to this project will be documented in this file.
   - **Retry with exponential backoff**: failed file transfers automatically retry up to 3 times with 1s/2s/4s delays
   - **Chunked streaming transfer**: uses Transfer-Encoding: chunked (64KB chunks) for large file uploads, avoids OOM
   - **Maven metadata smart merge**: maven-metadata.xml files are merged instead of overwritten, preserving all version entries
+  - **Pagination for file list**: promotion dialog file list now supports pagination with 10 items per page
 - **Proxy Repository Sync**: sync remote proxy repositories using Nexus ContentFacet API
   - Support single file, directory and full repository sync
   - MD5 incremental sync: compare remote/local MD5, skip unchanged assets
@@ -83,11 +84,20 @@ All notable changes to this project will be documented in this file.
   - Real-time progress window with polling
   - i18n support (English & Chinese)
   - Permission-aware: disable buttons when user lacks required permissions
+- **Sync Queue Page**: dedicated page for monitoring sync tasks
+  - Visible to all authenticated users (no admin restriction)
+  - Left sidebar menu entry, visible after login
+  - **Filter toolbar**: filter by repository, path, status, and username
+  - **Pagination**: 20 items per page with paging toolbar
+  - **Status display**: Failed / Running / Cancelled / Completed
+  - **Cell tooltips**: hover over any cell to see full content
+  - Auto-refresh every 3 seconds while active tasks exist
 - **Capability Configuration**:
   - `Promotion Capability`: configurable thread pool size
-  - `Sync Capability`: configurable thread pool size and admin credentials
+  - `Sync Capability`: configurable thread pool size, max sync queue size, **max sync queue records** (default: 200), and admin credentials
 - **Security**: Shiro-based permission integration
   - Promotion: requires `repository-view:edit` on target repository
   - Sync: requires `repository-view:delete` on proxy repository
+  - Sync Queue: requires authentication only (no admin role needed)
 - **Self-signed HTTPS support**: trust all SSL certificates for promotion HTTP calls
 - **Reverse proxy support**: extract base URL from `X-Forwarded-*` headers
