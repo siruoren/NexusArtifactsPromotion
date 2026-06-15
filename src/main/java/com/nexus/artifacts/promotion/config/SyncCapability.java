@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.capability.CapabilitySupport;
 
+import com.nexus.artifacts.promotion.service.DockerService;
 import com.nexus.artifacts.promotion.service.SyncService;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
@@ -27,11 +28,13 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
 
   private final TaskExecutorService taskExecutor;
   private final SyncService syncService;
+  private final DockerService dockerService;
 
   @Inject
-  public SyncCapability(final TaskExecutorService taskExecutor, final SyncService syncService) {
+  public SyncCapability(final TaskExecutorService taskExecutor, final SyncService syncService, final DockerService dockerService) {
     this.taskExecutor = taskExecutor;
     this.syncService = syncService;
+    this.dockerService = dockerService;
   }
 
   @Override
@@ -83,6 +86,17 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
     if (adminUser != null || adminPass != null) {
       syncService.updateAdminCredentials(adminUser, adminPass);
       log.info("Admin credentials updated from capability configuration");
+    }
+
+    // Update Docker release repositories configuration
+    String dockerReleaseRepos = props.get(PROP_DOCKER_RELEASE_REPOS);
+    if (dockerReleaseRepos != null && !dockerReleaseRepos.trim().isEmpty()) {
+      dockerService.updateDockerReleaseRepos(dockerReleaseRepos.trim());
+      log.info("Docker release repositories set to: {}", dockerReleaseRepos.trim());
+    }
+    else {
+      dockerService.updateDockerReleaseRepos("");
+      log.info("Docker release repositories cleared");
     }
 
     log.info("Sync capability activated");

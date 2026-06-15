@@ -176,6 +176,26 @@ public class DockerService {
   private volatile String adminUsername = DEFAULT_ADMIN_USERNAME;
   private volatile String adminPassword = DEFAULT_ADMIN_PASSWORD;
 
+  /** Set of Docker repository names configured as release repositories */
+  private volatile Set<String> dockerReleaseRepos = new HashSet<>();
+
+  /**
+   * Patterns that indicate a development/snapshot tag (not a release tag).
+   * Tags matching these patterns will be filtered out when promoting to a release repository.
+   */
+  private static final String[] SNAPSHOT_TAG_PATTERNS = {
+      "SNAPSHOT", "snapshot",
+      "-dev", "-DEV", "-Dev",
+      "-alpha", "-ALPHA", "-Alpha",
+      "-beta", "-BETA", "-Beta",
+      "-rc", "-RC", "-Rc",
+      "-pre", "-PRE", "-Pre",
+      "-test", "-TEST", "-Test",
+      "-canary", "-CANARY",
+      "-nightly", "-NIGHTLY",
+      "-latest", "-LATEST"
+  };
+
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
   private final TaskCacheManager cacheManager;
@@ -210,6 +230,46 @@ public class DockerService {
     if (password != null && !password.isEmpty()) {
       this.adminPassword = CredentialEncryptor.encrypt(password);
     }
+  }
+
+  /**
+   * Update Docker release repositories from capability configuration.
+   * @param repos Comma-separated list of repository names
+   */
+  public void updateDockerReleaseRepos(final String repos) {
+    Set<String> newRepos = new HashSet<>();
+    if (repos != null && !repos.trim().isEmpty()) {
+      String[] parts = repos.split(",");
+      for (String part : parts) {
+        String trimmed = part.trim();
+        if (!trimmed.isEmpty()) {
+          newRepos.add(trimmed);
+        }
+      }
+    }
+    this.dockerReleaseRepos = newRepos;
+    log.info("Docker release repositories updated: {}", newRepos);
+  }
+
+  /**
+   * Check if a Docker repository is configured as a release repository.
+   */
+  public boolean isDockerReleaseRepo(final String repoName) {
+    return dockerReleaseRepos.contains(repoName);
+  }
+
+  /**
+   * Check if a Docker tag is a release tag (not a snapshot/dev tag).
+   * A tag is considered a release tag if it does NOT match any snapshot patterns.
+   */
+  public boolean isReleaseTag(final String tag) {
+    if (tag == null || tag.isEmpty()) return false;
+    for (String pattern : SNAPSHOT_TAG_PATTERNS) {
+      if (tag.contains(pattern)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private String getAdminAuth() {
@@ -249,11 +309,49 @@ public class DockerService {
       }
     }
     catch (Exception e) {
-      log.debug("Internal API listing failed for Docker images in {}, falling back to REST API: {}",
+      log.debug("Internal API listing failed for Docker images in {}, falling back: {}",
           repositoryName, e.getMessage());
     }
 
-    // Strategy 2: Fall back to REST API
+    // Strategy 2: Try local Nexus REST API
+    try {
+      Map<String, DockerImageInfo> localApiImages = listDockerImagesViaLocalApi(repositoryName);
+      if (!localApiImages.isEmpty()) {
+        response.setImages(new ArrayList<>(localApiImages.values()));
+        response.setTotalCount(localApiImages.size());
+        return response;
+      }
+    }
+    catch (Exception e) {
+      log.debug("Local REST API listing failed for Docker images in {}, falling back: {}",
+          repositoryName, e.getMessage());
+    }
+
+    // Strategy 3: For proxy repos, try remote Nexus Search API
+    if ("proxy".equals(repo.getType().getValue())) {
+      try {
+        Map<String, DockerImageInfo> remoteImages = listDockerImagesViaRemoteApi(repo);
+        if (!remoteImages.isEmpty()) {
+          response.setImages(new ArrayList<>(remoteImages.values()));
+          response.setTotalCount(remoteImages.size());
+          return response;
+        }
+      }
+      catch (Exception e) {
+        log.info("Remote Nexus API listing failed for Docker images in {}: {}", repositoryName, e.getMessage());
+      }
+    }
+
+    response.setImages(new ArrayList<>(imageMap.values()));
+    response.setTotalCount(imageMap.size());
+    return response;
+  }
+
+  /**
+   * List Docker images via local Nexus REST API (Components API).
+   */
+  private Map<String, DockerImageInfo> listDockerImagesViaLocalApi(final String repositoryName) {
+    Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
     try {
       String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
@@ -272,8 +370,9 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
         conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
 
-        if (conn.getResponseCode() != 200) {
-          log.warn("Components API returned HTTP {} for {}", conn.getResponseCode(), url);
+        int code = conn.getResponseCode();
+        if (code != 200) {
+          log.info("Local Components API returned HTTP {} for {}", code, url);
           conn.disconnect();
           break;
         }
@@ -285,12 +384,187 @@ public class DockerService {
       while (continuationToken != null && !continuationToken.isEmpty());
     }
     catch (Exception e) {
-      log.error("Failed to list Docker images: {}", e.getMessage(), e);
+      log.info("Local REST API listing failed for Docker images: {}", e.getMessage());
     }
+    return imageMap;
+  }
 
-    response.setImages(new ArrayList<>(imageMap.values()));
-    response.setTotalCount(imageMap.size());
-    return response;
+  /**
+   * List Docker images from a remote Nexus instance via Search API.
+   * This works for proxy repositories whose remote is another Nexus instance.
+   */
+  private Map<String, DockerImageInfo> listDockerImagesViaRemoteApi(final Repository repo) {
+    Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null || config.getAttributes() == null || !config.getAttributes().containsKey("proxy")) {
+        return imageMap;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return imageMap;
+
+      // Extract base URL and repo name from remote URL
+      int repoIdx = remoteUrl.indexOf("/repository/");
+      if (repoIdx <= 0) return imageMap;
+
+      String remoteBaseUrl = remoteUrl.substring(0, repoIdx);
+      String repoPart = remoteUrl.substring(repoIdx + "/repository/".length());
+      if (repoPart.endsWith("/")) repoPart = repoPart.substring(0, repoPart.length() - 1);
+      int slashIdx = repoPart.indexOf('/');
+      String remoteRepoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+
+      log.info("Trying remote Nexus API for Docker images: baseUrl={}, repo={}, auth={}",
+          remoteBaseUrl, remoteRepoName, effectiveAuth != null ? "yes" : "none");
+
+      // Use Search API with docker format filter
+      String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName
+          + "&format=docker";
+      String continuationToken = null;
+
+      do {
+        String searchUrl = searchUrlBase;
+        if (continuationToken != null) {
+          searchUrl += "&continuationToken=" + continuationToken;
+        }
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        log.info("Remote Nexus Search API response: HTTP {} for Docker images", code);
+
+        if (code != 200) {
+          conn.disconnect();
+          // Try Components API as fallback
+          return listDockerImagesViaRemoteComponentsApi(remoteBaseUrl, remoteRepoName, effectiveAuth);
+        }
+
+        String json = readResponse(conn);
+        parseDockerSearchApiAssets(json, imageMap);
+        continuationToken = extractJsonValue(json, "continuationToken");
+      }
+      while (continuationToken != null && !continuationToken.isEmpty());
+
+      log.info("Remote Nexus Search API found {} Docker images", imageMap.size());
+
+      // If Search API found nothing, try Components API
+      if (imageMap.isEmpty()) {
+        return listDockerImagesViaRemoteComponentsApi(remoteBaseUrl, remoteRepoName, effectiveAuth);
+      }
+    }
+    catch (Exception e) {
+      log.info("Remote Nexus API failed for Docker images: {}", e.getMessage());
+    }
+    return imageMap;
+  }
+
+  /**
+   * List Docker images via remote Nexus Components API.
+   */
+  private Map<String, DockerImageInfo> listDockerImagesViaRemoteComponentsApi(
+      final String remoteBaseUrl, final String remoteRepoName, final String effectiveAuth) {
+    Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
+    try {
+      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName;
+      String continuationToken = null;
+
+      do {
+        String compUrl = compUrlBase;
+        if (continuationToken != null) {
+          compUrl += "&continuationToken=" + continuationToken;
+        }
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        log.info("Remote Nexus Components API response: HTTP {} for Docker images", code);
+        if (code != 200) {
+          conn.disconnect();
+          break;
+        }
+
+        String json = readResponse(conn);
+        parseDockerComponents(json, imageMap);
+        continuationToken = extractJsonValue(json, "continuationToken");
+      }
+      while (continuationToken != null && !continuationToken.isEmpty());
+
+      log.info("Remote Nexus Components API found {} Docker images", imageMap.size());
+    }
+    catch (Exception e) {
+      log.info("Remote Nexus Components API failed for Docker images: {}", e.getMessage());
+    }
+    return imageMap;
+  }
+
+  /**
+   * Parse Docker images from Nexus Search API (assets) response.
+   * Docker assets follow pattern: v2/<image>/manifests/<tag>
+   */
+  private void parseDockerSearchApiAssets(final String json, final Map<String, DockerImageInfo> imageMap) {
+    try {
+      String itemsSection = extractJsonArray(json, "items");
+      if (itemsSection == null) return;
+
+      int pos = 0;
+      while (pos < itemsSection.length()) {
+        int objStart = itemsSection.indexOf('{', pos);
+        if (objStart < 0) break;
+        int objEnd = findMatchingBrace(itemsSection, objStart);
+        if (objEnd < 0) break;
+
+        String item = itemsSection.substring(objStart, objEnd + 1);
+        String path = extractJsonValue(item, "path");
+
+        if (path != null && path.contains("/manifests/")) {
+          // Normalize path: strip leading slash
+          String normalizedPath = path.startsWith("/") ? path.substring(1) : path;
+
+          // Pattern: v2/<image>/manifests/<tag>
+          if (normalizedPath.startsWith("v2/")) {
+            int manifestsIdx = normalizedPath.indexOf("/manifests/");
+            String imagePart = normalizedPath.substring(3, manifestsIdx);
+            String tag = normalizedPath.substring(manifestsIdx + "/manifests/".length());
+
+            if (!imagePart.isEmpty() && !tag.isEmpty() && !tag.endsWith("/")) {
+              DockerImageInfo info = imageMap.get(imagePart);
+              if (info == null) {
+                info = new DockerImageInfo(imagePart);
+                imageMap.put(imagePart, info);
+              }
+              info.addTag(tag);
+            }
+          }
+        }
+
+        pos = objEnd + 1;
+      }
+    }
+    catch (Exception e) {
+      log.info("Failed to parse Docker Search API assets: {}", e.getMessage());
+    }
   }
 
   /**
@@ -310,14 +584,46 @@ public class DockerService {
       }
     }
     catch (Exception e) {
-      log.debug("Internal API listing failed for Docker tags {}/{}, falling back to REST API: {}",
+      log.debug("Internal API listing failed for Docker tags {}/{}, falling back: {}",
           repositoryName, imageName, e.getMessage());
     }
 
-    // Strategy 2: Fall back to REST API
+    // Strategy 2: Try local Nexus REST API
+    try {
+      List<String> localTags = listDockerTagsViaLocalApi(repositoryName, imageName);
+      if (!localTags.isEmpty()) {
+        return localTags;
+      }
+    }
+    catch (Exception e) {
+      log.debug("Local REST API listing failed for Docker tags {}/{}, falling back: {}",
+          repositoryName, imageName, e.getMessage());
+    }
+
+    // Strategy 3: For proxy repos, try remote Nexus API
+    try {
+      Repository repo = repositoryManager.get(repositoryName);
+      if (repo != null && "proxy".equals(repo.getType().getValue())) {
+        List<String> remoteTags = listDockerTagsViaRemoteApi(repo, imageName);
+        if (!remoteTags.isEmpty()) {
+          return remoteTags;
+        }
+      }
+    }
+    catch (Exception e) {
+      log.info("Remote API listing failed for Docker tags {}/{}: {}", repositoryName, imageName, e.getMessage());
+    }
+
+    return tags;
+  }
+
+  /**
+   * List Docker tags via local Nexus REST API (Components API).
+   */
+  private List<String> listDockerTagsViaLocalApi(final String repositoryName, final String imageName) {
+    List<String> tags = new ArrayList<>();
     try {
       String effectiveAuth = getAdminAuth();
-      // Use search API to find components matching the image name
       String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
 
@@ -346,9 +652,148 @@ public class DockerService {
       while (continuationToken != null && !continuationToken.isEmpty());
     }
     catch (Exception e) {
-      log.error("Failed to list Docker tags for {}/{}: {}", repositoryName, imageName, e.getMessage());
+      log.info("Local REST API listing failed for Docker tags: {}", e.getMessage());
     }
     return tags;
+  }
+
+  /**
+   * List Docker tags from a remote Nexus instance via Search API.
+   */
+  private List<String> listDockerTagsViaRemoteApi(final Repository repo, final String imageName) {
+    List<String> tags = new ArrayList<>();
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null || config.getAttributes() == null || !config.getAttributes().containsKey("proxy")) {
+        return tags;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return tags;
+
+      // Extract base URL and repo name from remote URL
+      int repoIdx = remoteUrl.indexOf("/repository/");
+      if (repoIdx <= 0) return tags;
+
+      String remoteBaseUrl = remoteUrl.substring(0, repoIdx);
+      String repoPart = remoteUrl.substring(repoIdx + "/repository/".length());
+      if (repoPart.endsWith("/")) repoPart = repoPart.substring(0, repoPart.length() - 1);
+      int slashIdx = repoPart.indexOf('/');
+      String remoteRepoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+
+      // Try Docker Registry V2 API first (most direct)
+      try {
+        String tagsUrl = remoteUrl + (remoteUrl.endsWith("/") ? "" : "/") + "v2/" + imageName + "/tags/list";
+        HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(30_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        if (code == 200) {
+          String json = readResponse(conn);
+          tags = parseDockerTagsList(json);
+          if (!tags.isEmpty()) {
+            log.info("Found {} tags for image {} via Docker Registry V2 API", tags.size(), imageName);
+            return tags;
+          }
+        }
+        conn.disconnect();
+      }
+      catch (Exception e) {
+        log.debug("Docker Registry V2 API failed for {}: {}", imageName, e.getMessage());
+      }
+
+      // Try remote Nexus Search API
+      String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName
+          + "&format=docker&group=" + java.net.URLEncoder.encode("v2/" + imageName, "UTF-8");
+      String continuationToken = null;
+
+      do {
+        String searchUrl = searchUrlBase;
+        if (continuationToken != null) {
+          searchUrl += "&continuationToken=" + continuationToken;
+        }
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        if (code != 200) {
+          conn.disconnect();
+          break;
+        }
+
+        String json = readResponse(conn);
+        parseDockerTagsFromSearchApi(json, imageName, tags);
+        continuationToken = extractJsonValue(json, "continuationToken");
+      }
+      while (continuationToken != null && !continuationToken.isEmpty());
+
+      log.info("Remote Nexus API found {} tags for image {}", tags.size(), imageName);
+    }
+    catch (Exception e) {
+      log.info("Remote API listing failed for Docker tags: {}", e.getMessage());
+    }
+    return tags;
+  }
+
+  /**
+   * Parse Docker tags from Nexus Search API (assets) response for a specific image.
+   */
+  private void parseDockerTagsFromSearchApi(final String json, final String imageName, final List<String> tags) {
+    try {
+      String itemsSection = extractJsonArray(json, "items");
+      if (itemsSection == null) return;
+
+      String manifestPrefix = "v2/" + imageName + "/manifests/";
+
+      int pos = 0;
+      while (pos < itemsSection.length()) {
+        int objStart = itemsSection.indexOf('{', pos);
+        if (objStart < 0) break;
+        int objEnd = findMatchingBrace(itemsSection, objStart);
+        if (objEnd < 0) break;
+
+        String item = itemsSection.substring(objStart, objEnd + 1);
+        String path = extractJsonValue(item, "path");
+
+        if (path != null) {
+          String normalizedPath = path.startsWith("/") ? path.substring(1) : path;
+          if (normalizedPath.startsWith(manifestPrefix)) {
+            String tag = normalizedPath.substring(manifestPrefix.length());
+            if (!tag.isEmpty() && !tag.endsWith("/")) {
+              if (!tags.contains(tag)) {
+                tags.add(tag);
+              }
+            }
+          }
+        }
+
+        pos = objEnd + 1;
+      }
+    }
+    catch (Exception e) {
+      log.info("Failed to parse Docker tags from Search API: {}", e.getMessage());
+    }
   }
 
   // ==================== Docker Promotion ====================
@@ -401,34 +846,110 @@ public class DockerService {
         List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
 
         try {
-          // Determine which tags to promote
-          List<String> tags = request.getTags();
-          if (request.isAllTags()) {
-            tags = listDockerTags(request.getSourceRepository(), request.getImage());
-            log.info("Docker promotion: found {} tags for image {} in {}", tags.size(), request.getImage(), request.getSourceRepository());
-          }
+          if (request.isAllImages()) {
+            // Directory level: promote all images and all tags
+            DockerImageListResponse imageList = listDockerImages(request.getSourceRepository());
+            List<DockerImageInfo> images = imageList.getImages();
+            log.info("Docker promotion (all images): found {} images in {}", images.size(), request.getSourceRepository());
 
-          if (tags.isEmpty()) {
-            throw new IOException("No tags found for image " + request.getImage() + " in " + request.getSourceRepository());
-          }
+            if (images.isEmpty()) {
+              throw new IOException("No Docker images found in repository " + request.getSourceRepository());
+            }
 
-          // Promote each tag
-          for (String tag : tags) {
-            try {
-              List<PromotionTaskResult.FileItem> tagItems = promoteDockerTag(
-                  request.getSourceRepository(), request.getTargetRepository(),
-                  request.getImage(), tag, cookieHeader, csrfToken, nexusBaseUrl);
-              promotedItems.addAll(tagItems);
+            for (DockerImageInfo img : images) {
+              String imageName = img.getName();
+              List<String> tags = img.getTags();
+              if (tags == null || tags.isEmpty()) {
+                tags = listDockerTags(request.getSourceRepository(), imageName);
+              }
+
+              // Filter tags for release repository
+              if (isDockerReleaseRepo(request.getTargetRepository())) {
+                List<String> originalTags = new ArrayList<>(tags);
+                tags = new ArrayList<>();
+                for (String tag : originalTags) {
+                  if (isReleaseTag(tag)) {
+                    tags.add(tag);
+                  } else {
+                    String manifestPath = "v2/" + imageName + "/manifests/" + tag;
+                    PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
+                    skippedItem.setStatus("skipped");
+                    skippedItem.setErrorMessage("Skipped: non-release tag (target is a release repository)");
+                    promotedItems.add(skippedItem);
+                  }
+                }
+              }
+
+              for (String tag : tags) {
+                try {
+                  List<PromotionTaskResult.FileItem> tagItems = promoteDockerTag(
+                      request.getSourceRepository(), request.getTargetRepository(),
+                      imageName, tag, cookieHeader, csrfToken, nexusBaseUrl);
+                  promotedItems.addAll(tagItems);
+                }
+                catch (Exception e) {
+                  log.error("Failed to promote {}:{}: {}", imageName, tag, e.getMessage());
+                  String manifestPath = "v2/" + imageName + "/manifests/" + tag;
+                  PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
+                  failedItem.setStatus("failed");
+                  failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  promotedItems.add(failedItem);
+                }
+                updatePromotionTaskProgress(result, promotedItems);
+              }
             }
-            catch (Exception e) {
-              log.error("Failed to promote {}:{}: {}", request.getImage(), tag, e.getMessage());
-              String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
-              PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
-              failedItem.setStatus("failed");
-              failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-              promotedItems.add(failedItem);
+          } else {
+            // Single image mode
+            // Determine which tags to promote
+            List<String> tags = request.getTags();
+            if (request.isAllTags()) {
+              tags = listDockerTags(request.getSourceRepository(), request.getImage());
+              log.info("Docker promotion: found {} tags for image {} in {}", tags.size(), request.getImage(), request.getSourceRepository());
             }
-            updatePromotionTaskProgress(result, promotedItems);
+
+            // Filter tags if target repository is a release repository
+            if (isDockerReleaseRepo(request.getTargetRepository())) {
+              List<String> originalTags = new ArrayList<>(tags);
+              tags = new ArrayList<>();
+              for (String tag : originalTags) {
+                if (isReleaseTag(tag)) {
+                  tags.add(tag);
+                }
+                else {
+                  log.info("Docker promotion: skipping non-release tag {} for release repository {}", tag, request.getTargetRepository());
+                  String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
+                  PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
+                  skippedItem.setStatus("skipped");
+                  skippedItem.setErrorMessage("Skipped: non-release tag (target is a release repository)");
+                  promotedItems.add(skippedItem);
+                }
+              }
+              log.info("Docker promotion: filtered {} tags to {} release tags for release repository {}",
+                  originalTags.size(), tags.size(), request.getTargetRepository());
+            }
+
+            if (tags.isEmpty()) {
+              throw new IOException("No tags found for image " + request.getImage() + " in " + request.getSourceRepository());
+            }
+
+            // Promote each tag
+            for (String tag : tags) {
+              try {
+                List<PromotionTaskResult.FileItem> tagItems = promoteDockerTag(
+                    request.getSourceRepository(), request.getTargetRepository(),
+                    request.getImage(), tag, cookieHeader, csrfToken, nexusBaseUrl);
+                promotedItems.addAll(tagItems);
+              }
+              catch (Exception e) {
+                log.error("Failed to promote {}:{}: {}", request.getImage(), tag, e.getMessage());
+                String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
+                PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
+                failedItem.setStatus("failed");
+                failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                promotedItems.add(failedItem);
+              }
+              updatePromotionTaskProgress(result, promotedItems);
+            }
           }
 
           result.setItems(promotedItems);
@@ -734,7 +1255,7 @@ public class DockerService {
         taskInfo.setTaskId(preTaskId);
         taskInfo.setSourceRepository(request.getSourceRepository());
         taskInfo.setTargetRepository(request.getSourceRepository()); // proxy syncs to itself
-        taskInfo.setPath("v2/" + request.getImage());
+        taskInfo.setPath(request.isAllImages() ? "v2/" : "v2/" + request.getImage());
         taskInfo.setDirectory(true);
         taskInfo.setFormat(request.getFormat());
         taskInfo.setUsername(username);
@@ -750,33 +1271,68 @@ public class DockerService {
             throw new IllegalArgumentException("Repository is not a proxy type: " + request.getSourceRepository());
           }
 
-          // Determine which tags to sync
-          List<String> tags = request.getTags();
-          if (request.isAllTags()) {
-            tags = listDockerTagsRemote(repo, request.getImage());
-            log.info("Docker sync: found {} tags for image {} in remote", tags.size(), request.getImage());
-          }
-
-          if (tags.isEmpty()) {
-            throw new IOException("No tags found for image " + request.getImage() + " in remote repository");
-          }
-
           cacheManager.createTaskCache(preTaskId);
 
           List<SyncTaskInfo.SyncFileDetail> syncedFiles = new ArrayList<>();
 
-          for (String tag : tags) {
-            try {
-              List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag);
-              syncedFiles.addAll(tagFiles);
+          if (request.isAllImages()) {
+            // Directory level: sync all images and all tags
+            DockerImageListResponse imageList = listDockerImages(request.getSourceRepository());
+            List<DockerImageInfo> images = imageList.getImages();
+            log.info("Docker sync (all images): found {} images in {}", images.size(), request.getSourceRepository());
+
+            if (images.isEmpty()) {
+              throw new IOException("No Docker images found in repository " + request.getSourceRepository());
             }
-            catch (Exception e) {
-              log.error("Failed to sync {}:{}: {}", request.getImage(), tag, e.getMessage());
-              String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
-              SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
-              failedDetail.setStatus("failed");
-              failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-              syncedFiles.add(failedDetail);
+
+            for (DockerImageInfo img : images) {
+              String imageName = img.getName();
+              List<String> tags = img.getTags();
+              if (tags == null || tags.isEmpty()) {
+                tags = listDockerTagsRemote(repo, imageName);
+              }
+
+              for (String tag : tags) {
+                try {
+                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+                  syncedFiles.addAll(tagFiles);
+                }
+                catch (Exception e) {
+                  log.error("Failed to sync {}:{}: {}", imageName, tag, e.getMessage());
+                  String manifestPath = "v2/" + imageName + "/manifests/" + tag;
+                  SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+                  failedDetail.setStatus("failed");
+                  failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  syncedFiles.add(failedDetail);
+                }
+              }
+            }
+          } else {
+            // Single image mode
+            // Determine which tags to sync
+            List<String> tags = request.getTags();
+            if (request.isAllTags()) {
+              tags = listDockerTagsRemote(repo, request.getImage());
+              log.info("Docker sync: found {} tags for image {} in remote", tags.size(), request.getImage());
+            }
+
+            if (tags.isEmpty()) {
+              throw new IOException("No tags found for image " + request.getImage() + " in remote repository");
+            }
+
+            for (String tag : tags) {
+              try {
+                List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag);
+                syncedFiles.addAll(tagFiles);
+              }
+              catch (Exception e) {
+                log.error("Failed to sync {}:{}: {}", request.getImage(), tag, e.getMessage());
+                String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
+                SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+                failedDetail.setStatus("failed");
+                failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                syncedFiles.add(failedDetail);
+              }
             }
           }
 
@@ -967,7 +1523,6 @@ public class DockerService {
   private List<String> listDockerTagsRemote(final Repository repo, final String imageName) {
     List<String> tags = new ArrayList<>();
     try {
-      // Try Docker Registry V2 API on the remote URL
       org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
       if (config != null && config.getAttributes() != null && config.getAttributes().containsKey("proxy")) {
         @SuppressWarnings("unchecked")
@@ -1001,25 +1556,17 @@ public class DockerService {
             log.info("Found {} tags for image {} via Docker Registry API", tags.size(), imageName);
             return tags;
           }
-          else if (code == 401) {
-            log.warn("Docker Registry API returned 401 Unauthorized for image {} — check authentication config", imageName);
-          }
-          else if (code == 404) {
-            log.info("Docker Registry API returned 404 for image {} — image may not exist on remote", imageName);
-          }
-          else if (RetryableOperation.isRetryableHttpCode(code)) {
-            log.warn("Docker Registry API returned retryable HTTP {} for image {}, will retry", code, imageName);
-            try {
-              String errorBody = readErrorResponse(conn);
-              log.debug("Docker Registry API error response: {}", errorBody);
-            }
-            catch (Exception ignored) {}
-            // Retry via RetryableOperation at the caller level
-          }
           else {
-            log.warn("Docker Registry API returned HTTP {} for image {}: {}", code, imageName, readErrorResponse(conn));
+            log.info("Docker Registry API returned HTTP {} for image {}, trying remote Nexus API", code, imageName);
           }
           conn.disconnect();
+
+          // Try remote Nexus Search API
+          List<String> remoteTags = listDockerTagsViaRemoteApi(repo, imageName);
+          if (!remoteTags.isEmpty()) {
+            log.info("Found {} tags for image {} via remote Nexus API", remoteTags.size(), imageName);
+            return remoteTags;
+          }
         }
       }
     }
@@ -1201,7 +1748,7 @@ public class DockerService {
     PromotionTaskResult result = promotionTaskResults.get(taskId);
     if (result != null) {
       String statusStr = result.getStatus();
-      if ("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr)) {
+      if ("completed".equalsIgnoreCase(statusStr) || "failed".equalsIgnoreCase(statusStr)) {
         taskExecutor.cleanupPromotionTaskHandle(taskId);
       }
     }
@@ -1229,7 +1776,7 @@ public class DockerService {
     for (Map.Entry<String, PromotionTaskResult> entry : promotionTaskResults.entrySet()) {
       PromotionTaskResult r = entry.getValue();
       String s = r.getStatus();
-      if (("COMPLETED".equals(s) || "FAILED".equals(s)) && r.getEndTime() > 0
+      if (("completed".equalsIgnoreCase(s) || "failed".equalsIgnoreCase(s)) && r.getEndTime() > 0
           && (now - r.getEndTime()) > TASK_RESULT_TTL_MS) {
         expired.add(entry.getKey());
       }

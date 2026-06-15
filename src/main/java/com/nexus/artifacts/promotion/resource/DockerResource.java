@@ -191,7 +191,8 @@ public class DockerResource implements Resource {
       return Response.ok()
           .entity("{\"taskId\":\"" + jsonEscape(taskId)
               + "\",\"status\":\"submitted\""
-              + ",\"image\":\"" + jsonEscape(request.getImage()) + "\""
+              + ",\"allImages\":" + request.isAllImages()
+              + ",\"image\":\"" + jsonEscape(request.getImage() != null ? request.getImage() : "") + "\""
               + ",\"tags\":" + (request.isAllTags() ? "\"all\"" : toJsonArray(request.getTags()))
               + ",\"message\":\"Docker promotion task created\"}")
           .build();
@@ -245,8 +246,9 @@ public class DockerResource implements Resource {
       return Response.ok()
           .entity("{\"taskId\":\"" + jsonEscape(taskId)
               + "\",\"status\":\"submitted\""
+              + ",\"allImages\":" + request.isAllImages()
               + ",\"repository\":\"" + jsonEscape(request.getSourceRepository()) + "\""
-              + ",\"image\":\"" + jsonEscape(request.getImage()) + "\""
+              + ",\"image\":\"" + jsonEscape(request.getImage() != null ? request.getImage() : "") + "\""
               + ",\"tags\":" + (request.isAllTags() ? "\"all\"" : toJsonArray(request.getTags()))
               + ",\"message\":\"Docker sync task created\"}")
           .build();

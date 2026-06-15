@@ -32,6 +32,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
   public static final String PROP_MAX_SYNC_RECORDS = "maxSyncRecords";
   public static final String PROP_ADMIN_USERNAME = "adminUsername";
   public static final String PROP_ADMIN_PASSWORD = "adminPassword";
+  public static final String PROP_DOCKER_RELEASE_REPOS = "dockerReleaseRepos";
 
   private static final NumberTextFormField POOL_SIZE_FIELD = new NumberTextFormField(
       PROP_SYNC_POOL_SIZE,
@@ -63,6 +64,14 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
       "Password for internal API calls (default: admin123)",
       false);
 
+  private static final StringTextFormField DOCKER_RELEASE_REPOS_FIELD = new StringTextFormField(
+      PROP_DOCKER_RELEASE_REPOS,
+      "Docker Release Repositories",
+      "Comma-separated list of Docker host repository names that are release repositories. "
+          + "When promoting images to a release repository, only release tags are allowed "
+          + "(tags containing SNAPSHOT/dev/alpha/beta/RC are filtered out). Example: docker-release,prod-docker",
+      false);
+
   public SyncCapabilityDescriptor() {
   }
 
@@ -83,7 +92,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, ADMIN_USERNAME_FIELD, ADMIN_PASSWORD_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, ADMIN_USERNAME_FIELD, ADMIN_PASSWORD_FIELD, DOCKER_RELEASE_REPOS_FIELD);
   }
 
   public Set<Tag> getTags() {

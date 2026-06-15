@@ -144,6 +144,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "docker.modal.syncing": "Syncing...",
     "docker.modal.cancel": "Cancel",
     "docker.modal.close": "Close",
+    "docker.modal.allImages": "All Images (Directory Level)",
+    "docker.modal.specificImage": "Specific Image",
+    "docker.modal.scope": "Scope:",
+    "docker.modal.filesToPromote": "Images to Promote",
+    "docker.modal.filesToSync": "Images to Sync",
     "docker.progress.title": "Docker Operation Progress",
     "docker.progress.status": "Status:",
     "docker.progress.processing": "Processing",
@@ -260,6 +265,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "docker.modal.syncing": "\u540c\u6b65\u4e2d...",
     "docker.modal.cancel": "\u53d6\u6d88",
     "docker.modal.close": "\u5173\u95ed",
+    "docker.modal.allImages": "\u6240\u6709\u955c\u50cf\uff08\u76ee\u5f55\u7ea7\u522b\uff09",
+    "docker.modal.specificImage": "\u6307\u5b9a\u955c\u50cf",
+    "docker.modal.scope": "\u8303\u56f4\uff1a",
+    "docker.modal.filesToPromote": "\u664b\u7ea7\u955c\u50cf\u5217\u8868",
+    "docker.modal.filesToSync": "\u540c\u6b65\u955c\u50cf\u5217\u8868",
     "docker.progress.title": "Docker\u64cd\u4f5c\u8fdb\u5ea6",
     "docker.progress.status": "\u72b6\u6001\uff1a",
     "docker.progress.processing": "\u5904\u7406\u4e2d",
@@ -377,9 +387,11 @@ function apiRequest(method, path, data) {
           return;
         }
         try {
-          resolve(Ext.decode(response.responseText));
+          var data = Ext.decode(response.responseText);
+          resolve(data);
         }
         catch (e) {
+          console.warn('apiRequest: failed to decode JSON response for', path, e);
           resolve({});
         }
       },
@@ -407,7 +419,12 @@ function apiRequest(method, path, data) {
           reject(new Error(err.error || 'Request failed: ' + status));
         }
         catch (e) {
-          reject(new Error('Request failed: ' + status));
+          // Response is not JSON (e.g., HTML 404 page from Nexus)
+          var errorMsg = 'Request failed: ' + status;
+          if (response.responseText && response.responseText.indexOf('cannot find resource') >= 0) {
+            errorMsg = 'API endpoint not found (' + status + '): ' + path + '. Please ensure the plugin is properly deployed and Nexus has been restarted.';
+          }
+          reject(new Error(errorMsg));
         }
       }
     };
@@ -1965,65 +1982,150 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       data: []
     });
 
+    // Preview store for "all images" mode - shows image:tag list
+    var previewStore = Ext.create('Ext.data.Store', {
+      fields: ['path', 'type', 'status'],
+      pageSize: 10,
+      data: []
+    });
+
+    var statusRenderer = function (val) {
+      switch (val) {
+        case 'processing':
+          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
+        case 'success':
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
+        case 'failed':
+          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'skipped':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
+        default:
+          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
+      }
+    };
+
+    var tipRenderer = function (value, meta) {
+      meta.tdAttr = 'data-qtip="' + sanitize(value || '') + '"';
+      return value;
+    };
+
     // Build form items
     var formItems = [
+      // Scope selector: All Images or Specific Image
       {
-        xtype: 'combobox',
-        fieldLabel: _t('docker.modal.image'),
-        store: imageStore,
-        displayField: 'name',
-        valueField: 'name',
-        queryMode: 'local',
-        editable: false,
-        itemId: 'imageCombo',
-        emptyText: _t('docker.modal.loading'),
+        xtype: 'radiogroup',
+        fieldLabel: _t('docker.modal.scope'),
+        itemId: 'scopeGroup',
+        columns: 1,
+        items: [
+          { boxLabel: _t('docker.modal.allImages'), name: 'dockerScope', inputValue: 'all', checked: true },
+          { boxLabel: _t('docker.modal.specificImage'), name: 'dockerScope', inputValue: 'specific' }
+        ],
         listeners: {
-          select: function (combo, records) {
-            var rec = records[0];
-            if (!rec) return;
-            var tags = rec.get('tags') || [];
-            tagStore.removeAll();
-            Ext.each(tags, function (t) {
-              tagStore.add({ tag: t, selected: false });
-            });
-            // Auto-check "all tags" checkbox
-            var allTagsCb = win.down('#allTagsCheckbox');
-            if (allTagsCb) { allTagsCb.setValue(true); }
-          }
-        }
-      },
-      {
-        xtype: 'checkbox',
-        boxLabel: _t('docker.modal.tags.all'),
-        itemId: 'allTagsCheckbox',
-        checked: true,
-        listeners: {
-          change: function (cb, checked) {
-            var tagGrid = win.down('#tagGrid');
-            if (tagGrid) {
-              tagGrid.setDisabled(checked);
+          change: function (rg, newVal) {
+            var scope = newVal.dockerScope;
+            var allPanel = win.down('#allImagesPanel');
+            var specificPanel = win.down('#specificImagePanel');
+            if (scope === 'all') {
+              allPanel.show();
+              specificPanel.hide();
+            } else {
+              allPanel.hide();
+              specificPanel.show();
             }
           }
         }
       },
+      // All images panel (directory level) - shows preview grid
       {
-        xtype: 'gridpanel',
-        itemId: 'tagGrid',
-        title: _t('docker.modal.tags.select'),
-        height: 200,
-        disabled: true,
-        store: tagStore,
-        columns: [
+        xtype: 'panel',
+        itemId: 'allImagesPanel',
+        layout: 'fit',
+        height: 280,
+        items: [{
+          xtype: 'gridpanel',
+          title: isPromote ? _t('docker.modal.filesToPromote') : _t('docker.modal.filesToSync'),
+          store: previewStore,
+          columns: [
+            { text: 'Image:Tag', dataIndex: 'path', flex: 2, renderer: tipRenderer, cellWrap: true },
+            { text: 'Type', dataIndex: 'type', width: 80 },
+            { text: _t('promotion.result.status'), dataIndex: 'status', width: 100, renderer: statusRenderer }
+          ],
+          dockedItems: [{
+            xtype: 'pagingtoolbar',
+            store: previewStore,
+            dock: 'bottom',
+            displayInfo: true,
+            displayMsg: '{0} - {1} / {2}',
+            emptyMsg: ''
+          }]
+        }]
+      },
+      // Specific image panel
+      {
+        xtype: 'panel',
+        itemId: 'specificImagePanel',
+        hidden: true,
+        layout: { type: 'vbox', align: 'stretch' },
+        items: [
           {
-            xtype: 'checkcolumn',
-            header: '',
-            dataIndex: 'selected',
-            width: 40,
-            stopSelection: false
+            xtype: 'combobox',
+            fieldLabel: _t('docker.modal.image'),
+            store: imageStore,
+            displayField: 'name',
+            valueField: 'name',
+            queryMode: 'local',
+            editable: false,
+            itemId: 'imageCombo',
+            emptyText: _t('docker.modal.loading'),
+            listeners: {
+              select: function (combo, records) {
+                var rec = records[0];
+                if (!rec) return;
+                var tags = rec.get('tags') || [];
+                tagStore.removeAll();
+                Ext.each(tags, function (t) {
+                  tagStore.add({ tag: t, selected: false });
+                });
+                var allTagsCb = win.down('#allTagsCheckbox');
+                if (allTagsCb) { allTagsCb.setValue(true); }
+              }
+            }
           },
-          { text: _t('docker.modal.tags'), dataIndex: 'tag', flex: 1 }
-        ],
-        selType: 'cellmodel'
+          {
+            xtype: 'checkbox',
+            boxLabel: _t('docker.modal.tags.all'),
+            itemId: 'allTagsCheckbox',
+            checked: true,
+            listeners: {
+              change: function (cb, checked) {
+                var tagGrid = win.down('#tagGrid');
+                if (tagGrid) {
+                  tagGrid.setDisabled(checked);
+                }
+              }
+            }
+          },
+          {
+            xtype: 'gridpanel',
+            itemId: 'tagGrid',
+            title: _t('docker.modal.tags.select'),
+            height: 160,
+            disabled: true,
+            store: tagStore,
+            columns: [
+              {
+                xtype: 'checkcolumn',
+                header: '',
+                dataIndex: 'selected',
+                width: 40,
+                stopSelection: false
+              },
+              { text: _t('docker.modal.tags'), dataIndex: 'tag', flex: 1 }
+            ],
+            selType: 'cellmodel'
+          }
+        ]
       }
     ];
 
@@ -2046,28 +2148,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       });
     }
 
-    // Status display (shown during progress)
-    var progressItems = [
-      {
-        xtype: 'displayfield',
-        itemId: 'dockerProgressStatus',
-        hidden: true,
-        fieldLabel: _t('docker.progress.status'),
-        value: ''
-      },
-      {
-        xtype: 'progressbar',
-        itemId: 'dockerProgressBar',
-        hidden: true,
-        value: 0,
-        text: ''
-      }
-    ];
-
     var win = Ext.create('Ext.window.Window', {
       title: isPromote ? _t('docker.modal.title.promote') : _t('docker.modal.title.sync'),
-      width: 600,
-      height: 450,
+      width: 700,
+      height: 520,
       modal: true,
       closable: true,
       layout: 'fit',
@@ -2075,17 +2159,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         xtype: 'panel',
         layout: { type: 'vbox', align: 'stretch' },
         bodyPadding: 10,
-        items: formItems.concat(progressItems)
+        autoScroll: true,
+        items: formItems
       }],
       buttons: [
         {
           text: _t('docker.modal.cancel'),
           itemId: 'cancelBtn',
           handler: function () {
-            if (win._dockerPollInterval) {
-              clearInterval(win._dockerPollInterval);
-              win._dockerPollInterval = null;
-            }
             win.close();
           }
         },
@@ -2093,83 +2174,102 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           text: isPromote ? _t('docker.modal.promote') : _t('docker.modal.sync'),
           itemId: 'execBtn',
           handler: function () {
-            var imageName = win.down('#imageCombo').getValue();
-            if (!imageName) return;
-
-            var allTags = win.down('#allTagsCheckbox').getValue();
-            var selectedTags = [];
-            if (!allTags) {
-              tagStore.each(function (rec) {
-                if (rec.get('selected')) {
-                  selectedTags.push(rec.get('tag'));
-                }
-              });
-              if (selectedTags.length === 0) {
-                showAlertDialog(_t('common.error'), _t('docker.modal.noTags'));
-                return;
-              }
-            }
+            var scopeGroup = win.down('#scopeGroup');
+            var isAllImages = scopeGroup.getValue().dockerScope === 'all';
 
             var execBtn = win.down('#execBtn');
             var cancelBtn = win.down('#cancelBtn');
-            execBtn.setText(isPromote ? _t('docker.modal.promoting') : _t('docker.modal.syncing'));
-            execBtn.disable();
 
-            var requestData = {
-              sourceRepository: repoName,
-              image: imageName,
-              tags: allTags ? [] : selectedTags,
-              format: format
-            };
+            if (isAllImages) {
+              // Directory level: promote/sync all images
+              var requestData = {
+                sourceRepository: repoName,
+                image: '',
+                tags: [],
+                format: format,
+                allImages: true
+              };
 
-            if (isPromote) {
-              requestData.targetRepository = win.down('#targetCombo').getValue();
-              if (!requestData.targetRepository) return;
-            }
+              if (isPromote) {
+                requestData.targetRepository = win.down('#targetCombo').getValue();
+                if (!requestData.targetRepository) return;
+              }
 
-            var apiPath = isPromote ? '/docker/promote' : '/docker/sync';
-            apiRequest('POST', apiPath, requestData)
-            .then(function (result) {
-              // Switch to progress mode
-              cancelBtn.setText(_t('docker.modal.close'));
-              cancelBtn.enable();
-              cancelBtn.setHandler(function () {
-                if (win._dockerPollInterval) {
-                  clearInterval(win._dockerPollInterval);
-                  win._dockerPollInterval = null;
+              execBtn.disable();
+              cancelBtn.disable();
+
+              var apiPath = isPromote ? '/docker/promote' : '/docker/sync';
+              apiRequest('POST', apiPath, requestData)
+              .then(function (result) {
+                // Collect preview paths for progress tracking
+                var previewPaths = [];
+                previewStore.each(function (rec) {
+                  previewPaths.push(rec.get('path'));
+                });
+                win.close();
+                me.showDockerProgressWindow(result, repoName, isPromote, previewPaths, requestData.targetRepository);
+              })
+              .catch(function (err) {
+                execBtn.enable();
+                cancelBtn.enable();
+                showAlertDialog(isPromote ? _t('promotion.execute.failed') : _t('sync.execute.failed'), sanitize(err.message));
+              });
+            } else {
+              // Specific image level
+              var imageName = win.down('#imageCombo').getValue();
+              if (!imageName) return;
+
+              var allTags = win.down('#allTagsCheckbox').getValue();
+              var selectedTags = [];
+              if (!allTags) {
+                tagStore.each(function (rec) {
+                  if (rec.get('selected')) {
+                    selectedTags.push(rec.get('tag'));
+                  }
+                });
+                if (selectedTags.length === 0) {
+                  showAlertDialog(_t('common.error'), _t('docker.modal.noTags'));
+                  return;
+                }
+              }
+
+              execBtn.disable();
+              cancelBtn.disable();
+
+              var requestData2 = {
+                sourceRepository: repoName,
+                image: imageName,
+                tags: allTags ? [] : selectedTags,
+                format: format
+              };
+
+              if (isPromote) {
+                requestData2.targetRepository = win.down('#targetCombo').getValue();
+                if (!requestData2.targetRepository) return;
+              }
+
+              var apiPath2 = isPromote ? '/docker/promote' : '/docker/sync';
+              apiRequest('POST', apiPath2, requestData2)
+              .then(function (result) {
+                // Build preview paths from selected image:tags
+                var previewPaths = [];
+                var imageRecord = imageStore.findRecord('name', imageName);
+                if (imageRecord) {
+                  var imgTags = imageRecord.get('tags') || [];
+                  var effectiveTags = allTags ? imgTags : selectedTags;
+                  Ext.each(effectiveTags, function (t) {
+                    previewPaths.push(imageName + ':' + t);
+                  });
                 }
                 win.close();
+                me.showDockerProgressWindow(result, repoName, isPromote, previewPaths, requestData2.targetRepository);
+              })
+              .catch(function (err) {
+                execBtn.enable();
+                cancelBtn.enable();
+                showAlertDialog(isPromote ? _t('promotion.execute.failed') : _t('sync.execute.failed'), sanitize(err.message));
               });
-              execBtn.hide();
-
-              // Show progress
-              var progressStatus = win.down('#dockerProgressStatus');
-              var progressBar = win.down('#dockerProgressBar');
-              if (progressStatus) {
-                progressStatus.show();
-                progressStatus.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('docker.progress.processing') + '</span>');
-              }
-              if (progressBar) {
-                progressBar.show();
-                progressBar.setValue(0);
-                progressBar.updateText(_t('docker.progress.pending'));
-              }
-
-              // Disable form
-              win.down('#imageCombo').disable();
-              win.down('#allTagsCheckbox').disable();
-              win.down('#tagGrid').disable();
-              if (isPromote) { win.down('#targetCombo').disable(); }
-
-              // Start polling
-              var taskApiPath = isPromote ? '/docker/promote/task/' : '/docker/sync/task/';
-              me._startDockerPolling(win, result.taskId, taskApiPath);
-            })
-            .catch(function (err) {
-              execBtn.setText(isPromote ? _t('docker.modal.promote') : _t('docker.modal.sync'));
-              execBtn.enable();
-              showAlertDialog(isPromote ? _t('promotion.execute.failed') : _t('sync.execute.failed'), sanitize(err.message));
-            });
+            }
           }
         }
       ]
@@ -2181,9 +2281,18 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     .then(function (data) {
       if (win.destroyed) return;
       imageStore.removeAll();
+      previewStore.removeAll();
       if (data.images && data.images.length > 0) {
         Ext.each(data.images, function (img) {
           imageStore.add({ name: img.name, tags: img.tags || [] });
+          // Also populate preview store with image:tag entries
+          Ext.each(img.tags || [], function (tag) {
+            previewStore.add({
+              path: img.name + ':' + tag,
+              type: 'image',
+              status: 'pending'
+            });
+          });
         });
         var combo = win.down('#imageCombo');
         if (combo) { combo.emptyText = ''; combo.applyEmptyText(); }
@@ -2195,14 +2304,163 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     .catch(function (err) {
       if (win.destroyed) return;
       var combo = win.down('#imageCombo');
-      if (combo) { combo.emptyText = _t('docker.modal.noImages'); combo.applyEmptyText(); }
+      if (combo) {
+        combo.emptyText = _t('docker.modal.noImages');
+        combo.applyEmptyText();
+      }
+      console.error('Failed to load Docker images:', err.message);
     });
   },
 
   /**
-   * Start polling for Docker task status.
+   * Unified Docker progress window for both promote and sync.
+   * Shows image:tag list with real-time status updates, consistent with regular file promotion.
    */
-  _startDockerPolling: function (win, taskId, apiPath) {
+  showDockerProgressWindow: function (result, repoName, isPromote, previewPaths, targetRepo) {
+    var me = this;
+    var taskId = result.taskId || '';
+    var totalFiles = previewPaths.length;
+
+    // Build file store from preview paths
+    var fileStore = Ext.create('Ext.data.Store', {
+      fields: ['path', 'type', 'status'],
+      pageSize: 10,
+      data: (function () {
+        var arr = [];
+        Ext.each(previewPaths, function (p) {
+          arr.push({ path: p, type: 'image', status: 'pending' });
+        });
+        return arr;
+      })()
+    });
+
+    var statusRenderer = function (val) {
+      switch (val) {
+        case 'processing':
+          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
+        case 'success':
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
+        case 'failed':
+          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'skipped':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
+        default:
+          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
+      }
+    };
+
+    var tipRenderer = function (value, meta) {
+      meta.tdAttr = 'data-qtip="' + sanitize(value || '') + '"';
+      return value;
+    };
+
+    var winItems = [];
+
+    // Target repo display (promote mode)
+    if (isPromote && targetRepo) {
+      winItems.push({
+        xtype: 'displayfield',
+        fieldLabel: _t('promotion.result.targetRepository'),
+        value: '<b>' + sanitize(targetRepo) + '</b>'
+      });
+    }
+
+    // Repository display (sync mode)
+    if (!isPromote) {
+      winItems.push({
+        xtype: 'displayfield',
+        fieldLabel: _t('sync.queue.created.repository'),
+        value: '<b>' + sanitize(repoName) + '</b>'
+      });
+    }
+
+    // Task ID display
+    winItems.push({
+      xtype: 'displayfield',
+      fieldLabel: _t('sync.queue.created.queueId'),
+      value: '<b>' + sanitize(taskId) + '</b>'
+    });
+
+    // Progress bar
+    winItems.push({
+      xtype: 'container',
+      itemId: 'progressContainer',
+      margin: '8 0',
+      layout: { type: 'hbox', align: 'middle' },
+      items: [
+        {
+          xtype: 'progressbar',
+          itemId: 'overallProgress',
+          flex: 1,
+          value: 0,
+          text: _t('promotion.progress.pending'),
+          animate: true
+        }
+      ]
+    });
+
+    // File list grid
+    winItems.push({
+      xtype: 'gridpanel',
+      flex: 1,
+      itemId: 'dockerFileGrid',
+      store: fileStore,
+      columns: [
+        { text: 'Image:Tag', dataIndex: 'path', flex: 2, renderer: tipRenderer, cellWrap: true },
+        { text: 'Type', dataIndex: 'type', width: 80 },
+        {
+          text: _t('promotion.result.status'), dataIndex: 'status', width: 100,
+          renderer: statusRenderer
+        }
+      ],
+      dockedItems: [{
+        xtype: 'pagingtoolbar',
+        store: fileStore,
+        dock: 'bottom',
+        displayInfo: true,
+        displayMsg: '{0} - {1} / {2}',
+        emptyMsg: ''
+      }]
+    });
+
+    var win = Ext.create('Ext.window.Window', {
+      title: isPromote ? _t('docker.modal.title.promote') : _t('docker.modal.title.sync'),
+      width: 700,
+      height: 500,
+      modal: true,
+      closable: true,
+      layout: 'fit',
+      items: [{
+        xtype: 'panel',
+        layout: { type: 'vbox', align: 'stretch' },
+        bodyPadding: 10,
+        items: winItems
+      }],
+      buttons: [
+        {
+          text: _t('promotion.result.close'),
+          itemId: 'closeBtn',
+          handler: function () {
+            if (win._dockerPollInterval) {
+              clearInterval(win._dockerPollInterval);
+              win._dockerPollInterval = null;
+            }
+            win.close();
+          }
+        }
+      ]
+    });
+    win.show();
+
+    // Start polling for task status
+    me._startDockerProgressPolling(win, taskId, fileStore, totalFiles, isPromote);
+  },
+
+  /**
+   * Unified polling for Docker promote/sync task status.
+   * Updates the image:tag grid with status from backend, same as regular file promotion.
+   */
+  _startDockerProgressPolling: function (win, taskId, fileStore, totalFiles, isPromote) {
     var isFinished = false;
     var pollCount = 0;
     var MAX_POLLS = 400;
@@ -2227,8 +2485,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         return;
       }
 
+      var apiPath = isPromote
+        ? '/service/rest/v1/docker/promote/task/' + encodeURIComponent(taskId)
+        : '/service/rest/v1/docker/sync/task/' + encodeURIComponent(taskId);
+
       var xhr = new XMLHttpRequest();
-      xhr.open('GET', '/service/rest/v1' + apiPath + encodeURIComponent(taskId), true);
+      xhr.open('GET', apiPath, true);
       xhr.setRequestHeader('Accept', 'application/json');
 
       var csrfToken = null;
@@ -2253,41 +2515,120 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         try { result = JSON.parse(xhr.responseText); } catch (e) { return; }
 
         var statusStr = (result.status || '').toLowerCase();
-        var progressStatus = win.down('#dockerProgressStatus');
-        var progressBar = win.down('#dockerProgressBar');
+        var progressBar = win.down('#overallProgress');
+        var grid = win.down('#dockerFileGrid');
+        var store = grid ? grid.getStore() : fileStore;
+        var currentTotal = Math.max(store.getCount(), totalFiles);
 
-        if (statusStr === 'running') {
-          if (progressStatus) {
-            progressStatus.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('docker.progress.processing') + '</span>');
+        // For promote: items are in result.items (PromotionTaskResult.FileItem)
+        // For sync: items are in result.fileDetails (SyncTaskInfo.SyncFileDetail)
+        var backendItems = result.items || result.fileDetails || [];
+
+        if (statusStr === 'completed' || statusStr === 'failed') {
+          var taskFailed = (statusStr === 'failed');
+
+          // Update store items from backend results
+          for (var i = 0; i < backendItems.length; i++) {
+            var item = backendItems[i];
+            var itemPath = item.path || '';
+            if (!itemPath) continue;
+
+            // Try to match by path in store
+            var idx = store.findExact('path', itemPath);
+            if (idx < 0) {
+              // Try matching image:tag format (e.g., "myapp:latest" vs "v2/myapp/manifests/latest")
+              var manifestIdx = itemPath.indexOf('/manifests/');
+              if (manifestIdx >= 0) {
+                var prefix = itemPath.substring(0, manifestIdx);
+                if (prefix.indexOf('v2/') === 0) prefix = prefix.substring(3);
+                var tagPart = itemPath.substring(manifestIdx + '/manifests/'.length);
+                var imageTag = prefix + ':' + tagPart;
+                idx = store.findExact('path', imageTag);
+              }
+            }
+
+            if (idx >= 0) {
+              var itemStatus = item.status;
+              if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
+                itemStatus = taskFailed ? 'failed' : 'success';
+              }
+              store.getAt(idx).set('status', itemStatus);
+            }
           }
-          // Calculate progress from fileDetails or items
-          var details = result.fileDetails || result.items || [];
-          if (details.length > 0 && progressBar) {
-            var done = 0;
-            Ext.each(details, function (d) {
-              if (d.status === 'success' || d.status === 'failed' || d.status === 'skipped') done++;
-            });
-            var pct = done / details.length;
+
+          // Mark any remaining pending items
+          store.each(function (rec) {
+            var st = rec.get('status');
+            if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
+              rec.set('status', taskFailed ? 'failed' : 'success');
+            }
+          });
+
+          // Count done
+          var doneCount = 0;
+          store.each(function (rec) {
+            var s = rec.get('status');
+            if (s === 'success' || s === 'failed' || s === 'skipped') doneCount++;
+          });
+
+          if (progressBar) {
+            progressBar.setValue(1);
+            progressBar.updateText(_t('promotion.progress.completed', doneCount, currentTotal));
+          }
+
+          win.setTitle(taskFailed ? _t('promotion.progress.failed') : _t('promotion.progress.success'));
+          isFinished = true;
+          stopPolling();
+        } else {
+          // Still running - update progress from backend items
+          for (var j = 0; j < backendItems.length; j++) {
+            var bi = backendItems[j];
+            var biPath = bi.path || '';
+            if (!biPath) continue;
+
+            var bidx = store.findExact('path', biPath);
+            if (bidx < 0) {
+              var mIdx = biPath.indexOf('/manifests/');
+              if (mIdx >= 0) {
+                var pfx = biPath.substring(0, mIdx);
+                if (pfx.indexOf('v2/') === 0) pfx = pfx.substring(3);
+                var tg = biPath.substring(mIdx + '/manifests/'.length);
+                var it = pfx + ':' + tg;
+                bidx = store.findExact('path', it);
+              }
+            }
+
+            if (bidx >= 0) {
+              var biStatus = bi.status;
+              if (biStatus !== 'failed' && biStatus !== 'skipped' && biStatus !== 'success') {
+                biStatus = 'success';
+              }
+              store.getAt(bidx).set('status', biStatus);
+            }
+          }
+
+          // Mark first pending item as processing
+          var hasProcessing = false;
+          store.each(function (rec) {
+            var rs = rec.get('status');
+            if (!hasProcessing && rs !== 'success' && rs !== 'failed' && rs !== 'skipped') {
+              rec.set('status', 'processing');
+              hasProcessing = true;
+            }
+          });
+
+          // Count and update progress bar
+          var processedCount = 0;
+          store.each(function (rec) {
+            var st = rec.get('status');
+            if (st === 'success' || st === 'failed' || st === 'skipped') { processedCount++; }
+          });
+
+          var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
+          if (progressBar) {
             progressBar.setValue(pct);
-            progressBar.updateText(done + '/' + details.length);
+            progressBar.updateText(_t('promotion.progress.completed', processedCount, currentTotal));
           }
-        } else if (statusStr === 'completed') {
-          if (progressStatus) {
-            progressStatus.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('docker.progress.success') + '</span>');
-          }
-          if (progressBar) { progressBar.setValue(1); progressBar.updateText(_t('docker.progress.success')); }
-          win.setTitle(_t('docker.progress.success'));
-          isFinished = true;
-          stopPolling();
-        } else if (statusStr === 'failed') {
-          if (progressStatus) {
-            var errMsg = result.errorMessage ? ' - ' + sanitize(result.errorMessage) : '';
-            progressStatus.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('docker.progress.failed') + errMsg + '</span>');
-          }
-          if (progressBar) { progressBar.updateText(_t('docker.progress.failed')); }
-          win.setTitle(_t('docker.progress.failed'));
-          isFinished = true;
-          stopPolling();
         }
       };
 
@@ -2295,8 +2636,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     };
 
     win._dockerPollInterval = setInterval(doPoll, 1500);
-    setTimeout(doPoll, 1000);
+    setTimeout(doPoll, 1500);
   },
+
 });
 
 // ==================== Sync Queue Created Dialog ====================

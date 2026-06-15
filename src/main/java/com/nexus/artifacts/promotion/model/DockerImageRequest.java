@@ -25,20 +25,24 @@ public class DockerImageRequest {
   /** Repository format, should be "docker" */
   private String format;
 
+  /** If true, promote/sync all images in the repository (directory level). image field is ignored. */
+  private boolean allImages;
+
   public DockerImageRequest() {}
 
   public void validate() {
     if (sourceRepository == null || sourceRepository.trim().isEmpty()) {
       throw new IllegalArgumentException("sourceRepository is required");
     }
-    if (image == null || image.trim().isEmpty()) {
-      throw new IllegalArgumentException("image is required");
-    }
     if (format == null || format.trim().isEmpty()) {
       throw new IllegalArgumentException("format is required");
     }
+    // image is required only when not doing all-images mode
+    if (!allImages && (image == null || image.trim().isEmpty())) {
+      throw new IllegalArgumentException("image is required");
+    }
     // Path traversal check
-    if (image.contains("..")) {
+    if (image != null && image.contains("..")) {
       throw new IllegalArgumentException("Invalid image name");
     }
   }
@@ -60,5 +64,13 @@ public class DockerImageRequest {
 
   public boolean isAllTags() {
     return tags == null || tags.isEmpty();
+  }
+
+  public boolean isAllImages() {
+    return allImages;
+  }
+
+  public void setAllImages(boolean allImages) {
+    this.allImages = allImages;
   }
 }
