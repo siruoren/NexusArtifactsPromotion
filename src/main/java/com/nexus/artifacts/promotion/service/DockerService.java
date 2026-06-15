@@ -239,6 +239,21 @@ public class DockerService {
     // Map: imageName -> DockerImageInfo
     Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
 
+    // Strategy 1: Try internal StorageTx API first (most reliable, no HTTP auth issues)
+    try {
+      Map<String, DockerImageInfo> internalImages = listDockerImagesInternal(repo);
+      if (!internalImages.isEmpty()) {
+        response.setImages(new ArrayList<>(internalImages.values()));
+        response.setTotalCount(internalImages.size());
+        return response;
+      }
+    }
+    catch (Exception e) {
+      log.debug("Internal API listing failed for Docker images in {}, falling back to REST API: {}",
+          repositoryName, e.getMessage());
+    }
+
+    // Strategy 2: Fall back to REST API
     try {
       String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
@@ -283,6 +298,23 @@ public class DockerService {
    */
   public List<String> listDockerTags(final String repositoryName, final String imageName) {
     List<String> tags = new ArrayList<>();
+
+    // Strategy 1: Try internal StorageTx API first (most reliable, no HTTP auth issues)
+    try {
+      Repository repo = repositoryManager.get(repositoryName);
+      if (repo != null) {
+        List<String> internalTags = listDockerTagsInternal(repo, imageName);
+        if (!internalTags.isEmpty()) {
+          return internalTags;
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Internal API listing failed for Docker tags {}/{}, falling back to REST API: {}",
+          repositoryName, imageName, e.getMessage());
+    }
+
+    // Strategy 2: Fall back to REST API
     try {
       String effectiveAuth = getAdminAuth();
       // Use search API to find components matching the image name
@@ -1223,6 +1255,118 @@ public class DockerService {
       syncTaskInfos.remove(id);
       taskExecutor.cleanupSyncTaskHandle(id);
     }
+  }
+
+  /**
+   * List Docker tags for a specific image using Nexus internal StorageTx API.
+   * This is the most reliable approach as it bypasses HTTP authentication issues.
+   */
+  private List<String> listDockerTagsInternal(final Repository repo, final String imageName) {
+    List<String> tags = new ArrayList<>();
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) {
+        return tags;
+      }
+
+      // Docker manifest assets follow pattern: v2/<image>/manifests/<tag>
+      String manifestPrefix = "v2/" + imageName + "/manifests/";
+
+      Iterable<Asset> assets = tx.browseAssets(bucket);
+      for (Asset asset : assets) {
+        String name = asset.name();
+        if (name == null) continue;
+
+        // Normalize
+        String normalizedName = name.startsWith("/") ? name.substring(1) : name;
+
+        if (normalizedName.startsWith(manifestPrefix)) {
+          String tag = normalizedName.substring(manifestPrefix.length());
+          if (!tag.isEmpty() && !tag.endsWith("/")) {
+            tags.add(tag);
+          }
+        }
+      }
+
+      log.debug("Internal API found {} tags for image {} in repo {}", tags.size(), imageName, repo.getName());
+    }
+    catch (Exception e) {
+      log.debug("Internal API listing failed for Docker tags {}/{}: {}", repo.getName(), imageName, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return tags;
+  }
+
+  // ==================== Internal API Listing ====================
+
+  /**
+   * List Docker images using Nexus internal StorageTx API.
+   * This is the most reliable approach as it bypasses HTTP authentication issues.
+   * Works for all repository types including proxy repositories.
+   */
+  private Map<String, DockerImageInfo> listDockerImagesInternal(final Repository repo) {
+    Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) {
+        return imageMap;
+      }
+
+      // Docker assets follow pattern: v2/<image>/manifests/<tag>
+      // and v2/<image>/blobs/<digest>
+      Iterable<Asset> assets = tx.browseAssets(bucket);
+      for (Asset asset : assets) {
+        String name = asset.name();
+        if (name == null) continue;
+
+        // Match manifest assets to extract image and tag
+        // Pattern: /v2/<image>/manifests/<tag>
+        if (name.contains("/manifests/")) {
+          int manifestsIdx = name.indexOf("/manifests/");
+          String prefix = name.substring(0, manifestsIdx);
+          // Strip leading slash and v2/
+          if (prefix.startsWith("/")) prefix = prefix.substring(1);
+          if (prefix.startsWith("v2/")) prefix = prefix.substring(3);
+          String imageName = prefix;
+          String tag = name.substring(manifestsIdx + "/manifests/".length());
+          if (tag.startsWith("/")) tag = tag.substring(1);
+
+          if (!imageName.isEmpty() && !tag.isEmpty()) {
+            DockerImageInfo info = imageMap.get(imageName);
+            if (info == null) {
+              info = new DockerImageInfo();
+              info.setName(imageName);
+              info.setTags(new ArrayList<>());
+              imageMap.put(imageName, info);
+            }
+            if (!info.getTags().contains(tag)) {
+              info.getTags().add(tag);
+            }
+          }
+        }
+      }
+
+      log.debug("Internal API found {} Docker images in repo {}", imageMap.size(), repo.getName());
+    }
+    catch (Exception e) {
+      log.debug("Internal API listing failed for Docker images in {}: {}", repo.getName(), e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return imageMap;
   }
 
   // ==================== Component Parsing ====================

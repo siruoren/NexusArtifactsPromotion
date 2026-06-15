@@ -700,17 +700,19 @@ public class SyncService {
    */
   private List<String> listRemoteAssets(final Repository repo, final String directoryPath) {
     try {
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+
       // Get remote URL from repository configuration
       org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
       if (config == null) {
         log.warn("No configuration found for repository {}", repo.getName());
-        return new ArrayList<>();
+        return listCachedAssetsInternal(repo, directoryPath);
       }
 
       Map<String, Map<String, Object>> attributes = config.getAttributes();
       if (attributes == null || !attributes.containsKey("proxy")) {
         log.warn("No proxy configuration found for repository {}", repo.getName());
-        return new ArrayList<>();
+        return listCachedAssetsInternal(repo, directoryPath);
       }
 
       @SuppressWarnings("unchecked")
@@ -718,7 +720,7 @@ public class SyncService {
       String remoteUrl = (String) proxyAttrs.get("remoteUrl");
       if (remoteUrl == null || remoteUrl.isEmpty()) {
         log.warn("No remote URL configured for proxy repository {}", repo.getName());
-        return new ArrayList<>();
+        return listCachedAssetsInternal(repo, directoryPath);
       }
 
       if (!remoteUrl.endsWith("/")) {
@@ -729,8 +731,6 @@ public class SyncService {
       String[] repoAuth = extractAuthFromRepo(repo);
       String authUsername = (repoAuth != null) ? repoAuth[0] : null;
       String authPassword = (repoAuth != null) ? repoAuth[1] : null;
-
-      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
 
       // Strategy 1: Check if remote URL points to a local Nexus repo
       String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
@@ -748,24 +748,412 @@ public class SyncService {
           }
         }
         catch (Exception ignored) {
-          // Repo not found locally, fall through to HTTP
+          // Repo not found locally, fall through
         }
       }
 
-      // Strategy 2: Fall back to HTTP directory listing
-      if (isFullSync) {
-        // For full sync via HTTP, we need to recursively crawl the root directory
-        log.info("Falling back to HTTP recursive directory listing for full repo sync: {}", remoteUrl);
-        return listRemoteAssetsViaHttpRecursive("", remoteUrl, authUsername, authPassword);
+      // Strategy 2: Try remote Nexus Search API (for external Nexus instances)
+      // This can discover ALL remote assets, including those not yet cached locally.
+      List<String> remoteApiAssets = listAssetsViaRemoteNexusApi(remoteUrl, repo.getName(),
+          directoryPath, authUsername, authPassword);
+      if (!remoteApiAssets.isEmpty()) {
+        log.info("Found {} assets via remote Nexus Search API for repo {} in path '{}'",
+            remoteApiAssets.size(), repo.getName(), isFullSync ? "/" : directoryPath);
+        return remoteApiAssets;
       }
-      log.info("Falling back to HTTP directory listing for remote: {}", remoteUrl);
-      return listRemoteAssetsViaHttp(directoryPath, remoteUrl, authUsername, authPassword);
+
+      // Strategy 3: Fall back to HTTP directory listing
+      if (isFullSync) {
+        log.info("Falling back to HTTP recursive directory listing for full repo sync: {}", remoteUrl);
+        List<String> httpAssets = listRemoteAssetsViaHttpRecursive("", remoteUrl, authUsername, authPassword);
+        if (!httpAssets.isEmpty()) {
+          return httpAssets;
+        }
+      }
+      else {
+        log.info("Falling back to HTTP directory listing for remote: {}", remoteUrl);
+        List<String> httpAssets = listRemoteAssetsViaHttp(directoryPath, remoteUrl, authUsername, authPassword);
+        if (!httpAssets.isEmpty()) {
+          return httpAssets;
+        }
+      }
+
+      // Strategy 4: Last resort - list locally cached assets
+      // This only finds already-cached assets, but better than returning empty.
+      log.info("All remote listing strategies failed, falling back to locally cached assets for repo {}", repo.getName());
+      return listCachedAssetsInternal(repo, directoryPath);
 
     }
     catch (Exception e) {
       log.error("Failed to list remote assets for {}: {}", directoryPath, e.getMessage(), e);
-      return new ArrayList<>();
+      return listCachedAssetsInternal(repo, directoryPath);
     }
+  }
+
+  /**
+   * List assets from a remote Nexus instance via its Search API.
+   * This works for external Nexus instances that expose the REST API.
+   * Can discover ALL remote assets, including those not yet cached locally.
+   *
+   * The remoteUrl is the proxy repo's remote URL, e.g. https://remote-nexus:8081/repository/my-repo/
+   * We extract the base URL and repository name, then call the Search API.
+   */
+  private List<String> listAssetsViaRemoteNexusApi(final String remoteUrl, final String localRepoName,
+      final String directoryPath, final String authUsername, final String authPassword) {
+    List<String> results = new ArrayList<>();
+    try {
+      // Extract base URL and repo name from remote URL
+      // Pattern: <base-url>/repository/<repo-name>/
+      // e.g. https://host:8081/repository/my-repo/ → base=https://host:8081, repo=my-repo
+      // e.g. https://host/nexus/repository/my-repo/ → base=https://host/nexus, repo=my-repo
+      String remoteRepoName = null;
+      String remoteBaseUrl = null;
+
+      int repoIdx = remoteUrl.indexOf("/repository/");
+      if (repoIdx > 0) {
+        remoteBaseUrl = remoteUrl.substring(0, repoIdx);
+        String repoPart = remoteUrl.substring(repoIdx + "/repository/".length());
+        if (repoPart.endsWith("/")) {
+          repoPart = repoPart.substring(0, repoPart.length() - 1);
+        }
+        int slashIdx = repoPart.indexOf('/');
+        remoteRepoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
+      }
+
+      if (remoteRepoName == null || remoteBaseUrl == null) {
+        log.info("Cannot extract Nexus base URL and repo name from remote URL: {}", remoteUrl);
+        return results;
+      }
+
+      log.info("Remote Nexus API: baseUrl={}, repoName={}, auth={}", remoteBaseUrl, remoteRepoName,
+          authUsername != null ? authUsername : "none");
+
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String effectiveAuth = (authUsername != null && authPassword != null)
+          ? authUsername + ":" + authPassword : null;
+
+      // Try Search API with pagination
+      String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
+      String continuationToken = null;
+
+      do {
+        String searchUrl = searchUrlBase;
+        if (!isFullSync) {
+          String normalizedDir = directoryPath;
+          if (normalizedDir.startsWith("/")) {
+            normalizedDir = normalizedDir.substring(1);
+          }
+          if (normalizedDir.endsWith("/")) {
+            normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
+          }
+          searchUrl += "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
+        }
+        if (continuationToken != null) {
+          searchUrl += "&continuationToken=" + continuationToken;
+        }
+
+        log.info("Calling remote Nexus Search API: {}", searchUrl);
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        log.info("Remote Nexus Search API response: HTTP {} for {}", code, searchUrl);
+
+        if (code == 404) {
+          log.info("Remote Nexus Search API not available at {}, trying Components API", remoteBaseUrl);
+          conn.disconnect();
+          // Fall back to Components API
+          return listAssetsViaRemoteComponentsApi(remoteBaseUrl, remoteRepoName,
+              directoryPath, effectiveAuth);
+        }
+        if (code == 403 || code == 401) {
+          log.info("Remote Nexus Search API returned {} - authentication required for {}", code, remoteBaseUrl);
+          conn.disconnect();
+          return results;
+        }
+        if (code != 200) {
+          log.info("Remote Nexus Search API returned HTTP {} for {}", code, searchUrl);
+          conn.disconnect();
+          return results;
+        }
+
+        String json = readResponse(conn);
+        conn.disconnect();
+
+        if (log.isDebugEnabled()) {
+          log.debug("Search API response (first 500 chars): {}", json.substring(0, Math.min(json.length(), 500)));
+        }
+
+        // Parse assets from response
+        List<String> pageResults = parseSearchApiAssets(json, directoryPath);
+        results.addAll(pageResults);
+
+        // Extract continuation token for next page
+        continuationToken = extractJsonValue(json, "continuationToken");
+      }
+      while (continuationToken != null && !continuationToken.isEmpty());
+
+      log.info("Remote Nexus Search API found {} assets from {}/{}", results.size(), remoteBaseUrl, remoteRepoName);
+
+      // If Search API found nothing, try Components API as fallback
+      if (results.isEmpty()) {
+        log.info("Search API returned 0 results, trying Components API as fallback");
+        List<String> compResults = listAssetsViaRemoteComponentsApi(remoteBaseUrl, remoteRepoName,
+            directoryPath, effectiveAuth);
+        if (!compResults.isEmpty()) {
+          return compResults;
+        }
+      }
+    }
+    catch (Exception e) {
+      log.info("Remote Nexus Search API failed for {}: {}", remoteUrl, e.getMessage());
+    }
+    return results;
+  }
+
+  /**
+   * List assets from a remote Nexus instance via its Components API.
+   * Fallback when Search API returns 0 results or is not available.
+   */
+  private List<String> listAssetsViaRemoteComponentsApi(final String remoteBaseUrl, final String remoteRepoName,
+      final String directoryPath, final String effectiveAuth) {
+    List<String> results = new ArrayList<>();
+    try {
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName;
+      String continuationToken = null;
+
+      do {
+        String compUrl = compUrlBase;
+        if (continuationToken != null) {
+          compUrl += "&continuationToken=" + continuationToken;
+        }
+
+        log.info("Calling remote Nexus Components API: {}", compUrl);
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        log.info("Remote Nexus Components API response: HTTP {}", code);
+
+        if (code != 200) {
+          conn.disconnect();
+          return results;
+        }
+
+        String json = readResponse(conn);
+        conn.disconnect();
+
+        // Parse components and extract asset paths
+        List<String> pageResults = parseComponentsApiAssets(json, directoryPath);
+        results.addAll(pageResults);
+
+        continuationToken = extractJsonValue(json, "continuationToken");
+      }
+      while (continuationToken != null && !continuationToken.isEmpty());
+
+      log.info("Remote Nexus Components API found {} assets from {}/{}", results.size(), remoteBaseUrl, remoteRepoName);
+    }
+    catch (Exception e) {
+      log.info("Remote Nexus Components API failed: {}", e.getMessage());
+    }
+    return results;
+  }
+
+  /**
+   * Parse assets from Nexus Components API response.
+   * Each component has an "assets" array with asset objects containing "path".
+   */
+  private List<String> parseComponentsApiAssets(final String json, final String directoryPath) {
+    List<String> results = new ArrayList<>();
+    try {
+      String itemsSection = extractJsonArray(json, "items");
+      if (itemsSection == null) return results;
+
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String normalizedPrefix = directoryPath;
+      if (normalizedPrefix != null && normalizedPrefix.startsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(1);
+      }
+      if (normalizedPrefix != null && normalizedPrefix.endsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(0, normalizedPrefix.length() - 1);
+      }
+
+      int pos = 0;
+      while (pos < itemsSection.length()) {
+        int objStart = itemsSection.indexOf('{', pos);
+        if (objStart < 0) break;
+        int objEnd = findMatchingBrace(itemsSection, objStart);
+        if (objEnd < 0) break;
+
+        String component = itemsSection.substring(objStart, objEnd + 1);
+
+        // Extract assets array from component
+        String assetsSection = extractJsonArray(component, "assets");
+        if (assetsSection != null) {
+          int aPos = 0;
+          while (aPos < assetsSection.length()) {
+            int aObjStart = assetsSection.indexOf('{', aPos);
+            if (aObjStart < 0) break;
+            int aObjEnd = findMatchingBrace(assetsSection, aObjStart);
+            if (aObjEnd < 0) break;
+
+            String asset = assetsSection.substring(aObjStart, aObjEnd + 1);
+            String path = extractJsonValue(asset, "path");
+            if (path != null && !path.isEmpty()) {
+              if (path.startsWith("/")) path = path.substring(1);
+              if (!path.endsWith("/")) {
+                if (isFullSync) {
+                  results.add(path);
+                }
+                else if (path.startsWith(normalizedPrefix + "/")) {
+                  results.add(path);
+                }
+              }
+            }
+
+            aPos = aObjEnd + 1;
+          }
+        }
+
+        pos = objEnd + 1;
+      }
+    }
+    catch (Exception e) {
+      log.info("Failed to parse Components API assets: {}", e.getMessage());
+    }
+    return results;
+  }
+
+  /**
+   * Parse assets from Nexus Search API response.
+   * Extracts asset paths from the "items" array.
+   */
+  private List<String> parseSearchApiAssets(final String json, final String directoryPath) {
+    List<String> results = new ArrayList<>();
+    try {
+      String itemsSection = extractJsonArray(json, "items");
+      if (itemsSection == null) return results;
+
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String normalizedPrefix = directoryPath;
+      if (normalizedPrefix != null && normalizedPrefix.startsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(1);
+      }
+      if (normalizedPrefix != null && normalizedPrefix.endsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(0, normalizedPrefix.length() - 1);
+      }
+
+      int pos = 0;
+      while (pos < itemsSection.length()) {
+        int objStart = itemsSection.indexOf('{', pos);
+        if (objStart < 0) break;
+        int objEnd = findMatchingBrace(itemsSection, objStart);
+        if (objEnd < 0) break;
+
+        String item = itemsSection.substring(objStart, objEnd + 1);
+        String path = extractJsonValue(item, "path");
+        if (path != null && !path.isEmpty()) {
+          // Normalize: strip leading slash
+          if (path.startsWith("/")) path = path.substring(1);
+
+          // Skip directory entries
+          if (!path.endsWith("/")) {
+            if (isFullSync) {
+              results.add(path);
+            }
+            else if (path.startsWith(normalizedPrefix + "/")) {
+              results.add(path);
+            }
+          }
+        }
+
+        pos = objEnd + 1;
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to parse Search API assets: {}", e.getMessage());
+    }
+    return results;
+  }
+
+  /**
+   * List locally cached assets in a repository using Nexus internal StorageTx API.
+   * This is the most reliable approach for proxy repositories, as it bypasses
+   * HTTP authentication and directory listing issues entirely.
+   * Works for all repository types including proxy repositories.
+   */
+  private List<String> listCachedAssetsInternal(final Repository repo, final String directoryPath) {
+    List<String> results = new ArrayList<>();
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) {
+        log.debug("Bucket not found for repository: {}", repo.getName());
+        return results;
+      }
+
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String normalizedPrefix = directoryPath;
+      if (normalizedPrefix != null && normalizedPrefix.startsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(1);
+      }
+      if (normalizedPrefix != null && normalizedPrefix.endsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(0, normalizedPrefix.length() - 1);
+      }
+
+      Iterable<Asset> assets = tx.browseAssets(bucket);
+      for (Asset asset : assets) {
+        String name = asset.name();
+        if (name == null) continue;
+
+        // Normalize: strip leading slash
+        String normalizedName = name.startsWith("/") ? name.substring(1) : name;
+
+        // Skip directory entries
+        if (normalizedName.endsWith("/")) continue;
+
+        if (isFullSync) {
+          results.add(normalizedName);
+        }
+        else {
+          // Include assets under the path prefix
+          if (normalizedName.startsWith(normalizedPrefix + "/")) {
+            results.add(normalizedName);
+          }
+        }
+      }
+
+      log.debug("Internal API found {} cached assets in repo {} under prefix '{}'",
+          results.size(), repo.getName(), isFullSync ? "/" : normalizedPrefix);
+    }
+    catch (Exception e) {
+      log.debug("Internal API search failed for repo {}/{}: {}", repo.getName(), directoryPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return results;
   }
 
   /**
@@ -1191,12 +1579,99 @@ public class SyncService {
         }
       }
 
-      // For external HTTP remotes, we cannot easily get MD5 from directory listing
-      // Return null so sync will always proceed (full sync behavior)
+      // For external Nexus instances, try to get MD5 via remote Search API
+      String remoteMd5 = getRemoteAssetMd5ViaApi(remoteUrl, assetPath, repoAuth);
+      if (remoteMd5 != null) {
+        return remoteMd5;
+      }
+
+      // For external HTTP remotes where we cannot get MD5, return null
+      // so sync will always proceed (full sync behavior)
       return null;
     }
     catch (Exception e) {
       log.debug("Failed to get remote MD5 for {}/{}: {}", proxyRepo.getName(), assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get the MD5 checksum of a remote asset via the Nexus Search API.
+   * This works for external Nexus instances that expose the REST API.
+   */
+  private String getRemoteAssetMd5ViaApi(final String remoteUrl, final String assetPath,
+      final String[] repoAuth) {
+    try {
+      String remoteRepoName = null;
+      String remoteBaseUrl = null;
+
+      int repoIdx = remoteUrl.indexOf("/repository/");
+      if (repoIdx > 0) {
+        remoteBaseUrl = remoteUrl.substring(0, repoIdx);
+        String repoPart = remoteUrl.substring(repoIdx + "/repository/".length());
+        if (repoPart.endsWith("/")) {
+          repoPart = repoPart.substring(0, repoPart.length() - 1);
+        }
+        int slashIdx = repoPart.indexOf('/');
+        remoteRepoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
+      }
+
+      if (remoteRepoName == null || remoteBaseUrl == null) return null;
+
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+
+      // Normalize asset path for search
+      String searchPath = assetPath;
+      if (searchPath.startsWith("/")) searchPath = searchPath.substring(1);
+
+      // Use Search API to find the specific asset and get its checksum
+      String searchUrl = remoteBaseUrl + "/service/rest/v1/search/assets?repository="
+          + remoteRepoName + "&name=" + java.net.URLEncoder.encode(searchPath, "UTF-8");
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+      conn.setRequestProperty("Accept", "application/json");
+
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      String json = readResponse(conn);
+      conn.disconnect();
+
+      // Parse checksums from the first matching asset
+      String itemsSection = extractJsonArray(json, "items");
+      if (itemsSection == null) return null;
+
+      int objStart = itemsSection.indexOf('{');
+      if (objStart < 0) return null;
+      int objEnd = findMatchingBrace(itemsSection, objStart);
+      if (objEnd < 0) return null;
+
+      String item = itemsSection.substring(objStart, objEnd + 1);
+
+      // checksums is a JSON object like {"md5": "xxx", "sha1": "yyy", ...}
+      // Try to extract md5 value directly from the item string
+      // Look for "checksums":{...,"md5":"<value>",...} pattern
+      String md5 = extractChecksumValue(item, "md5");
+      if (md5 != null && !md5.isEmpty()) {
+        log.debug("Found remote MD5 via Search API for {}: {}", assetPath, md5);
+        return md5;
+      }
+
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 via API for {}: {}", assetPath, e.getMessage());
       return null;
     }
   }
@@ -1369,6 +1844,30 @@ public class SyncService {
   // ========================================================================
   // Simple JSON parsing (no external library dependency)
   // ========================================================================
+
+  /**
+   * Extract a checksum value from a JSON string that contains a "checksums" object.
+   * The checksums object format: {"md5": "xxx", "sha1": "yyy", ...}
+   * This handles the nested object case where extractJsonValue alone might not work.
+   */
+  private String extractChecksumValue(final String json, final String algo) {
+    // Find "checksums" key
+    String checksumsPattern = "\"checksums\"";
+    int checksumsIdx = json.indexOf(checksumsPattern);
+    if (checksumsIdx < 0) return null;
+
+    // Find the opening brace of the checksums object
+    int objStart = json.indexOf('{', checksumsIdx + checksumsPattern.length());
+    if (objStart < 0) return null;
+
+    // Find the matching closing brace
+    int objEnd = findMatchingBrace(json, objStart);
+    if (objEnd < 0) return null;
+
+    // Extract the checksums object and find the algorithm value
+    String checksumsObj = json.substring(objStart, objEnd + 1);
+    return extractJsonValue(checksumsObj, algo);
+  }
 
   private String extractJsonValue(final String json, final String key) {
     String pattern = "\"" + key + "\"";
