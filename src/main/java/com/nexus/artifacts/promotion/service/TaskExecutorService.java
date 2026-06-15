@@ -41,12 +41,14 @@ public class TaskExecutorService {
   private static final int DEFAULT_PROMOTION_POOL_SIZE = 4;
   private static final int DEFAULT_SYNC_POOL_SIZE = 4;
   private static final int DEFAULT_MAX_SYNC_QUEUE_SIZE = 20;
+  private static final int DEFAULT_MAX_SYNC_RECORDS = 200;
   private static final long TASK_TIMEOUT_MINUTES = 60;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
   private volatile int promotionPoolSize = DEFAULT_PROMOTION_POOL_SIZE;
   private volatile int syncPoolSize = DEFAULT_SYNC_POOL_SIZE;
   private volatile int maxSyncQueueSize = DEFAULT_MAX_SYNC_QUEUE_SIZE;
+  private volatile int maxSyncRecords = DEFAULT_MAX_SYNC_RECORDS;
 
   private ExecutorService promotionExecutor;
   private ExecutorService syncExecutor;
@@ -372,6 +374,11 @@ public class TaskExecutorService {
     log.info("Max sync queue size updated to {}", maxSyncQueueSize);
   }
 
+  public void updateMaxSyncRecords(final int newMax) {
+    this.maxSyncRecords = Math.max(1, newMax);
+    log.info("Max sync records updated to {}", maxSyncRecords);
+  }
+
   private void reconfigurePool(final ExecutorService executor, final int newSize, final String type) {
     if (executor instanceof ThreadPoolExecutor) {
       ThreadPoolExecutor tpe = (ThreadPoolExecutor) executor;
@@ -384,6 +391,7 @@ public class TaskExecutorService {
   public int getPromotionPoolSize() { return promotionPoolSize; }
   public int getSyncPoolSize() { return syncPoolSize; }
   public int getMaxSyncQueueSize() { return maxSyncQueueSize; }
+  public int getMaxSyncRecords() { return maxSyncRecords; }
 
   /**
    * Check if sync queue has capacity.

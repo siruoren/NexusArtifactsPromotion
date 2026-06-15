@@ -362,6 +362,7 @@ public class SyncService {
 
   /**
    * Get all sync tasks (for queue display).
+   * Returns at most maxSyncRecords entries (newest first).
    */
   public List<SyncTaskInfo> getAllSyncTasks() {
     cleanupExpiredTaskInfos();
@@ -378,6 +379,10 @@ public class SyncService {
       tasks.add(info);
     }
     tasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
+    int maxRecords = taskExecutor.getMaxSyncRecords();
+    if (tasks.size() > maxRecords) {
+      tasks = tasks.subList(0, maxRecords);
+    }
     return tasks;
   }
 

@@ -65,6 +65,18 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
       }
     }
 
+    String maxRecordsStr = props.get(PROP_MAX_SYNC_RECORDS);
+    if (maxRecordsStr != null) {
+      try {
+        int maxRecords = Integer.parseInt(maxRecordsStr);
+        taskExecutor.updateMaxSyncRecords(maxRecords);
+        log.info("Max sync records set to {} from capability configuration", maxRecords);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid max sync records value: {}", maxRecordsStr);
+      }
+    }
+
     // Update admin credentials for internal API calls
     String adminUser = props.get(PROP_ADMIN_USERNAME);
     String adminPass = props.get(PROP_ADMIN_PASSWORD);

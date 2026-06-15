@@ -29,6 +29,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   public static final String PROP_SYNC_POOL_SIZE = "syncPoolSize";
   public static final String PROP_MAX_SYNC_QUEUE_SIZE = "maxSyncQueueSize";
+  public static final String PROP_MAX_SYNC_RECORDS = "maxSyncRecords";
   public static final String PROP_ADMIN_USERNAME = "adminUsername";
   public static final String PROP_ADMIN_PASSWORD = "adminPassword";
 
@@ -42,6 +43,12 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
       PROP_MAX_SYNC_QUEUE_SIZE,
       "Max Sync Queue Size",
       "Maximum number of concurrent sync queue tasks (1-100, default: 20)",
+      false);
+
+  private static final NumberTextFormField MAX_RECORDS_FIELD = new NumberTextFormField(
+      PROP_MAX_SYNC_RECORDS,
+      "Max Sync Queue Records",
+      "Maximum number of sync task records to retain (1-10000, default: 200)",
       false);
 
   private static final StringTextFormField ADMIN_USERNAME_FIELD = new StringTextFormField(
@@ -76,7 +83,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, ADMIN_USERNAME_FIELD, ADMIN_PASSWORD_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, ADMIN_USERNAME_FIELD, ADMIN_PASSWORD_FIELD);
   }
 
   public Set<Tag> getTags() {

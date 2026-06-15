@@ -443,6 +443,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     me.store = Ext.create('Ext.data.Store', {
       fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
         'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
+      pageSize: 20,
       proxy: {
         type: 'ajax',
         url: '/service/rest/v1/sync/queue',
@@ -507,7 +508,15 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
               itemId: 'activeCountBtn',
               disabled: true
             }
-          ]
+          ],
+          dockedItems: [{
+            xtype: 'pagingtoolbar',
+            store: me.store,
+            dock: 'bottom',
+            displayInfo: true,
+            displayMsg: '{0} - {1} / {2}',
+            emptyMsg: ''
+          }]
         }
       ]
     });
@@ -1250,6 +1259,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     var fileStore = Ext.create('Ext.data.Store', {
       fields: ['path', 'type', 'size', 'status'],
+      pageSize: 10,
       data: preview && preview.files ? (function () {
         var arr = [];
         Ext.each(preview.files, function (f) {
@@ -1341,7 +1351,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
                 text: _t('promotion.result.status'), dataIndex: 'status', width: 100,
                 renderer: statusRenderer
               }
-            ]
+            ],
+            dockedItems: [{
+              xtype: 'pagingtoolbar',
+              store: fileStore,
+              dock: 'bottom',
+              displayInfo: true,
+              displayMsg: '{0} - {1} / {2}',
+              emptyMsg: ''
+            }]
           }
         ]
       }],
