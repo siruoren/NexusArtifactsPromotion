@@ -105,6 +105,17 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.table.result": "Result",
     "sync.queue.table.items": "items",
     "sync.queue.table.refresh": "Refresh",
+    "sync.queue.filter.repository": "Repository",
+    "sync.queue.filter.path": "Path",
+    "sync.queue.filter.status": "Status",
+    "sync.queue.filter.username": "User",
+    "sync.queue.filter.all": "All",
+    "sync.queue.filter.search": "Search",
+    "sync.queue.filter.reset": "Reset",
+    "sync.queue.status.failed": "Failed",
+    "sync.queue.status.running": "Running",
+    "sync.queue.status.cancelled": "Cancelled",
+    "sync.queue.status.completed": "Completed",
     "sync.queue.config.title": "Queue Configuration",
     "sync.queue.config.maxSyncQueueSize": "Max Sync Queue Size",
     "sync.queue.config.syncPoolSize": "Sync Pool Size",
@@ -208,6 +219,17 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.table.result": "\u7ed3\u679c",
     "sync.queue.table.items": "\u9879",
     "sync.queue.table.refresh": "\u5237\u65b0",
+    "sync.queue.filter.repository": "\u4ed3\u5e93",
+    "sync.queue.filter.path": "\u8def\u5f84",
+    "sync.queue.filter.status": "\u72b6\u6001",
+    "sync.queue.filter.username": "\u7528\u6237",
+    "sync.queue.filter.all": "\u5168\u90e8",
+    "sync.queue.filter.search": "\u641c\u7d22",
+    "sync.queue.filter.reset": "\u91cd\u7f6e",
+    "sync.queue.status.failed": "\u5931\u8d25",
+    "sync.queue.status.running": "\u8fdb\u884c\u4e2d",
+    "sync.queue.status.cancelled": "\u53d6\u6d88",
+    "sync.queue.status.completed": "\u5b8c\u6210",
     "sync.queue.config.title": "\u961f\u5217\u914d\u7f6e",
     "sync.queue.config.maxSyncQueueSize": "\u6700\u5927\u540c\u6b65\u961f\u5217\u6570",
     "sync.queue.config.syncPoolSize": "\u540c\u6b65\u7ebf\u7a0b\u6c60\u5927\u5c0f",
@@ -440,10 +462,9 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
   initComponent: function () {
     var me = this;
 
-    me.store = Ext.create('Ext.data.Store', {
+    me.allDataStore = Ext.create('Ext.data.Store', {
       fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
         'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
-      pageSize: 20,
       proxy: {
         type: 'ajax',
         url: '/service/rest/v1/sync/queue',
@@ -451,25 +472,33 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
       },
       autoLoad: true,
       listeners: {
-        load: function () {
-          me.updateStatusColumn();
+        load: function (store) {
+          me.applyFilters();
           me.checkAllFinished();
         }
       }
     });
 
+    me.store = Ext.create('Ext.data.Store', {
+      fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+        'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
+      pageSize: 20
+    });
+
     var statusRenderer = function (val) {
       switch ((val || '').toLowerCase()) {
         case 'running':
-          return '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>';
+          return '<span style="color:#337ab7;font-weight:bold;">' + _t('sync.queue.status.running') + '</span>';
         case 'completed':
-          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('sync.queue.status.completed') + '</span>';
         case 'failed':
-          return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
-        case 'migrated':
-          return '<span style="color:#999;">Migrated</span>';
+          return '<span style="color:#d9534f;font-weight:bold;">' + _t('sync.queue.status.failed') + '</span>';
+        case 'cancelled':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('sync.queue.status.cancelled') + '</span>';
         case 'pending':
-          return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
+          return '<span style="color:#999;">' + _t('sync.queue.status.running') + '</span>';
+        case 'migrated':
+          return '<span style="color:#5cb85c;">' + _t('sync.queue.status.completed') + '</span>';
         default:
           return '<span style="color:#999;">' + sanitize(val || '') + '</span>';
       }
@@ -481,29 +510,112 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
       return d.toLocaleString();
     };
 
+    var tipRenderer = function (value, meta) {
+      meta.tdAttr = 'data-qtip="' + sanitize(value || '') + '"';
+      return value;
+    };
+
+    var tipStatusRenderer = function (value, meta) {
+      meta.tdAttr = 'data-qtip="' + sanitize(value || '') + '"';
+      return statusRenderer(value);
+    };
+
+    var tipTimeRenderer = function (value, meta) {
+      var display = timeRenderer(value);
+      meta.tdAttr = 'data-qtip="' + sanitize(display) + '"';
+      return display;
+    };
+
     Ext.apply(me, {
       items: [
         {
           xtype: 'gridpanel',
           store: me.store,
           columns: [
-            { text: _t('sync.queue.table.queueId'), dataIndex: 'taskId', width: 180 },
-            { text: _t('sync.queue.table.sourceRepository'), dataIndex: 'sourceRepository', flex: 1 },
-            { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1 },
-            { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100, renderer: statusRenderer },
-            { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150, renderer: timeRenderer },
-            { text: _t('sync.queue.table.endTime'), dataIndex: 'endTime', width: 150, renderer: timeRenderer },
-            { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100 },
-            { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1 }
+            { text: _t('sync.queue.table.queueId'), dataIndex: 'taskId', width: 180, renderer: tipRenderer },
+            { text: _t('sync.queue.table.sourceRepository'), dataIndex: 'sourceRepository', flex: 1, renderer: tipRenderer },
+            { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1, renderer: tipRenderer },
+            { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100, renderer: tipStatusRenderer },
+            { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150, renderer: tipTimeRenderer },
+            { text: _t('sync.queue.table.endTime'), dataIndex: 'endTime', width: 150, renderer: tipTimeRenderer },
+            { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100, renderer: tipRenderer },
+            { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1, renderer: tipRenderer }
           ],
           tbar: [
             {
-              text: _t('sync.queue.table.refresh'),
-              iconCls: 'x-fa fa-refresh',
-              handler: function () { me.store.reload(); }
+              xtype: 'textfield',
+              itemId: 'filterRepository',
+              emptyText: _t('sync.queue.filter.repository'),
+              width: 150,
+              listeners: {
+                specialkey: function (field, e) {
+                  if (e.getKey() === e.ENTER) me.applyFilters();
+                }
+              }
             },
             {
-              text: _t('promotion.progress.pending'),
+              xtype: 'textfield',
+              itemId: 'filterPath',
+              emptyText: _t('sync.queue.filter.path'),
+              width: 150,
+              listeners: {
+                specialkey: function (field, e) {
+                  if (e.getKey() === e.ENTER) me.applyFilters();
+                }
+              }
+            },
+            {
+              xtype: 'combobox',
+              itemId: 'filterStatus',
+              emptyText: _t('sync.queue.filter.status'),
+              width: 120,
+              editable: false,
+              store: [
+                ['', _t('sync.queue.filter.all')],
+                ['running', _t('sync.queue.status.running')],
+                ['completed', _t('sync.queue.status.completed')],
+                ['failed', _t('sync.queue.status.failed')],
+                ['cancelled', _t('sync.queue.status.cancelled')]
+              ],
+              listeners: {
+                select: function () { me.applyFilters(); }
+              }
+            },
+            {
+              xtype: 'textfield',
+              itemId: 'filterUsername',
+              emptyText: _t('sync.queue.filter.username'),
+              width: 120,
+              listeners: {
+                specialkey: function (field, e) {
+                  if (e.getKey() === e.ENTER) me.applyFilters();
+                }
+              }
+            },
+            {
+              text: _t('sync.queue.filter.search'),
+              iconCls: 'x-fa fa-search',
+              handler: function () { me.applyFilters(); }
+            },
+            {
+              text: _t('sync.queue.filter.reset'),
+              iconCls: 'x-fa fa-undo',
+              handler: function () {
+                me.down('#filterRepository').setValue('');
+                me.down('#filterPath').setValue('');
+                me.down('#filterStatus').setValue('');
+                me.down('#filterUsername').setValue('');
+                me.applyFilters();
+              }
+            },
+            '-',
+            {
+              text: _t('sync.queue.table.refresh'),
+              iconCls: 'x-fa fa-refresh',
+              handler: function () { me.allDataStore.reload(); }
+            },
+            {
+              text: _t('sync.queue.status.running') + ': 0',
               iconCls: 'x-fa fa-circle-o',
               itemId: 'activeCountBtn',
               disabled: true
@@ -523,41 +635,65 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
 
     me.callParent(arguments);
 
-    // Start auto-refresh for active tasks
     me._queuePollInterval = setInterval(function () {
       if (!me.destroyed) {
-        me.store.reload();
+        me.allDataStore.reload();
       } else {
         clearInterval(me._queuePollInterval);
       }
     }, 3000);
   },
 
-  updateStatusColumn: function () {
-    // Force grid to re-render status column
+  applyFilters: function () {
+    var me = this;
+    var repoFilter = (me.down('#filterRepository') || {}).value || '';
+    var pathFilter = (me.down('#filterPath') || {}).value || '';
+    var statusFilter = (me.down('#filterStatus') || {}).value || '';
+    var userFilter = (me.down('#filterUsername') || {}).value || '';
+
+    repoFilter = repoFilter.toLowerCase();
+    pathFilter = pathFilter.toLowerCase();
+    statusFilter = statusFilter.toLowerCase();
+    userFilter = userFilter.toLowerCase();
+
+    var filtered = [];
+    me.allDataStore.each(function (rec) {
+      if (repoFilter && (rec.get('sourceRepository') || '').toLowerCase().indexOf(repoFilter) === -1 &&
+          (rec.get('targetRepository') || '').toLowerCase().indexOf(repoFilter) === -1) return;
+      if (pathFilter && (rec.get('path') || '').toLowerCase().indexOf(pathFilter) === -1) return;
+      if (statusFilter) {
+        var st = (rec.get('status') || '').toLowerCase();
+        if (statusFilter === 'running' && st !== 'running' && st !== 'pending') return;
+        if (statusFilter === 'completed' && st !== 'completed' && st !== 'migrated') return;
+        if (statusFilter === 'failed' && st !== 'failed') return;
+        if (statusFilter === 'cancelled' && st !== 'cancelled') return;
+        if (statusFilter !== 'running' && statusFilter !== 'completed' && st !== statusFilter) return;
+      }
+      if (userFilter && (rec.get('username') || '').toLowerCase().indexOf(userFilter) === -1) return;
+      filtered.push(rec.copy());
+    });
+
+    me.store.loadData(filtered);
+    me.checkAllFinished();
   },
 
   checkAllFinished: function () {
     var me = this;
     var hasActive = false;
-    me.store.each(function (rec) {
+    var activeCount = 0;
+    me.allDataStore.each(function (rec) {
       var st = (rec.get('status') || '').toLowerCase();
       if (st === 'running' || st === 'pending') {
         hasActive = true;
+        activeCount++;
       }
     });
 
     var activeBtn = me.down('#activeCountBtn');
     if (activeBtn) {
-      var activeCount = 0;
-      me.store.each(function (rec) {
-        var st = (rec.get('status') || '').toLowerCase();
-        if (st === 'running' || st === 'pending') activeCount++;
-      });
-      activeBtn.setText('Active: ' + activeCount);
+      activeBtn.setText(_t('sync.queue.status.running') + ': ' + activeCount);
     }
 
-    // If all tasks are finished, stop auto-refresh to release resources
     if (!hasActive && me._queuePollInterval) {
       clearInterval(me._queuePollInterval);
       me._queuePollInterval = null;
