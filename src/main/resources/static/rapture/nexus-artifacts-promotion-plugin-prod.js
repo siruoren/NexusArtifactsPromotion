@@ -345,6 +345,44 @@ function sanitize(str) {
   return div.innerHTML;
 }
 
+/**
+ * Find a store record index by matching a Docker asset path to image:tag format.
+ * Backend returns paths like "v2/myapp/manifests/latest" but store has "myapp:latest".
+ * Also tries matching by originalPath field.
+ */
+function findDockerPathIndex(store, backendPath) {
+  if (!backendPath || !store) return -1;
+
+  // Try matching by originalPath field first (Docker promotion modal stores original paths)
+  var idx = store.findExact('originalPath', backendPath);
+  if (idx >= 0) return idx;
+
+  // Try converting Docker path to image:tag format
+  // Pattern: v2/<image>/manifests/<tag>
+  var manifestMatch = backendPath.match(/^v2\/(.+?)\/manifests\/(.+)$/);
+  if (manifestMatch) {
+    var imageTag = manifestMatch[1] + ':' + manifestMatch[2];
+    idx = store.findExact('path', imageTag);
+    if (idx >= 0) return idx;
+  }
+
+  // Pattern: v2/<image>/blobs/<digest> - match by image name prefix
+  var blobsMatch = backendPath.match(/^v2\/(.+?)\/blobs\//);
+  if (blobsMatch) {
+    var imageName = blobsMatch[1];
+    store.each(function (rec) {
+      var p = rec.get('path') || '';
+      if (p.indexOf(imageName + ':') === 0 || p.indexOf(imageName + '/') === 0) {
+        idx = store.indexOf(rec);
+        return false;
+      }
+    });
+    if (idx >= 0) return idx;
+  }
+
+  return -1;
+}
+
 function apiRequest(method, path, data) {
   return new Ext.Promise(function (resolve, reject) {
     // Build request options - inherit from Ext.Ajax defaultHeaders to get
@@ -1813,6 +1851,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               var item = backendItems[i];
               if (!item.path) continue;
               var idx = store.findExact('path', item.path);
+              // Fallback: try matching Docker image:tag format
+              if (idx < 0) {
+                idx = findDockerPathIndex(store, item.path);
+              }
               if (idx >= 0) {
                 var itemStatus = item.status;
                 if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
@@ -1855,6 +1897,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           var bi = backendItems[j];
           if (!bi.path) continue;
           var bidx = store.findExact('path', bi.path);
+          // Fallback: try matching Docker image:tag format
+          if (bidx < 0) {
+            bidx = findDockerPathIndex(store, bi.path);
+          }
           if (bidx >= 0) {
             var biStatus = bi.status;
             if (biStatus !== 'failed' && biStatus !== 'skipped' && biStatus !== 'success') {
@@ -2168,6 +2214,18 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               win.down('#progressContainer').show();
               var grid = win.down('#fileGrid');
               if (grid && grid.title) { grid.setTitle(''); }
+
+              // Change buttons: hide promote, change cancel to close
+              promoteBtn.hide();
+              cancelBtn.setText(_t('promotion.result.close'));
+              cancelBtn.enable();
+              cancelBtn.setHandler(function () {
+                if (win._pollInterval) {
+                  clearInterval(win._pollInterval);
+                  win._pollInterval = null;
+                }
+                win.close();
+              });
 
               // Start polling
               me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles);

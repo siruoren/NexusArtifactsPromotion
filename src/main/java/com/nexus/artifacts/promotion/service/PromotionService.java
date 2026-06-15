@@ -531,6 +531,12 @@ public class PromotionService {
       return promoteMavenMetadata(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
     }
 
+    // Special handling for Docker format: use Docker v2 API for push
+    // Docker repositories don't accept direct PUT uploads - they require the Docker v2 API
+    if (isDockerAssetPath(filePath)) {
+      return promoteDockerAsset(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+    }
+
     // Download from source
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
@@ -1233,6 +1239,277 @@ public class PromotionService {
       return "directory";
     }
     return "file";
+  }
+
+  /**
+   * Check if the asset path is a Docker v2 format path.
+   * Docker paths start with "v2/" and contain /manifests/ or /blobs/ segments.
+   */
+  private boolean isDockerAssetPath(final String path) {
+    if (path == null) return false;
+    return path.startsWith("v2/") && (path.contains("/manifests/") || path.contains("/blobs/"));
+  }
+
+  /**
+   * Promote a Docker asset using Docker v2 API.
+   * Docker repositories don't accept direct PUT uploads - they require the Docker v2 API:
+   * - Manifests: PUT /v2/<name>/manifests/<tag> with proper Content-Type
+   * - Blobs: POST /v2/<name>/blobs/uploads/ then PUT with digest
+   */
+  private PromotionTaskResult.FileItem promoteDockerAsset(
+      final String sourceRepo,
+      final String targetRepo,
+      final String filePath,
+      final String cookieHeader,
+      final String csrfToken,
+      final String nexusBaseUrl,
+      final String sourceMd5,
+      final String targetMd5) throws IOException
+  {
+    // Parse Docker path: v2/<image>/manifests/<tag> or v2/<image>/blobs/<digest>
+    String pathWithoutV2 = filePath.substring(3); // remove "v2/"
+
+    int manifestIdx = pathWithoutV2.indexOf("/manifests/");
+    int blobsIdx = pathWithoutV2.indexOf("/blobs/");
+
+    if (manifestIdx >= 0) {
+      return promoteDockerManifest(sourceRepo, targetRepo, pathWithoutV2, manifestIdx,
+          cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+    }
+    else if (blobsIdx >= 0) {
+      return promoteDockerBlob(sourceRepo, targetRepo, pathWithoutV2, blobsIdx,
+          cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+    }
+    else {
+      throw new IOException("Unknown Docker asset path format: " + filePath);
+    }
+  }
+
+  /**
+   * Promote a Docker manifest using Docker v2 API.
+   * Downloads the manifest from source, then pushes it to target via PUT /v2/<name>/manifests/<tag>.
+   */
+  private PromotionTaskResult.FileItem promoteDockerManifest(
+      final String sourceRepo,
+      final String targetRepo,
+      final String pathWithoutV2,
+      final int manifestIdx,
+      final String cookieHeader,
+      final String csrfToken,
+      final String nexusBaseUrl,
+      final String sourceMd5,
+      final String targetMd5) throws IOException
+  {
+    String imageName = pathWithoutV2.substring(0, manifestIdx);
+    String tag = pathWithoutV2.substring(manifestIdx + "/manifests/".length());
+    String filePath = "v2/" + pathWithoutV2;
+
+    // Step 1: Download manifest from source with proper Accept headers
+    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + filePath);
+    HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    downloadConn.setRequestMethod("GET");
+    downloadConn.setConnectTimeout(TIMEOUT_MS);
+    downloadConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(downloadConn, cookieHeader, csrfToken);
+    downloadConn.setRequestProperty("Accept",
+        "application/vnd.docker.distribution.manifest.v2+json," +
+        "application/vnd.docker.distribution.manifest.list.v2+json," +
+        "application/vnd.oci.image.manifest.v1+json," +
+        "application/json");
+
+    int downloadCode = downloadConn.getResponseCode();
+    if (downloadCode != 200) {
+      String errorMsg = readErrorResponse(downloadConn);
+      downloadConn.disconnect();
+      throw new IOException("Download manifest from " + sourceRepo + "/" + filePath +
+          " failed: HTTP " + downloadCode + " - " + errorMsg);
+    }
+
+    // Get the Content-Type of the manifest (critical for Docker push)
+    String contentType = downloadConn.getContentType();
+    if (contentType == null || contentType.isEmpty()) {
+      contentType = "application/vnd.docker.distribution.manifest.v2+json";
+    }
+
+    // Read manifest content
+    byte[] manifestBytes;
+    try (InputStream input = downloadConn.getInputStream()) {
+      manifestBytes = readAllBytes(input);
+    }
+    finally {
+      downloadConn.disconnect();
+    }
+
+    // Step 2: Push manifest to target via Docker v2 API
+    URL pushUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/manifests/" + tag);
+    HttpURLConnection pushConn = (HttpURLConnection) pushUrl.openConnection();
+    pushConn.setRequestMethod("PUT");
+    pushConn.setDoOutput(true);
+    pushConn.setConnectTimeout(TIMEOUT_MS);
+    pushConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(pushConn, cookieHeader, csrfToken);
+    pushConn.setRequestProperty("Content-Type", contentType);
+
+    try (OutputStream output = pushConn.getOutputStream()) {
+      output.write(manifestBytes);
+      output.flush();
+    }
+
+    int pushCode = pushConn.getResponseCode();
+    String pushMsg = "";
+    if (pushCode >= 400) {
+      pushMsg = readErrorResponse(pushConn);
+    }
+    pushConn.disconnect();
+
+    if (pushCode < 200 || pushCode > 299) {
+      throw new IOException("Push manifest to " + targetRepo + "/v2/" + imageName + "/manifests/" + tag +
+          " failed: HTTP " + pushCode + " - " + pushMsg);
+    }
+
+    log.info("Successfully promoted Docker manifest: {}/v2/{}/manifests/{} -> {}",
+        sourceRepo, imageName, tag, targetRepo);
+
+    PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "image");
+    item.setSourceMd5(sourceMd5);
+    item.setTargetMd5(targetMd5);
+    item.setStatus("success");
+    return item;
+  }
+
+  /**
+   * Promote a Docker blob using Docker v2 API.
+   * Downloads the blob from source, then pushes it to target via the blob upload process.
+   */
+  private PromotionTaskResult.FileItem promoteDockerBlob(
+      final String sourceRepo,
+      final String targetRepo,
+      final String pathWithoutV2,
+      final int blobsIdx,
+      final String cookieHeader,
+      final String csrfToken,
+      final String nexusBaseUrl,
+      final String sourceMd5,
+      final String targetMd5) throws IOException
+  {
+    String imageName = pathWithoutV2.substring(0, blobsIdx);
+    String digest = pathWithoutV2.substring(blobsIdx + "/blobs/".length());
+    String filePath = "v2/" + pathWithoutV2;
+
+    // Step 1: Initiate blob upload - POST /v2/<name>/blobs/uploads/
+    URL initUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/blobs/uploads/");
+    HttpURLConnection initConn = (HttpURLConnection) initUrl.openConnection();
+    initConn.setRequestMethod("POST");
+    initConn.setConnectTimeout(TIMEOUT_MS);
+    initConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(initConn, cookieHeader, csrfToken);
+
+    int initCode = initConn.getResponseCode();
+    if (initCode != 202) {
+      String errorMsg = readErrorResponse(initConn);
+      initConn.disconnect();
+
+      // If blob already exists (HTTP 409 Conflict or 202 Accepted), skip
+      if (initCode == 409 || initCode == 202) {
+        log.info("Docker blob already exists in target, skipping: {}/{}", targetRepo, digest);
+        PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "image");
+        item.setStatus("skipped");
+        return item;
+      }
+      throw new IOException("Initiate blob upload to " + targetRepo + " failed: HTTP " + initCode + " - " + errorMsg);
+    }
+
+    // Get the upload location from Location header
+    String uploadLocation = initConn.getHeaderField("Location");
+    initConn.disconnect();
+
+    if (uploadLocation == null || uploadLocation.isEmpty()) {
+      throw new IOException("No Location header in blob upload initiation response from " + targetRepo);
+    }
+
+    // Make upload location absolute if relative
+    if (!uploadLocation.startsWith("http")) {
+      uploadLocation = nexusBaseUrl + "/repository/" + targetRepo + uploadLocation;
+    }
+
+    // Step 2: Download blob from source
+    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + filePath);
+    HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    downloadConn.setRequestMethod("GET");
+    downloadConn.setConnectTimeout(TIMEOUT_MS);
+    downloadConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(downloadConn, cookieHeader, csrfToken);
+
+    int downloadCode = downloadConn.getResponseCode();
+    if (downloadCode != 200) {
+      String errorMsg = readErrorResponse(downloadConn);
+      downloadConn.disconnect();
+      throw new IOException("Download blob from " + sourceRepo + "/" + filePath +
+          " failed: HTTP " + downloadCode + " - " + errorMsg);
+    }
+
+    // Step 3: Upload blob to target via PUT to the upload location
+    // Append digest parameter to the upload location
+    String putUrl = uploadLocation;
+    if (putUrl.contains("?")) {
+      putUrl += "&digest=" + java.net.URLEncoder.encode(digest, "UTF-8");
+    } else {
+      putUrl += "?digest=" + java.net.URLEncoder.encode(digest, "UTF-8");
+    }
+
+    HttpURLConnection putConn = (HttpURLConnection) new URL(putUrl).openConnection();
+    putConn.setRequestMethod("PUT");
+    putConn.setDoOutput(true);
+    putConn.setConnectTimeout(TIMEOUT_MS);
+    putConn.setReadTimeout(TIMEOUT_MS);
+    setAuthHeaders(putConn, cookieHeader, csrfToken);
+    putConn.setRequestProperty("Content-Type", "application/octet-stream");
+    putConn.setChunkedStreamingMode(64 * 1024);
+
+    try (InputStream input = downloadConn.getInputStream();
+         OutputStream output = putConn.getOutputStream()) {
+      byte[] buffer = new byte[BUFFER_SIZE];
+      int bytesRead;
+      while ((bytesRead = input.read(buffer)) != -1) {
+        output.write(buffer, 0, bytesRead);
+      }
+      output.flush();
+    }
+    finally {
+      downloadConn.disconnect();
+    }
+
+    int putCode = putConn.getResponseCode();
+    String putMsg = "";
+    if (putCode >= 400) {
+      putMsg = readErrorResponse(putConn);
+    }
+    putConn.disconnect();
+
+    if (putCode < 200 || putCode > 299) {
+      throw new IOException("Upload blob to " + targetRepo + " failed: HTTP " + putCode + " - " + putMsg);
+    }
+
+    log.info("Successfully promoted Docker blob: {}/{} -> {}", sourceRepo, digest, targetRepo);
+
+    PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "image");
+    item.setSourceMd5(sourceMd5);
+    item.setTargetMd5(targetMd5);
+    item.setStatus("success");
+    return item;
+  }
+
+  /**
+   * Read all bytes from an InputStream.
+   */
+  private byte[] readAllBytes(final InputStream input) throws IOException {
+    byte[] buffer = new byte[8192];
+    java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+    int bytesRead;
+    while ((bytesRead = input.read(buffer)) != -1) {
+      baos.write(buffer, 0, bytesRead);
+    }
+    return baos.toByteArray();
   }
 
   private String sanitizeErrorMessage(final String message) {

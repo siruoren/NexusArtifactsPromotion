@@ -549,19 +549,19 @@ public class SyncService {
             assetPath, determineType(assetPath));
 
         try {
-          // Incremental check: compare MD5 of remote and local assets
+          // Incremental check: compare checksums of remote and local assets
           String remoteMd5 = getRemoteAssetMd5(repo, assetPath, repoAuth);
-          String localMd5 = getLocalAssetMd5(repo.getName(), assetPath, repoAuth);
+          String localMd5 = getLocalAssetChecksum(repo, assetPath);
 
           detail.setRemoteMd5(remoteMd5);
           detail.setLocalMd5(localMd5);
 
-          if (remoteMd5 != null && localMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-            log.info("Skipping sync (MD5 match): {}/{}, MD5={}", repo.getName(), assetPath, remoteMd5);
+          if (remoteMd5 != null && localMd5 != null && checksumsMatch(remoteMd5, localMd5)) {
+            log.info("Skipping sync (checksum match): {}/{}, checksum={}", repo.getName(), assetPath, remoteMd5);
             detail.setStatus("skipped");
           }
           else {
-            log.info("MD5 differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
+            log.info("Checksum differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
                 remoteMd5, localMd5, assetPath);
             // Use retry for sync operations
             RetryableOperation.executeRun("sync asset " + assetPath,
@@ -601,19 +601,19 @@ public class SyncService {
           filePath, determineType(filePath));
 
       try {
-        // Incremental check: compare MD5 of remote and local assets
+        // Incremental check: compare checksums of remote and local assets
         String remoteMd5 = getRemoteAssetMd5(repo, filePath, repoAuth);
-        String localMd5 = getLocalAssetMd5(repo.getName(), filePath, repoAuth);
+        String localMd5 = getLocalAssetChecksum(repo, filePath);
 
         detail.setRemoteMd5(remoteMd5);
         detail.setLocalMd5(localMd5);
 
-        if (remoteMd5 != null && localMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-          log.info("Skipping sync (MD5 match): {}/{}, MD5={}", repo.getName(), filePath, remoteMd5);
+        if (remoteMd5 != null && localMd5 != null && checksumsMatch(remoteMd5, localMd5)) {
+          log.info("Skipping sync (checksum match): {}/{}, checksum={}", repo.getName(), filePath, remoteMd5);
           detail.setStatus("skipped");
         }
         else {
-          log.info("MD5 differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
+          log.info("Checksum differs or missing, syncing: remoteMd5={}, localMd5={}, path={}",
               remoteMd5, localMd5, filePath);
           syncAssetViaContentFacet(repo, filePath, repoAuth);
           detail.setStatus("success");
@@ -1570,27 +1570,219 @@ public class SyncService {
       String remoteUrl = (String) proxyAttrs.get("remoteUrl");
       if (remoteUrl == null || remoteUrl.isEmpty()) return null;
 
-      // If remote URL points to a local Nexus repo, use internal API to get MD5
+      // Strategy 1: If remote URL points to a local Nexus repo, use internal API to get MD5
       String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
       if (remoteRepoName != null) {
         Repository remoteRepo = repositoryManager.get(remoteRepoName);
         if (remoteRepo != null) {
-          return getAssetMd5(remoteRepoName, assetPath);
+          String md5 = getAssetMd5(remoteRepoName, assetPath);
+          if (md5 != null) {
+            log.debug("Found remote MD5 via local Nexus repo for {}/{}: {}", proxyRepo.getName(), assetPath, md5);
+            return md5;
+          }
         }
       }
 
-      // For external Nexus instances, try to get MD5 via remote Search API
+      // Strategy 2: For external Nexus instances, try to get MD5 via remote Search API
       String remoteMd5 = getRemoteAssetMd5ViaApi(remoteUrl, assetPath, repoAuth);
       if (remoteMd5 != null) {
+        log.debug("Found remote MD5 via remote Search API for {}/{}: {}", proxyRepo.getName(), assetPath, remoteMd5);
         return remoteMd5;
+      }
+
+      // Strategy 3: For Docker proxy repos, try Docker Registry API to get manifest digest
+      String format = proxyRepo.getFormat().getValue();
+      if ("docker".equals(format)) {
+        String dockerMd5 = getDockerRemoteAssetMd5(proxyRepo, assetPath, remoteUrl, repoAuth);
+        if (dockerMd5 != null) {
+          log.debug("Found remote MD5 via Docker Registry API for {}/{}: {}", proxyRepo.getName(), assetPath, dockerMd5);
+          return dockerMd5;
+        }
       }
 
       // For external HTTP remotes where we cannot get MD5, return null
       // so sync will always proceed (full sync behavior)
+      log.debug("Could not get remote MD5 for {}/{}, will sync unconditionally", proxyRepo.getName(), assetPath);
       return null;
     }
     catch (Exception e) {
       log.debug("Failed to get remote MD5 for {}/{}: {}", proxyRepo.getName(), assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get remote MD5 for Docker proxy repos using Docker Registry v2 API.
+   * For manifests: GET /v2/<name>/manifests/<tag> returns digest in Docker-Content-Digest header.
+   * For blobs: GET /v2/<name>/blobs/<digest> returns digest in Docker-Content-Digest header.
+   * We use the digest as a checksum substitute since Docker registry doesn't provide MD5.
+   */
+  private String getDockerRemoteAssetMd5(final Repository proxyRepo, final String assetPath,
+      final String remoteUrl, final String[] repoAuth) {
+    try {
+      // Parse Docker asset path: v2/<image>/manifests/<tag> or v2/<image>/blobs/<digest>
+      if (!assetPath.startsWith("v2/")) return null;
+
+      String pathWithoutV2 = assetPath.substring(3);
+      int manifestIdx = pathWithoutV2.indexOf("/manifests/");
+      int blobsIdx = pathWithoutV2.indexOf("/blobs/");
+
+      String imageName = null;
+      String reference = null;
+      String apiPath = null;
+
+      if (manifestIdx >= 0) {
+        imageName = pathWithoutV2.substring(0, manifestIdx);
+        reference = pathWithoutV2.substring(manifestIdx + "/manifests/".length());
+        apiPath = "/v2/" + imageName + "/manifests/" + reference;
+      } else if (blobsIdx >= 0) {
+        imageName = pathWithoutV2.substring(0, blobsIdx);
+        reference = pathWithoutV2.substring(blobsIdx + "/blobs/".length());
+        apiPath = "/v2/" + imageName + "/blobs/" + reference;
+      } else {
+        return null;
+      }
+
+      // Build the Docker Registry API URL
+      String registryUrl = remoteUrl;
+      if (registryUrl.endsWith("/")) {
+        registryUrl = registryUrl.substring(0, registryUrl.length() - 1);
+      }
+      // Remove /v2 suffix if present (some configs include it)
+      if (registryUrl.endsWith("/v2")) {
+        registryUrl = registryUrl.substring(0, registryUrl.length() - 3);
+      }
+
+      String fullUrl = registryUrl + apiPath;
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+
+      // For manifests, accept manifest types
+      if (manifestIdx >= 0) {
+        conn.setRequestProperty("Accept",
+            "application/vnd.docker.distribution.manifest.v2+json," +
+            "application/vnd.docker.distribution.manifest.list.v2+json," +
+            "application/vnd.oci.image.manifest.v1+json," +
+            "application/json");
+      }
+
+      // Add auth if available
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code == 401) {
+        // Try Docker token auth
+        String wwwAuth = conn.getHeaderField("Www-Authenticate");
+        conn.disconnect();
+        if (wwwAuth != null && wwwAuth.contains("Bearer")) {
+          String token = getDockerRegistryToken(wwwAuth, imageName, repoAuth);
+          if (token != null) {
+            conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+            conn.setRequestMethod("HEAD");
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(30_000);
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            if (manifestIdx >= 0) {
+              conn.setRequestProperty("Accept",
+                  "application/vnd.docker.distribution.manifest.v2+json," +
+                  "application/vnd.docker.distribution.manifest.list.v2+json," +
+                  "application/vnd.oci.image.manifest.v1+json," +
+                  "application/json");
+            }
+            code = conn.getResponseCode();
+          }
+        }
+      }
+
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      // Get the Docker-Content-Digest header as the checksum
+      String digest = conn.getHeaderField("Docker-Content-Digest");
+      conn.disconnect();
+
+      if (digest != null && !digest.isEmpty()) {
+        // Convert digest to a usable checksum string (e.g., "sha256:abc123" -> "sha256:abc123")
+        // We store this as the "MD5" field since it serves the same purpose for comparison
+        log.debug("Found Docker digest for {}: {}", assetPath, digest);
+        return digest;
+      }
+
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get Docker remote MD5 for {}: {}", assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get Docker registry auth token from Www-Authenticate header.
+   * Handles Bearer token authentication for Docker Hub and private registries.
+   */
+  private String getDockerRegistryToken(final String wwwAuth, final String imageName,
+      final String[] repoAuth) {
+    try {
+      // Parse realm and service from Www-Authenticate header
+      // Format: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/nginx:pull"
+      String realm = null;
+      String service = null;
+
+      java.util.regex.Pattern realmPattern = java.util.regex.Pattern.compile("realm=\"([^\"]+)\"");
+      java.util.regex.Matcher realmMatcher = realmPattern.matcher(wwwAuth);
+      if (realmMatcher.find()) {
+        realm = realmMatcher.group(1);
+      }
+
+      java.util.regex.Pattern servicePattern = java.util.regex.Pattern.compile("service=\"([^\"]+)\"");
+      java.util.regex.Matcher serviceMatcher = servicePattern.matcher(wwwAuth);
+      if (serviceMatcher.find()) {
+        service = serviceMatcher.group(1);
+      }
+
+      if (realm == null) return null;
+
+      String tokenUrl = realm + "?service=" + java.net.URLEncoder.encode(service != null ? service : "", "UTF-8")
+          + "&scope=repository:" + imageName + ":pull";
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(tokenUrl).openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      String json = readResponse(conn);
+      conn.disconnect();
+
+      // Parse token from JSON response
+      String token = extractJsonValue(json, "token");
+      if (token == null) {
+        token = extractJsonValue(json, "access_token");
+      }
+      return token;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get Docker registry token: {}", e.getMessage());
       return null;
     }
   }
@@ -1683,6 +1875,98 @@ public class SyncService {
   private String getLocalAssetMd5(final String repoName, final String assetPath,
       final String[] repoAuth) {
     return getAssetMd5(repoName, assetPath);
+  }
+
+  /**
+   * Get the local checksum for a Docker proxy repo asset.
+   * For Docker assets, returns SHA256 digest (matching Docker-Content-Digest format).
+   * For non-Docker assets, returns MD5.
+   */
+  private String getLocalAssetChecksum(final Repository repo, final String assetPath) {
+    String format = repo.getFormat().getValue();
+    if ("docker".equals(format)) {
+      return getAssetChecksum(repo.getName(), assetPath, "sha256");
+    }
+    return getAssetMd5(repo.getName(), assetPath);
+  }
+
+  /**
+   * Get a specific checksum algorithm for an asset using Nexus internal StorageTx API.
+   */
+  private String getAssetChecksum(final String repoName, final String assetPath, final String algorithm) {
+    try {
+      Repository repo = repositoryManager.get(repoName);
+      if (repo == null) return null;
+
+      StorageTx tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      try {
+        Bucket bucket = tx.findBucket(repo);
+        Asset asset = tx.findAssetWithProperty("name", assetPath, bucket);
+        if (asset == null && !assetPath.startsWith("/")) {
+          asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
+        }
+        if (asset == null) return null;
+
+        // Try the requested algorithm
+        HashAlgorithm hashAlgo;
+        if ("sha256".equals(algorithm)) {
+          hashAlgo = HashAlgorithm.SHA256;
+        } else if ("sha1".equals(algorithm)) {
+          hashAlgo = HashAlgorithm.SHA1;
+        } else {
+          hashAlgo = HashAlgorithm.MD5;
+        }
+
+        try {
+          HashCode hash = asset.getChecksum(hashAlgo);
+          if (hash != null) {
+            String value = hash.toString();
+            if (!value.isEmpty()) {
+              // For SHA256, prepend "sha256:" to match Docker digest format
+              if ("sha256".equals(algorithm) && !value.startsWith("sha256:")) {
+                return "sha256:" + value;
+              }
+              return value;
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Asset.getChecksum({}) failed for {}/{}: {}", algorithm, repoName, assetPath, e.getMessage());
+        }
+
+        // Try blob headers
+        try {
+          if (asset.requireBlobRef() != null) {
+            Blob blob = tx.requireBlob(asset.requireBlobRef());
+            if (blob != null) {
+              Map<String, String> headers = blob.getHeaders();
+              String headerKey = "Content-Hash-" + algorithm.toUpperCase();
+              String value = headers.get(headerKey);
+              if (value == null) value = headers.get(headerKey.toLowerCase());
+              if (value != null && !value.isEmpty()) {
+                if ("sha256".equals(algorithm) && !value.startsWith("sha256:")) {
+                  return "sha256:" + value;
+                }
+                return value;
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Blob header {} lookup failed for {}/{}: {}", algorithm, repoName, assetPath, e.getMessage());
+        }
+
+        return null;
+      }
+      finally {
+        tx.close();
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to get {} for {}/{}: {}", algorithm, repoName, assetPath, e.getMessage());
+      return null;
+    }
   }
 
   /**
@@ -1850,6 +2134,42 @@ public class SyncService {
    * The checksums object format: {"md5": "xxx", "sha1": "yyy", ...}
    * This handles the nested object case where extractJsonValue alone might not work.
    */
+  /**
+   * Compare two checksums for equality.
+   * Supports both MD5 (hex string) and Docker digest (sha256:hex) formats.
+   * For Docker digests, compares the hex part after the algorithm prefix.
+   */
+  private boolean checksumsMatch(final String checksum1, final String checksum2) {
+    if (checksum1 == null || checksum2 == null) return false;
+
+    // Direct case-insensitive comparison
+    if (checksum1.equalsIgnoreCase(checksum2)) return true;
+
+    // Handle Docker digest format: "sha256:abc" vs "sha256:abc" or "abc" vs "sha256:abc"
+    String hex1 = extractDigestHex(checksum1);
+    String hex2 = extractDigestHex(checksum2);
+
+    if (hex1 != null && hex2 != null) {
+      return hex1.equalsIgnoreCase(hex2);
+    }
+
+    return false;
+  }
+
+  /**
+   * Extract the hex part from a checksum string.
+   * "sha256:abc123" -> "abc123"
+   * "abc123" -> "abc123"
+   */
+  private String extractDigestHex(final String checksum) {
+    if (checksum == null) return null;
+    int colonIdx = checksum.indexOf(':');
+    if (colonIdx >= 0 && (checksum.startsWith("sha256:") || checksum.startsWith("sha1:"))) {
+      return checksum.substring(colonIdx + 1);
+    }
+    return checksum;
+  }
+
   private String extractChecksumValue(final String json, final String algo) {
     // Find "checksums" key
     String checksumsPattern = "\"checksums\"";
