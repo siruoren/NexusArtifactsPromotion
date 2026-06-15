@@ -435,7 +435,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
   alias: 'widget.nx-artifacts-promotion-syncqueue',
 
   title: _t('sync.queue.page.title'),
-  layout: 'border',
+  layout: 'fit',
 
   initComponent: function () {
     var me = this;
@@ -480,88 +480,9 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
       return d.toLocaleString();
     };
 
-    // Config form
-    me.configForm = Ext.create('Ext.form.Panel', {
-      region: 'east',
-      width: 300,
-      split: true,
-      title: _t('sync.queue.config.title'),
-      bodyPadding: 10,
-      collapsible: true,
-      collapsed: true,
-      defaults: {
-        anchor: '100%',
-        labelWidth: 120,
-        allowBlank: false
-      },
-      items: [
-        {
-          xtype: 'numberfield',
-          name: 'maxSyncQueueSize',
-          fieldLabel: _t('sync.queue.config.maxSyncQueueSize'),
-          minValue: 1,
-          maxValue: 100,
-          value: 20
-        },
-        {
-          xtype: 'numberfield',
-          name: 'syncPoolSize',
-          fieldLabel: _t('sync.queue.config.syncPoolSize'),
-          minValue: 1,
-          maxValue: 50,
-          value: 4
-        },
-        {
-          xtype: 'numberfield',
-          name: 'promotionPoolSize',
-          fieldLabel: _t('sync.queue.config.promotionPoolSize'),
-          minValue: 1,
-          maxValue: 50,
-          value: 4
-        }
-      ],
-      buttons: [
-        {
-          text: _t('sync.queue.config.save'),
-          handler: function () {
-            var form = me.configForm.getForm();
-            if (!form.isValid()) return;
-            var values = form.getValues();
-            var config = {
-              maxSyncQueueSize: parseInt(values.maxSyncQueueSize, 10),
-              syncPoolSize: parseInt(values.syncPoolSize, 10),
-              promotionPoolSize: parseInt(values.promotionPoolSize, 10)
-            };
-            apiRequest('PUT', '/sync/queue/config', config)
-              .then(function () {
-                NX.Messages.info(_t('sync.queue.config.saved'));
-              })
-              .catch(function (err) {
-                showAlertDialog(_t('common.error'), _t('sync.queue.config.saveFailed') + ' ' + err.message);
-              });
-          }
-        }
-      ],
-      listeners: {
-        expand: function () {
-          apiRequest('GET', '/sync/queue/config')
-            .then(function (config) {
-              me.configForm.getForm().setValues({
-                maxSyncQueueSize: config.maxSyncQueueSize || 20,
-                syncPoolSize: config.syncPoolSize || 4,
-                promotionPoolSize: config.promotionPoolSize || 4
-              });
-            })
-            .catch(function () { /* ignore */ });
-        }
-      }
-    });
-
     Ext.apply(me, {
       items: [
-        me.configForm,
         {
-          region: 'center',
           xtype: 'gridpanel',
           store: me.store,
           columns: [
@@ -666,20 +587,16 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       weight: 200,
       authenticationRequired: true,
       visible: function () {
-        // Only visible to admin users
+        // Visible to all authenticated users
         try {
           var user = NX.State.getValue('user');
           if (!user) return false;
           // NX.State user may be a string (username) or object
           if (typeof user === 'string') {
-            return user === 'admin';
+            return user !== 'anonymous';
           }
           if (typeof user === 'object') {
-            if (user.admin === true) return true;
-            var roles = user.roles || [];
-            for (var i = 0; i < roles.length; i++) {
-              if (roles[i] === 'nx-admin' || roles[i] === 'admin') return true;
-            }
+            return true;
           }
         } catch (e) { /* ignore */ }
         return false;

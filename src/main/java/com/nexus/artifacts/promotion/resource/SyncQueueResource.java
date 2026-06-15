@@ -1,17 +1,13 @@
 package com.nexus.artifacts.promotion.resource;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
 import javax.ws.rs.GET;
-import javax.ws.rs.PUT;
 import javax.ws.rs.Path;
 import javax.ws.rs.Produces;
-import javax.ws.rs.Consumes;
 import javax.ws.rs.QueryParam;
 import javax.ws.rs.DefaultValue;
 import javax.ws.rs.core.MediaType;
@@ -25,7 +21,6 @@ import org.sonatype.nexus.rest.Resource;
 
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.service.SyncService;
-import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
@@ -43,30 +38,22 @@ public class SyncQueueResource implements Resource {
   private static final Logger log = LoggerFactory.getLogger(SyncQueueResource.class);
 
   private final SyncService syncService;
-  private final TaskExecutorService taskExecutorService;
 
   @Inject
-  public SyncQueueResource(final SyncService syncService, final TaskExecutorService taskExecutorService) {
+  public SyncQueueResource(final SyncService syncService) {
     this.syncService = syncService;
-    this.taskExecutorService = taskExecutorService;
   }
 
   /**
-   * Check if the current user is an admin.
-   * Returns 401 if not authenticated, 403 if not admin.
+   * Check if the current user is authenticated (not anonymous).
+   * Returns 401 if not authenticated.
    */
-  private Response requireAdmin() {
+  private Response requireAuthenticated() {
     Subject subject = SecurityUtils.getSubject();
     if (subject == null || !subject.isAuthenticated() || isAnonymous(subject)) {
       log.warn("Unauthenticated access attempt to sync queue API");
       return Response.status(Response.Status.UNAUTHORIZED)
           .entity("{\"error\":\"Authentication required\",\"message\":\"Please log in to access sync queue\"}")
-          .build();
-    }
-    if (!subject.hasRole("nx-admin")) {
-      log.warn("Non-admin access attempt to sync queue API by user: {}", subject.getPrincipal());
-      return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"Admin required\",\"message\":\"Only administrators can access sync queue\"}")
           .build();
     }
     return null;
@@ -96,7 +83,7 @@ public class SyncQueueResource implements Resource {
       @QueryParam("start") @DefaultValue("0") int start,
       @QueryParam("limit") @DefaultValue("25") int limit
   ) {
-    Response authError = requireAdmin();
+    Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
     }
@@ -121,7 +108,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("List all sync queue tasks")
   public Response listAllTasksAlias()
   {
-    Response authError = requireAdmin();
+    Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
     }
@@ -146,7 +133,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("List active sync queue tasks")
   public Response listActiveTasks()
   {
-    Response authError = requireAdmin();
+    Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
     }
@@ -171,7 +158,7 @@ public class SyncQueueResource implements Resource {
   @ApiOperation("Get sync task details")
   public Response getTask(@javax.ws.rs.PathParam("taskId") final String taskId)
   {
-    Response authError = requireAdmin();
+    Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
     }
@@ -189,106 +176,6 @@ public class SyncQueueResource implements Resource {
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
           .entity("{\"error\":\"Failed to get sync task\"}")
           .build();
-    }
-  }
-
-  /**
-   * Get current queue configuration.
-   */
-  @GET
-  @Path("/config")
-  @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("Get sync queue configuration")
-  public Response getQueueConfig()
-  {
-    Response authError = requireAdmin();
-    if (authError != null) {
-      return authError;
-    }
-    try {
-      Map<String, Object> config = new HashMap<>();
-      config.put("promotionPoolSize", taskExecutorService.getPromotionPoolSize());
-      config.put("syncPoolSize", taskExecutorService.getSyncPoolSize());
-      config.put("maxSyncQueueSize", taskExecutorService.getMaxSyncQueueSize());
-      config.put("hasSyncQueueCapacity", taskExecutorService.hasSyncQueueCapacity());
-      return Response.ok(config).build();
-    }
-    catch (Exception e) {
-      log.error("Failed to get queue config: {}", e.getMessage());
-      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Failed to get queue config\"}")
-          .build();
-    }
-  }
-
-  /**
-   * Update sync queue configuration.
-   * Accepts JSON body like: {"maxSyncQueueSize": 30, "syncPoolSize": 8, "promotionPoolSize": 6}
-   */
-  @PUT
-  @Path("/config")
-  @Consumes(MediaType.APPLICATION_JSON)
-  @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("Update sync queue configuration")
-  public Response updateQueueConfig(final Map<String, Object> config)
-  {
-    Response authError = requireAdmin();
-    if (authError != null) {
-      return authError;
-    }
-    try {
-      // Check promote permission for config changes
-      Subject subject = SecurityUtils.getSubject();
-      if (!subject.isPermitted("nexus:sync:update")) {
-        return Response.status(Response.Status.FORBIDDEN)
-            .entity("{\"error\":\"Permission denied\",\"message\":\"sync update permission required\"}")
-            .build();
-      }
-
-      Map<String, Object> result = new HashMap<>();
-
-      if (config.containsKey("maxSyncQueueSize")) {
-        int size = parseInt(config.get("maxSyncQueueSize"), 20);
-        size = Math.max(1, Math.min(100, size));
-        taskExecutorService.updateMaxSyncQueueSize(size);
-        result.put("maxSyncQueueSize", taskExecutorService.getMaxSyncQueueSize());
-      }
-
-      if (config.containsKey("syncPoolSize")) {
-        int size = parseInt(config.get("syncPoolSize"), 4);
-        size = Math.max(1, Math.min(50, size));
-        taskExecutorService.updateSyncPoolSize(size);
-        result.put("syncPoolSize", taskExecutorService.getSyncPoolSize());
-      }
-
-      if (config.containsKey("promotionPoolSize")) {
-        int size = parseInt(config.get("promotionPoolSize"), 4);
-        size = Math.max(1, Math.min(50, size));
-        taskExecutorService.updatePromotionPoolSize(size);
-        result.put("promotionPoolSize", taskExecutorService.getPromotionPoolSize());
-      }
-
-      log.info("Queue configuration updated: {}", result);
-      return Response.ok(result).build();
-    }
-    catch (Exception e) {
-      log.error("Failed to update queue config: {}", e.getMessage());
-      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Failed to update queue config\"}")
-          .build();
-    }
-  }
-
-  private int parseInt(final Object value, final int defaultValue) {
-    if (value == null) return defaultValue;
-    try {
-      if (value instanceof Number) {
-        return ((Number) value).intValue();
-      }
-      return Integer.parseInt(value.toString());
-    }
-    catch (NumberFormatException e) {
-      return defaultValue;
     }
   }
 
