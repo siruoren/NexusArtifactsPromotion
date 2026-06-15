@@ -656,7 +656,15 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
             dock: 'bottom',
             displayInfo: true,
             displayMsg: '{0} - {1} / {2}',
-            emptyMsg: ''
+            emptyMsg: '',
+            listeners: {
+              beforechange: function (toolbar, page) {
+                if (me.filteredData) {
+                  me.loadPage(page);
+                  return false; // Prevent default load
+                }
+              }
+            }
           }]
         }
       ]
@@ -705,8 +713,33 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
       filtered.push(rec.copy());
     });
 
-    me.store.loadData(filtered);
+    // Store all filtered data for client-side pagination
+    me.filteredData = filtered;
+
+    // Load first page
+    me.store.currentPage = 1;
+    me.loadPage(1);
     me.checkAllFinished();
+  },
+
+  loadPage: function (page) {
+    var me = this;
+    var pageSize = me.store.pageSize || 20;
+    var total = (me.filteredData || []).length;
+    var start = (page - 1) * pageSize;
+    var end = Math.min(start + pageSize, total);
+    var pageData = (me.filteredData || []).slice(start, end);
+
+    me.store.loadData(pageData);
+    me.store.currentPage = page;
+    me.store.getTotalCount = function () { return total; };
+
+    // Update paging toolbar
+    var toolbar = me.down('pagingtoolbar');
+    if (toolbar) {
+      toolbar.store.getTotalCount = function () { return total; };
+      toolbar.onLoad();
+    }
   },
 
   checkAllFinished: function () {
