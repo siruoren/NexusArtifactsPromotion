@@ -1986,30 +1986,53 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var isPromote = (mode === 'promote');
 
     // Parse the path to determine which images/tags to show
-    // Docker paths in Nexus: v2/<image>/manifests/<tag> or v2/<image>/
+    // Docker paths in Nexus:
+    //   v2/<image>/manifests/<tag>  - specific tag
+    //   v2/<image>/blobs/<digest>   - specific blob (extract image name)
+    //   v2/<image>/                 - all tags of an image
+    //   v2/ or empty                - all images (directory level)
+    //   <image>/                    - non-v2 path, treat as image name
     var pathImageName = null;  // matched image name from path
     var pathTag = null;        // matched specific tag from path
     var isAllImages = true;    // whether to show all images
 
     if (path) {
       var cleanPath = path;
-      // Remove leading slash
+      // Remove leading/trailing slashes
       if (cleanPath.charAt(0) === '/') cleanPath = cleanPath.substring(1);
+      if (cleanPath.charAt(cleanPath.length - 1) === '/') cleanPath = cleanPath.substring(0, cleanPath.length - 1);
 
-      // Check if path is a manifest path: v2/<image>/manifests/<tag>
-      var manifestMatch = cleanPath.match(/^v2\/(.+?)\/manifests\/([^\/]+)$/);
-      if (manifestMatch) {
-        pathImageName = manifestMatch[1];
-        pathTag = manifestMatch[2];
-        isAllImages = false;
+      if (cleanPath === '' || cleanPath === 'v2') {
+        // Root or v2 root: show all images
+        isAllImages = true;
       } else {
-        // Check if path is an image directory: v2/<image>/ or v2/<image>
-        var dirMatch = cleanPath.match(/^v2\/(.+?)\/?$/);
-        if (dirMatch && dirMatch[1] !== '') {
-          pathImageName = dirMatch[1];
-          isAllImages = false;
+        // Remove v2/ prefix if present
+        var pathWithoutV2 = cleanPath;
+        if (pathWithoutV2.indexOf('v2/') === 0) {
+          pathWithoutV2 = pathWithoutV2.substring(3);
         }
-        // Otherwise (path is empty, "/", or "v2/"), show all images
+
+        if (pathWithoutV2 !== '') {
+          // Check for manifests/<tag> pattern
+          var manifestIdx = pathWithoutV2.indexOf('/manifests/');
+          if (manifestIdx >= 0) {
+            pathImageName = pathWithoutV2.substring(0, manifestIdx);
+            pathTag = pathWithoutV2.substring(manifestIdx + '/manifests/'.length);
+            isAllImages = false;
+          } else {
+            // Check for blobs/<digest> pattern - extract image name only
+            var blobsIdx = pathWithoutV2.indexOf('/blobs/');
+            if (blobsIdx >= 0) {
+              pathImageName = pathWithoutV2.substring(0, blobsIdx);
+              isAllImages = false;
+            } else {
+              // Treat the entire path as an image name
+              // e.g. "myapp/backend" or "nginx"
+              pathImageName = pathWithoutV2;
+              isAllImages = false;
+            }
+          }
+        }
       }
     }
 
@@ -2145,7 +2168,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             execBtn.disable();
             cancelBtn.disable();
 
-            var apiPath = isPromote ? '/docker/promote' : '/docker/sync';
+            var apiPath = isPromote ? '/promotion/docker/promote' : '/promotion/docker/sync';
             apiRequest('POST', apiPath, requestData)
             .then(function (result) {
               win.close();
@@ -2163,7 +2186,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     win.show();
 
     // Load Docker images and filter by path
-    apiRequest('GET', '/docker/images?repository=' + encodeURIComponent(repoName))
+    apiRequest('GET', '/promotion/docker/images?repository=' + encodeURIComponent(repoName))
     .then(function (data) {
       if (win.destroyed) return;
       previewStore.removeAll();
@@ -2174,8 +2197,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
           // Filter by path
           if (!isAllImages && pathImageName) {
-            // Only include images matching the path
-            if (imgName !== pathImageName) return;
+            // Match images: exact match or image name starts with path prefix
+            // e.g. path "myorg" matches "myorg/myapp" and "myorg/backend"
+            var matches = (imgName === pathImageName)
+              || (imgName.indexOf(pathImageName + '/') === 0)
+              || (pathImageName.indexOf(imgName + '/') === 0);
+            if (!matches) return;
             // If a specific tag was in the path, only show that tag
             if (pathTag) {
               imgTags = [pathTag];
@@ -2376,8 +2403,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       }
 
       var apiPath = isPromote
-        ? '/service/rest/v1/docker/promote/task/' + encodeURIComponent(taskId)
-        : '/service/rest/v1/docker/sync/task/' + encodeURIComponent(taskId);
+        ? '/service/rest/v1/promotion/docker/promote/task/' + encodeURIComponent(taskId)
+        : '/service/rest/v1/promotion/docker/sync/task/' + encodeURIComponent(taskId);
 
       var xhr = new XMLHttpRequest();
       xhr.open('GET', apiPath, true);
