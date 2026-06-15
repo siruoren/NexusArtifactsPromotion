@@ -774,6 +774,13 @@ public class PromotionService {
     String normalizedPrefix = (pathPrefix != null && pathPrefix.endsWith("/"))
         ? pathPrefix.substring(0, pathPrefix.length() - 1) : pathPrefix;
 
+    // Approach 0: Internal Java API (most reliable, no auth issues)
+    results = searchAssetsViaInternalApi(repository, normalizedPrefix);
+    if (!results.isEmpty()) {
+      log.debug("Internal API found {} items for {}/{}", results.size(), repository, normalizedPrefix);
+      return results;
+    }
+
     // Approach 1: Search API with wildcard
     results = trySearchApi(repository, normalizedPrefix, nexusBaseUrl);
 
@@ -783,6 +790,70 @@ public class PromotionService {
       results = tryComponentsApi(repository, normalizedPrefix, nexusBaseUrl);
     }
 
+    return results;
+  }
+
+  /**
+   * Search assets using Nexus internal StorageTx API.
+   * This is the most reliable approach as it bypasses HTTP authentication entirely.
+   * Works for all repository types including proxy repositories.
+   */
+  private List<String> searchAssetsViaInternalApi(final String repository, final String pathPrefix) {
+    List<String> results = new ArrayList<>();
+    try {
+      Repository repo = repositoryManager.get(repository);
+      if (repo == null) {
+        log.debug("Repository not found for internal search: {}", repository);
+        return results;
+      }
+
+      StorageTx tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      try {
+        Bucket bucket = tx.findBucket(repo);
+        if (bucket == null) {
+          log.debug("Bucket not found for repository: {}", repository);
+          return results;
+        }
+
+        // Browse all assets and filter by path prefix
+        Iterable<Asset> assets = tx.browseAssets(bucket);
+        String normalizedPrefix = pathPrefix;
+        if (normalizedPrefix != null && normalizedPrefix.startsWith("/")) {
+          normalizedPrefix = normalizedPrefix.substring(1);
+        }
+
+        for (Asset asset : assets) {
+          String name = asset.name();
+          if (name == null) continue;
+
+          // Normalize: strip leading slash
+          String normalizedName = name.startsWith("/") ? name.substring(1) : name;
+
+          if (normalizedPrefix == null || normalizedPrefix.isEmpty()) {
+            // No prefix filter - include all non-directory assets
+            if (!normalizedName.endsWith("/")) {
+              results.add(normalizedName);
+            }
+          }
+          else {
+            // Include assets under the path prefix
+            if (normalizedName.startsWith(normalizedPrefix + "/") && !normalizedName.endsWith("/")) {
+              results.add(normalizedName);
+            }
+          }
+        }
+
+        log.debug("Internal API found {} assets in repo {} under prefix '{}'",
+            results.size(), repository, normalizedPrefix);
+      }
+      finally {
+        tx.close();
+      }
+    }
+    catch (Exception e) {
+      log.debug("Internal API search failed for {}/{}: {}", repository, pathPrefix, e.getMessage());
+    }
     return results;
   }
 
@@ -807,6 +878,11 @@ public class PromotionService {
       conn.setRequestProperty("Accept", "application/json");
 
       int code = conn.getResponseCode();
+      if (code == 403 || code == 401) {
+        log.debug("Search API returned {} for {}/{}, may need authentication", code, repository, pathPrefix);
+        conn.disconnect();
+        return results;
+      }
       if (code == 200) {
         String json = readStream(conn.getInputStream());
         results = parseSearchItems(json, pathPrefix);

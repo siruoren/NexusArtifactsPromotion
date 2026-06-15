@@ -6,6 +6,8 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -18,6 +20,10 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -69,6 +75,31 @@ public class DockerService {
 
   private static final Logger log = LoggerFactory.getLogger(DockerService.class);
 
+  /**
+   * Trust-all-SSL manager for self-signed certificates.
+   * Ensures HTTPS connections to remote storage with self-signed certs work correctly.
+   */
+  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
+      new X509TrustManager() {
+        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
+        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
+      }
+  };
+
+  static {
+    try {
+      SSLContext sc = SSLContext.getInstance("TLS");
+      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
+      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
+      log.info("DockerService SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
+    }
+    catch (Exception e) {
+      log.warn("Failed to initialize SSL trust manager for DockerService: {}", e.getMessage(), e);
+    }
+  }
+
   /** Maximum time (ms) to keep completed task results */
   private static final long TASK_RESULT_TTL_MS = 30 * 60 * 1000L;
 
@@ -81,8 +112,62 @@ public class DockerService {
   /** Maximum retry attempts for individual blob/manifest operations */
   private static final int DOCKER_RETRY_ATTEMPTS = 3;
 
-  /** Nexus local base URL for internal API calls */
-  private static final String LOCAL_NEXUS_BASE = "http://localhost:8081";
+  /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
+  private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
+  private static final String LOCAL_NEXUS_BASE_HTTP = "http://localhost:8081";
+
+  /** Cached working local base URL */
+  private volatile String cachedLocalNexusBase = null;
+
+  /**
+   * Get the working local Nexus base URL.
+   * Tries HTTPS first (for Nexus with SSL), then falls back to HTTP.
+   * Result is cached after first successful connection.
+   */
+  private String getLocalNexusBase() {
+    if (cachedLocalNexusBase != null) {
+      return cachedLocalNexusBase;
+    }
+
+    // Try HTTPS first
+    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
+      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
+      log.info("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
+      return cachedLocalNexusBase;
+    }
+
+    // Fall back to HTTP
+    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
+      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
+      log.info("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
+      return cachedLocalNexusBase;
+    }
+
+    // Default to HTTP if both fail (Nexus might not be fully started yet)
+    log.warn("Could not determine local Nexus base URL, defaulting to HTTP");
+    cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
+    return cachedLocalNexusBase;
+  }
+
+  /**
+   * Test if a local Nexus URL is reachable.
+   */
+  private boolean testLocalConnection(final String baseUrl) {
+    try {
+      URL url = new URL(baseUrl + "/service/rest/v1/status");
+      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(3000);
+      conn.setReadTimeout(3000);
+      int code = conn.getResponseCode();
+      conn.disconnect();
+      return code < 500;
+    }
+    catch (Exception e) {
+      log.debug("Local connection test failed for {}: {}", baseUrl, e.getMessage());
+      return false;
+    }
+  }
 
   /** Default admin credentials for internal API calls */
   private static final String DEFAULT_ADMIN_USERNAME = "admin";
@@ -155,7 +240,7 @@ public class DockerService {
     Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
 
     try {
-      String apiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
       String effectiveAuth = getAdminAuth();
 
@@ -201,7 +286,7 @@ public class DockerService {
     try {
       String effectiveAuth = getAdminAuth();
       // Use search API to find components matching the image name
-      String apiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
 
       do {

@@ -5,6 +5,8 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.security.SecureRandom;
+import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -18,6 +20,10 @@ import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -63,11 +69,40 @@ public class SyncService {
 
   private static final Logger log = LoggerFactory.getLogger(SyncService.class);
 
+  /**
+   * Trust-all-SSL manager for self-signed certificates.
+   * Ensures HTTPS connections to remote storage with self-signed certs work correctly.
+   */
+  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
+      new X509TrustManager() {
+        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
+        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
+      }
+  };
+
+  static {
+    try {
+      SSLContext sc = SSLContext.getInstance("TLS");
+      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
+      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
+      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
+      log.info("SyncService SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
+    }
+    catch (Exception e) {
+      log.warn("Failed to initialize SSL trust manager for SyncService: {}", e.getMessage(), e);
+    }
+  }
+
   /** Maximum time (ms) to keep completed task info before cleanup (30 minutes) */
   private static final long TASK_INFO_TTL_MS = 30 * 60 * 1000L;
 
-  /** Nexus local base URL for internal API calls */
-  private static final String LOCAL_NEXUS_BASE = "http://localhost:8081";
+  /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
+  private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
+  private static final String LOCAL_NEXUS_BASE_HTTP = "http://localhost:8081";
+
+  /** Cached working local base URL */
+  private volatile String cachedLocalNexusBase = null;
 
   /** Default admin credentials for internal API calls */
   private static final String DEFAULT_ADMIN_USERNAME = "admin";
@@ -99,6 +134,56 @@ public class SyncService {
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
+  }
+
+  /**
+   * Get the working local Nexus base URL.
+   * Tries HTTPS first (for Nexus with SSL), then falls back to HTTP.
+   * Result is cached after first successful connection.
+   */
+  private String getLocalNexusBase() {
+    if (cachedLocalNexusBase != null) {
+      return cachedLocalNexusBase;
+    }
+
+    // Try HTTPS first
+    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
+      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
+      log.info("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
+      return cachedLocalNexusBase;
+    }
+
+    // Fall back to HTTP
+    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
+      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
+      log.info("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
+      return cachedLocalNexusBase;
+    }
+
+    // Default to HTTP if both fail (Nexus might not be fully started yet)
+    log.warn("Could not determine local Nexus base URL, defaulting to HTTP");
+    cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
+    return cachedLocalNexusBase;
+  }
+
+  /**
+   * Test if a local Nexus URL is reachable.
+   */
+  private boolean testLocalConnection(final String baseUrl) {
+    try {
+      URL url = new URL(baseUrl + "/service/rest/v1/status");
+      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(3000);
+      conn.setReadTimeout(3000);
+      int code = conn.getResponseCode();
+      conn.disconnect();
+      return code < 500;
+    }
+    catch (Exception e) {
+      log.debug("Local connection test failed for {}: {}", baseUrl, e.getMessage());
+      return false;
+    }
   }
 
   /**
@@ -728,7 +813,7 @@ public class SyncService {
     // Full repository sync — list all assets without any path filter
     boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
     if (isFullSync) {
-      String allApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName;
+      String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
       List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
       log.info("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
       return allAssets;
@@ -742,7 +827,7 @@ public class SyncService {
     String pathPrefix = normalizedDir;
 
     // Step 1: Try with group filter first (efficient for Maven2 repos)
-    String groupApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName
+    String groupApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName
         + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
     List<String> assetsWithGroup = listAssetsViaApiUrl(groupApiUrl, effectiveAuth);
 
@@ -759,7 +844,7 @@ public class SyncService {
     // and filtering by path prefix. This handles raw/hosted repos where the Search API's
     // group parameter doesn't correspond to the file system directory path.
     log.info("Group filter returned 0 results for '{}', falling back to path-prefix filter", normalizedDir);
-    String allApiUrl = LOCAL_NEXUS_BASE + "/service/rest/v1/search/assets?repository=" + repoName;
+    String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
     List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
     List<String> filtered = filterByPathPrefix(allAssets, pathPrefix);
 

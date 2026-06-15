@@ -109,6 +109,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.filter.path": "Path",
     "sync.queue.filter.status": "Status",
     "sync.queue.filter.username": "User",
+    "sync.queue.filter.taskId": "Queue ID",
     "sync.queue.filter.all": "All",
     "sync.queue.filter.search": "Search",
     "sync.queue.filter.reset": "Reset",
@@ -116,6 +117,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.status.running": "Running",
     "sync.queue.status.cancelled": "Cancelled",
     "sync.queue.status.completed": "Completed",
+    "sync.queue.table.duration": "Duration (min)",
     "sync.queue.config.title": "Queue Configuration",
     "sync.queue.config.maxSyncQueueSize": "Max Sync Queue Size",
     "sync.queue.config.syncPoolSize": "Sync Pool Size",
@@ -223,6 +225,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.filter.path": "\u8def\u5f84",
     "sync.queue.filter.status": "\u72b6\u6001",
     "sync.queue.filter.username": "\u7528\u6237",
+    "sync.queue.filter.taskId": "\u961f\u5217ID",
     "sync.queue.filter.all": "\u5168\u90e8",
     "sync.queue.filter.search": "\u641c\u7d22",
     "sync.queue.filter.reset": "\u91cd\u7f6e",
@@ -230,6 +233,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.status.running": "\u8fdb\u884c\u4e2d",
     "sync.queue.status.cancelled": "\u53d6\u6d88",
     "sync.queue.status.completed": "\u5b8c\u6210",
+    "sync.queue.table.duration": "\u8017\u65f6\uff08\u5206\u949f\uff09",
     "sync.queue.config.title": "\u961f\u5217\u914d\u7f6e",
     "sync.queue.config.maxSyncQueueSize": "\u6700\u5927\u540c\u6b65\u961f\u5217\u6570",
     "sync.queue.config.syncPoolSize": "\u540c\u6b65\u7ebf\u7a0b\u6c60\u5927\u5c0f",
@@ -526,6 +530,19 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
       return display;
     };
 
+    var durationRenderer = function (value, meta, record) {
+      var start = record.get('startTime');
+      var end = record.get('endTime');
+      var duration = '';
+      if (start) {
+        var endTime = end || Date.now();
+        var minutes = ((endTime - start) / 60000).toFixed(1);
+        duration = minutes;
+      }
+      meta.tdAttr = 'data-qtip="' + sanitize(duration) + '"';
+      return duration;
+    };
+
     Ext.apply(me, {
       items: [
         {
@@ -537,11 +554,22 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
             { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1, renderer: tipRenderer },
             { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100, renderer: tipStatusRenderer },
             { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150, renderer: tipTimeRenderer },
-            { text: _t('sync.queue.table.endTime'), dataIndex: 'endTime', width: 150, renderer: tipTimeRenderer },
+            { text: _t('sync.queue.table.duration'), dataIndex: 'endTime', width: 100, renderer: durationRenderer },
             { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100, renderer: tipRenderer },
             { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1, renderer: tipRenderer }
           ],
           tbar: [
+            {
+              xtype: 'textfield',
+              itemId: 'filterTaskId',
+              emptyText: _t('sync.queue.filter.taskId'),
+              width: 150,
+              listeners: {
+                specialkey: function (field, e) {
+                  if (e.getKey() === e.ENTER) me.applyFilters();
+                }
+              }
+            },
             {
               xtype: 'textfield',
               itemId: 'filterRepository',
@@ -601,6 +629,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
               text: _t('sync.queue.filter.reset'),
               iconCls: 'x-fa fa-undo',
               handler: function () {
+                me.down('#filterTaskId').setValue('');
                 me.down('#filterRepository').setValue('');
                 me.down('#filterPath').setValue('');
                 me.down('#filterStatus').setValue('');
@@ -646,11 +675,13 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
 
   applyFilters: function () {
     var me = this;
+    var taskIdFilter = (me.down('#filterTaskId') || {}).value || '';
     var repoFilter = (me.down('#filterRepository') || {}).value || '';
     var pathFilter = (me.down('#filterPath') || {}).value || '';
     var statusFilter = (me.down('#filterStatus') || {}).value || '';
     var userFilter = (me.down('#filterUsername') || {}).value || '';
 
+    taskIdFilter = taskIdFilter.toLowerCase();
     repoFilter = repoFilter.toLowerCase();
     pathFilter = pathFilter.toLowerCase();
     statusFilter = statusFilter.toLowerCase();
@@ -658,6 +689,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
 
     var filtered = [];
     me.allDataStore.each(function (rec) {
+      if (taskIdFilter && (rec.get('taskId') || '').toLowerCase().indexOf(taskIdFilter) === -1) return;
       if (repoFilter && (rec.get('sourceRepository') || '').toLowerCase().indexOf(repoFilter) === -1 &&
           (rec.get('targetRepository') || '').toLowerCase().indexOf(repoFilter) === -1) return;
       if (pathFilter && (rec.get('path') || '').toLowerCase().indexOf(pathFilter) === -1) return;
