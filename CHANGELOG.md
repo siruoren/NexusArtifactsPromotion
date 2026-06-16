@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1] - 2026-06-16
+
+### Added
+
+- **Docker Release Repository Configuration (Promotion)**: added `dockerReleaseRepos` parameter to Promotion Capability
+  - When promoting images to a configured release repository, only non-snapshot tags are displayed and promoted
+  - Tags containing SNAPSHOT/dev/alpha/beta/RC/pre/test/canary/nightly/latest are filtered out
+- **Docker Release Proxy Repository Configuration (Sync)**: added `dockerReleaseProxyRepos` parameter to Sync Capability
+  - When syncing images from a configured release proxy repository, only non-snapshot tags are synced
+  - Non-release tags are marked as "skipped" in sync results
+
+### Changed
+
+- **Removed Incremental Sync Comparison**: all proxy repository sync (Docker and non-Docker) now performs full sync on each execution
+  - Removed MD5/ETag/Last-Modified checksum comparison logic from SyncService
+  - Removed MD5 checksum comparison logic from DockerService
+  - Every sync operation re-downloads all assets from remote
+- **Removed Last-Modified Checksum Comparison**: non-Docker proxy sync no longer uses Last-Modified header for comparison (was incorrect)
+
+### Removed
+
+- **Incremental Sync Methods**: removed all checksum comparison related methods
+  - SyncService: `getRemoteAssetMd5`, `getRemoteAssetChecksumViaHttp`, `getDockerRemoteAssetMd5`, `getDockerRegistryToken`, `getRemoteAssetMd5ViaApi`, `searchRemoteAssetMd5`, `searchRemoteAssetMd5ViaComponents`, `parseMd5FromSearchResponse`, `findMd5InAssetsArray`, `getLocalAssetChecksumForCompare`, `getLocalAssetEtag`, `getLocalAssetChecksum`, `checksumsMatch`, `extractDigestHex`
+  - DockerService: `getRemoteAssetMd5`, `getRemoteAssetMd5ViaApi`, `getLocalAssetMd5`, `extractRepoNameFromUrl`
+
 ## [1.0.0] - 2026-06-15
 
 ### Added
@@ -89,8 +114,8 @@ All notable changes to this project will be documented in this file.
   - **Cell tooltips**: hover over any cell to see full content
   - Auto-refresh every 3 seconds while active tasks exist
 - **Capability Configuration**:
-  - `Promotion Capability`: configurable thread pool size
-  - `Sync Capability`: configurable thread pool size, max sync queue size, max sync queue records, Docker release repositories
+  - `Promotion Capability`: configurable thread pool size, Docker release repositories
+  - `Sync Capability`: configurable thread pool size, max sync queue size, max sync queue records, Docker release proxy repositories
 - **Security**: Shiro-based permission integration
   - Promotion: requires `repository-view:edit` on target repository
   - Sync: requires `repository-view:delete` on proxy repository

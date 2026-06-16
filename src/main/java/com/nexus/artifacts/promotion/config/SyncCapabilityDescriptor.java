@@ -29,7 +29,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
   public static final String PROP_SYNC_POOL_SIZE = "syncPoolSize";
   public static final String PROP_MAX_SYNC_QUEUE_SIZE = "maxSyncQueueSize";
   public static final String PROP_MAX_SYNC_RECORDS = "maxSyncRecords";
-  public static final String PROP_DOCKER_RELEASE_REPOS = "dockerReleaseRepos";
+  public static final String PROP_DOCKER_RELEASE_PROXY_REPOS = "dockerReleaseProxyRepos";
 
   private static final NumberTextFormField POOL_SIZE_FIELD = new NumberTextFormField(
       PROP_SYNC_POOL_SIZE,
@@ -49,12 +49,12 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
       "Maximum number of sync task records to retain (1-10000, default: 200)",
       false);
 
-  private static final StringTextFormField DOCKER_RELEASE_REPOS_FIELD = new StringTextFormField(
-      PROP_DOCKER_RELEASE_REPOS,
-      "Docker Release Repositories",
-      "Comma-separated list of Docker host repository names that are release repositories. "
-          + "When promoting images to a release repository, only release tags are allowed "
-          + "(tags containing SNAPSHOT/dev/alpha/beta/RC are filtered out). Example: docker-release,prod-docker",
+  private static final StringTextFormField DOCKER_RELEASE_PROXY_REPOS_FIELD = new StringTextFormField(
+      PROP_DOCKER_RELEASE_PROXY_REPOS,
+      "Docker Release Proxy Repositories",
+      "Comma-separated list of Docker proxy repository names that are release repositories. "
+          + "When syncing images from a release proxy repository, only release tags are synced "
+          + "(tags containing SNAPSHOT/dev/alpha/beta/RC are filtered out). Example: docker-release-proxy,prod-docker-proxy",
       false);
 
   public SyncCapabilityDescriptor() {
@@ -72,12 +72,12 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   @Override
   public String about() {
-    return "Configure remote repository sync settings including thread pool size and max queue size";
+    return "Configure remote repository sync settings including thread pool size, max queue size, and Docker release proxy repos";
   }
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, DOCKER_RELEASE_REPOS_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, DOCKER_RELEASE_PROXY_REPOS_FIELD);
   }
 
   public Set<Tag> getTags() {

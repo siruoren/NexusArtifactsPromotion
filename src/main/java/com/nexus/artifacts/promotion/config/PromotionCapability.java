@@ -9,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.capability.CapabilitySupport;
 
+import com.nexus.artifacts.promotion.service.DockerService;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
 import static com.nexus.artifacts.promotion.config.PromotionCapabilityDescriptor.*;
@@ -17,6 +18,7 @@ import static com.nexus.artifacts.promotion.config.PromotionCapabilityDescriptor
  * Promotion management capability for Nexus system settings.
  * Allows administrators to configure:
  * - Promotion thread pool size
+ * - Docker release repositories (filter snapshot tags when promoting to release repos)
  */
 @Named(PromotionCapabilityDescriptor.TYPE_ID)
 public class PromotionCapability extends CapabilitySupport<Map<String, String>> {
@@ -24,10 +26,12 @@ public class PromotionCapability extends CapabilitySupport<Map<String, String>> 
   private static final Logger log = LoggerFactory.getLogger(PromotionCapability.class);
 
   private final TaskExecutorService taskExecutor;
+  private final DockerService dockerService;
 
   @Inject
-  public PromotionCapability(final TaskExecutorService taskExecutor) {
+  public PromotionCapability(final TaskExecutorService taskExecutor, final DockerService dockerService) {
     this.taskExecutor = taskExecutor;
+    this.dockerService = dockerService;
   }
 
   @Override
@@ -48,6 +52,18 @@ public class PromotionCapability extends CapabilitySupport<Map<String, String>> 
         log.warn("Invalid promotion pool size value: {}", poolSizeStr);
       }
     }
+
+    // Update Docker release repositories configuration
+    String dockerReleaseRepos = props.get(PROP_DOCKER_RELEASE_REPOS);
+    if (dockerReleaseRepos != null && !dockerReleaseRepos.trim().isEmpty()) {
+      dockerService.updateDockerReleaseRepos(dockerReleaseRepos.trim());
+      log.info("Docker release repositories set to: {}", dockerReleaseRepos.trim());
+    }
+    else {
+      dockerService.updateDockerReleaseRepos("");
+      log.info("Docker release repositories cleared");
+    }
+
     log.info("Promotion capability activated");
   }
 

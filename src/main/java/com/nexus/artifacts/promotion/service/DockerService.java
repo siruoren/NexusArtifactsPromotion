@@ -168,8 +168,11 @@ public class DockerService {
     }
   }
 
-  /** Set of Docker repository names configured as release repositories */
+  /** Set of Docker host repository names configured as release repositories (for promotion) */
   private volatile Set<String> dockerReleaseRepos = new HashSet<>();
+
+  /** Set of Docker proxy repository names configured as release repositories (for sync) */
+  private volatile Set<String> dockerReleaseProxyRepos = new HashSet<>();
 
   /**
    * Patterns that indicate a development/snapshot tag (not a release tag).
@@ -231,10 +234,36 @@ public class DockerService {
   }
 
   /**
-   * Check if a Docker repository is configured as a release repository.
+   * Check if a Docker repository is configured as a release repository (for promotion).
    */
   public boolean isDockerReleaseRepo(final String repoName) {
     return dockerReleaseRepos.contains(repoName);
+  }
+
+  /**
+   * Update Docker release proxy repositories from capability configuration.
+   * @param repos Comma-separated list of proxy repository names
+   */
+  public void updateDockerReleaseProxyRepos(final String repos) {
+    Set<String> newRepos = new HashSet<>();
+    if (repos != null && !repos.trim().isEmpty()) {
+      String[] parts = repos.split(",");
+      for (String part : parts) {
+        String trimmed = part.trim();
+        if (!trimmed.isEmpty()) {
+          newRepos.add(trimmed);
+        }
+      }
+    }
+    this.dockerReleaseProxyRepos = newRepos;
+    log.info("Docker release proxy repositories updated: {}", newRepos);
+  }
+
+  /**
+   * Check if a Docker proxy repository is configured as a release repository (for sync).
+   */
+  public boolean isDockerReleaseProxyRepo(final String repoName) {
+    return dockerReleaseProxyRepos.contains(repoName);
   }
 
   /**
@@ -1256,11 +1285,30 @@ public class DockerService {
               throw new IOException("No Docker images found in repository " + request.getSourceRepository());
             }
 
+            boolean isReleaseProxy = isDockerReleaseProxyRepo(request.getSourceRepository());
+
             for (DockerImageInfo img : images) {
               String imageName = img.getName();
               List<String> tags = img.getTags();
               if (tags == null || tags.isEmpty()) {
                 tags = listDockerTagsRemote(repo, imageName);
+              }
+
+              // Filter tags for release proxy repository
+              if (isReleaseProxy) {
+                List<String> originalTags = new ArrayList<>(tags);
+                tags = new ArrayList<>();
+                for (String tag : originalTags) {
+                  if (isReleaseTag(tag)) {
+                    tags.add(tag);
+                  } else {
+                    String manifestPath = "v2/" + imageName + "/manifests/" + tag;
+                    SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+                    skippedDetail.setStatus("skipped");
+                    skippedDetail.setErrorMessage("Skipped: non-release tag (source is a release proxy repository)");
+                    syncedFiles.add(skippedDetail);
+                  }
+                }
               }
 
               for (String tag : tags) {
@@ -1285,6 +1333,23 @@ public class DockerService {
             if (request.isAllTags()) {
               tags = listDockerTagsRemote(repo, request.getImage());
               log.info("Docker sync: found {} tags for image {} in remote", tags.size(), request.getImage());
+            }
+
+            // Filter tags for release proxy repository
+            if (isDockerReleaseProxyRepo(request.getSourceRepository())) {
+              List<String> originalTags = new ArrayList<>(tags);
+              tags = new ArrayList<>();
+              for (String tag : originalTags) {
+                if (isReleaseTag(tag)) {
+                  tags.add(tag);
+                } else {
+                  String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
+                  SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+                  skippedDetail.setStatus("skipped");
+                  skippedDetail.setErrorMessage("Skipped: non-release tag (source is a release proxy repository)");
+                  syncedFiles.add(skippedDetail);
+                }
+              }
             }
 
             if (tags.isEmpty()) {
@@ -1395,27 +1460,12 @@ public class DockerService {
 
   /**
    * Sync a single Docker asset (manifest or blob) via ViewFacet.dispatch.
-   * Includes MD5 incremental check, cache deletion, and negative cache invalidation.
+   * Always re-sync: delete cached asset, invalidate negative cache, then dispatch GET.
    */
   private SyncTaskInfo.SyncFileDetail syncDockerAsset(final Repository repo, final String assetPath) throws Exception {
     SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, "image");
 
-    // Extract auth from proxy repo configuration
-    String[] repoAuth = extractAuthFromRepo(repo);
-
-    // Incremental check: compare MD5 of remote and local
-    String remoteMd5 = getRemoteAssetMd5(repo, assetPath, repoAuth);
-    String localMd5 = getLocalAssetMd5(repo.getName(), assetPath);
-    detail.setRemoteMd5(remoteMd5);
-    detail.setLocalMd5(localMd5);
-
-    if (remoteMd5 != null && localMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-      log.debug("Skipping Docker asset sync (MD5 match): {}/{}", repo.getName(), assetPath);
-      detail.setStatus("skipped");
-      return detail;
-    }
-
-    // Delete cached asset + invalidate negative cache + dispatch GET
+    // Always re-sync: delete cached asset + invalidate negative cache + dispatch GET
     deleteCachedAssetInternal(repo, assetPath);
     invalidateNegativeCache(repo, assetPath);
 
@@ -2033,119 +2083,6 @@ public class DockerService {
     return null;
   }
 
-  private String getRemoteAssetMd5(final Repository proxyRepo, final String assetPath, final String[] repoAuth) {
-    try {
-      org.sonatype.nexus.repository.config.Configuration config = proxyRepo.getConfiguration();
-      if (config == null) return null;
-      Map<String, Map<String, Object>> attributes = config.getAttributes();
-      if (attributes == null || !attributes.containsKey("proxy")) return null;
-
-      @SuppressWarnings("unchecked")
-      Map<String, Object> proxyAttrs = attributes.get("proxy");
-      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
-      if (remoteUrl == null || remoteUrl.isEmpty()) return null;
-
-      // Strategy 1: If remote URL points to a local Nexus repo, use internal API
-      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
-      if (remoteRepoName != null) {
-        Repository remoteRepo = repositoryManager.get(remoteRepoName);
-        if (remoteRepo != null) {
-          return getAssetMd5(remoteRepoName, assetPath);
-        }
-      }
-
-      // Strategy 2: For external Nexus instances, try to get MD5 via remote Search API
-      String remoteMd5 = getRemoteAssetMd5ViaApi(remoteUrl, assetPath, repoAuth);
-      if (remoteMd5 != null) {
-        return remoteMd5;
-      }
-    }
-    catch (Exception e) {
-      log.debug("Failed to get remote MD5 for {}/{}: {}", proxyRepo.getName(), assetPath, e.getMessage());
-    }
-    return null;
-  }
-
-  /**
-   * Get the MD5 checksum of a remote Docker asset via the Nexus Search API.
-   */
-  private String getRemoteAssetMd5ViaApi(final String remoteUrl, final String assetPath,
-      final String[] repoAuth) {
-    try {
-      String remoteRepoName = null;
-      String remoteBaseUrl = null;
-
-      int repoIdx = remoteUrl.indexOf("/repository/");
-      if (repoIdx > 0) {
-        remoteBaseUrl = remoteUrl.substring(0, repoIdx);
-        String repoPart = remoteUrl.substring(repoIdx + "/repository/".length());
-        if (repoPart.endsWith("/")) {
-          repoPart = repoPart.substring(0, repoPart.length() - 1);
-        }
-        int slashIdx = repoPart.indexOf('/');
-        remoteRepoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
-      }
-
-      if (remoteRepoName == null || remoteBaseUrl == null) return null;
-
-      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
-          ? repoAuth[0] + ":" + repoAuth[1] : null;
-
-      // Normalize asset path for search
-      String searchPath = assetPath;
-      if (searchPath.startsWith("/")) searchPath = searchPath.substring(1);
-
-      // Use Search API to find the specific asset and get its checksum
-      String searchUrl = remoteBaseUrl + "/service/rest/v1/search/assets?repository="
-          + remoteRepoName + "&name=" + java.net.URLEncoder.encode(searchPath, "UTF-8");
-
-      HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(10_000);
-      conn.setReadTimeout(30_000);
-      conn.setRequestProperty("Accept", "application/json");
-
-      if (effectiveAuth != null) {
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
-      }
-
-      int code = conn.getResponseCode();
-      if (code != 200) {
-        conn.disconnect();
-        return null;
-      }
-
-      String json = readResponse(conn);
-      conn.disconnect();
-
-      // Parse checksums from the first matching asset
-      String itemsSection = extractJsonArray(json, "items");
-      if (itemsSection == null) return null;
-
-      int objStart = itemsSection.indexOf('{');
-      if (objStart < 0) return null;
-      int objEnd = findMatchingBrace(itemsSection, objStart);
-      if (objEnd < 0) return null;
-
-      String item = itemsSection.substring(objStart, objEnd + 1);
-      String md5 = extractChecksumValue(item, "md5");
-      if (md5 != null && !md5.isEmpty()) {
-        log.debug("Found remote MD5 via Search API for Docker asset {}: {}", assetPath, md5);
-        return md5;
-      }
-
-      return null;
-    }
-    catch (Exception e) {
-      log.debug("Failed to get remote MD5 via API for Docker asset {}: {}", assetPath, e.getMessage());
-      return null;
-    }
-  }
-
-  private String getLocalAssetMd5(final String repoName, final String assetPath) {
-    return getAssetMd5(repoName, assetPath);
-  }
-
   private void deleteCachedAssetInternal(final Repository repo, final String assetPath) {
     StorageTx tx = null;
     try {
@@ -2198,24 +2135,6 @@ public class DockerService {
     catch (Exception e) {
       log.debug("Negative cache invalidation skipped: {}", e.getMessage());
     }
-  }
-
-  private String extractRepoNameFromUrl(final String remoteUrl) {
-    try {
-      java.net.URL url = new java.net.URL(remoteUrl);
-      String path = url.getPath();
-      if (path.startsWith("/repository/")) {
-        String repoPart = path.substring("/repository/".length());
-        if (repoPart.endsWith("/")) repoPart = repoPart.substring(0, repoPart.length() - 1);
-        int slashIdx = repoPart.indexOf('/');
-        String repoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
-        if (!repoName.isEmpty()) return repoName;
-      }
-    }
-    catch (Exception e) {
-      log.debug("Failed to extract repo name from URL {}: {}", remoteUrl, e.getMessage());
-    }
-    return null;
   }
 
   private String[] extractAuthFromRepo(final Repository repo) {
