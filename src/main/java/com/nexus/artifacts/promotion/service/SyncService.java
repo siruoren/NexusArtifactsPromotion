@@ -478,6 +478,48 @@ public class SyncService {
   }
 
   /**
+   * Resubmit a recovered sync task after Nexus restart.
+   * Called by {@link SyncQueuePersistenceManager} during startup recovery.
+   */
+  public void resubmitRecoveredTask(final SyncTaskInfo recoveredTask) {
+    if (recoveredTask == null || recoveredTask.getTaskId() == null) {
+      log.warn("Cannot resubmit null or invalid recovered task");
+      return;
+    }
+
+    String taskId = recoveredTask.getTaskId();
+    String repoName = recoveredTask.getSourceRepository();
+    String path = recoveredTask.getPath();
+
+    log.info("Resubmitting recovered sync task: {} for {}:{}", taskId, repoName, path);
+
+    // Store the task info in memory
+    taskInfos.put(taskId, recoveredTask);
+
+    // Create a new sync request and submit it
+    SyncRequest request = new SyncRequest();
+    request.setRepositoryName(repoName);
+    request.setPath(path);
+    request.setIsDirectory(recoveredTask.isDirectory());
+    request.setFormat(recoveredTask.getFormat());
+
+    // Submit via normal sync flow (which handles permission, queue capacity, etc.)
+    try {
+      String newTaskId = sync(request);
+      log.info("Recovered task {} resubmitted as new task {}", taskId, newTaskId);
+      // Mark the old task as migrated
+      recoveredTask.setStatus(TaskStatus.MIGRATED);
+      recoveredTask.setEndTime(System.currentTimeMillis());
+    }
+    catch (Exception e) {
+      log.error("Failed to resubmit recovered task {}: {}", taskId, e.getMessage());
+      recoveredTask.setStatus(TaskStatus.FAILED);
+      recoveredTask.setErrorMessage("Recovery failed: " + sanitizeErrorMessage(e.getMessage()));
+      recoveredTask.setEndTime(System.currentTimeMillis());
+    }
+  }
+
+  /**
    * Get active (pending/running) sync tasks.
    */
   public List<SyncTaskInfo> getActiveSyncTasks() {

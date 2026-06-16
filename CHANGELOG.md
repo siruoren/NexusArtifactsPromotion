@@ -12,6 +12,41 @@ All notable changes to this project will be documented in this file.
 - **Docker Release Proxy Repository Configuration (Sync)**: added `dockerReleaseProxyRepos` parameter to Sync Capability
   - When syncing images from a configured release proxy repository, only non-snapshot tags are synced
   - Non-release tags are marked as "skipped" in sync results
+- **Docker Manifest OCI and Multi-Architecture Support**: added `DockerManifestParser` for comprehensive manifest format handling
+  - Support Docker Manifest V2 Schema 2 (`application/vnd.docker.distribution.manifest.v2+json`)
+  - Support OCI Image Manifest V1 (`application/vnd.oci.image.manifest.v1+json`)
+  - Support Docker Fat Manifest / Manifest List V2 (`application/vnd.docker.distribution.manifest.list.v2+json`)
+  - Support OCI Image Index V1 (`application/vnd.oci.image.index.v1+json`)
+  - Auto-detect manifest type when Content-Type header is missing
+  - Multi-architecture (arm64/arm32v6/etc.) image promotion and sync support
+  - Recursive sub-manifest processing for fat manifests
+- **Docker and Generic Sync Flow Separation**: Docker format sync requests are now delegated to `DockerService`
+  - `SyncService.sync()` detects Docker format and delegates to `DockerService.syncDockerImage()`
+  - Docker sync leverages manifest-aware blob dependency resolution
+  - Non-Docker formats continue to use ContentFacet-based sync
+- **Promotion Queue Capacity Control**: added `maxPromotionQueueSize` configuration to prevent OOM
+  - Promotion Capability UI now includes "Max Promotion Queue Size" field (default: 50)
+  - `TaskExecutorService` rejects new promotion tasks when queue is full
+  - Prevents memory exhaustion from excessive concurrent promotion tasks
+- **Configurable Retry Strategy**: retry parameters are now configurable via Promotion Capability UI
+  - Added "Retry Base Delay (ms)" field (100-10000, default: 1000)
+  - Added "Retry Max Delay (ms)" field (1000-300000, default: 30000)
+  - Exponential backoff with jitter: `min(maxDelay, baseDelay * 2^attempt) + random(0, jitter)`
+  - Retryable error classification: only retries on IOException, HTTP 429/5xx; never retries on IllegalArgumentException, SecurityException, HTTP 4xx
+- **Global Exception Handling**: added `PromotionExceptionMapper` for standardized REST API error responses
+  - SecurityException → 403 Forbidden
+  - IllegalArgumentException → 400 Bad Request
+  - IllegalStateException → 503 Service Unavailable
+  - IOException → 502 Bad Gateway
+  - All errors return consistent JSON format: `{"error":"category","message":"detail","status":code}`
+- **Structured Logging Enhancement**: improved promotion and sync completion logs with task metadata
+  - Promotion completion log includes: taskId, source, target, totalFiles, success count, skipped count, duration
+  - Sync completion log includes: taskId, repository, path, synced count, skipped count
+- **Sync Queue Persistence and Recovery**: added `SyncQueuePersistenceManager` for active task recovery after Nexus restart
+  - Active (PENDING/RUNNING) sync tasks are periodically persisted to disk (every 30 seconds)
+  - On Nexus startup, persisted active tasks are automatically recovered and resubmitted
+  - Only the latest snapshot is kept; old state files are cleaned up
+  - Recovered tasks are resubmitted through the normal sync flow with permission checks
 
 ### Changed
 
