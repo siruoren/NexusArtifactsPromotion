@@ -1565,8 +1565,7 @@ public class SyncService {
         }
       }
 
-      // Strategy 4: For non-Docker formats, try HTTP HEAD to get ETag or Last-Modified
-      // as a change indicator for incremental sync
+      // Strategy 4: For non-Docker formats, try HTTP HEAD to get ETag as change indicator
       String httpChecksum = getRemoteAssetChecksumViaHttp(remoteUrl, assetPath, repoAuth);
       if (httpChecksum != null) {
         log.debug("Found remote checksum via HTTP HEAD for {}/{}: {}", proxyRepo.getName(), assetPath, httpChecksum);
@@ -1586,8 +1585,8 @@ public class SyncService {
 
   /**
    * Get remote asset checksum via HTTP HEAD request.
-   * Tries to get ETag, Content-MD5, or Last-Modified header as a change indicator.
-   * Returns a string in format "etag:<value>" or "lm:<value>" for comparison.
+   * Tries to get ETag or Content-MD5 header as a change indicator.
+   * Returns a string in format "etag:<value>" or plain MD5 for comparison.
    */
   private String getRemoteAssetChecksumViaHttp(final String remoteUrl, final String assetPath,
       final String[] repoAuth) {
@@ -1636,13 +1635,6 @@ public class SyncService {
       if (contentMd5 != null && !contentMd5.isEmpty()) {
         conn.disconnect();
         return contentMd5;
-      }
-
-      // Try Last-Modified header as fallback
-      String lastModified = conn.getHeaderField("Last-Modified");
-      if (lastModified != null && !lastModified.isEmpty()) {
-        conn.disconnect();
-        return "lm:" + lastModified;
       }
 
       conn.disconnect();
@@ -1922,7 +1914,7 @@ public class SyncService {
 
   /**
    * Get local asset checksum for comparison with remote checksum.
-   * If remote checksum is in ETag or Last-Modified format, gets the corresponding
+   * If remote checksum is in ETag format, gets the corresponding
    * local value via HTTP HEAD. Otherwise uses the standard MD5/SHA256 checksum.
    */
   private String getLocalAssetChecksumForCompare(final Repository repo, final String assetPath,
@@ -1931,10 +1923,6 @@ public class SyncService {
       // If remote is ETag-based, get local ETag via HTTP HEAD
       if (remoteChecksum.startsWith("etag:")) {
         return getLocalAssetEtag(repo.getName(), assetPath);
-      }
-      // If remote is Last-Modified-based, get local Last-Modified via HTTP HEAD
-      if (remoteChecksum.startsWith("lm:")) {
-        return getLocalAssetLastModified(repo.getName(), assetPath);
       }
     }
     // Default: use standard checksum (MD5 for non-Docker, SHA256 for Docker)
@@ -1975,43 +1963,6 @@ public class SyncService {
     }
     catch (Exception e) {
       log.debug("Failed to get local ETag for {}/{}: {}", repoName, assetPath, e.getMessage());
-      return null;
-    }
-  }
-
-  /**
-   * Get local asset Last-Modified via HTTP HEAD request.
-   */
-  private String getLocalAssetLastModified(final String repoName, final String assetPath) {
-    try {
-      String baseUrl = getLocalNexusBase();
-      String normalizedPath = assetPath;
-      if (normalizedPath.startsWith("/")) {
-        normalizedPath = normalizedPath.substring(1);
-      }
-      String urlStr = baseUrl + "/repository/" + repoName + "/" + normalizedPath;
-
-      HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
-      conn.setRequestMethod("HEAD");
-      conn.setConnectTimeout(5_000);
-      conn.setReadTimeout(10_000);
-
-      int code = conn.getResponseCode();
-      if (code != 200) {
-        conn.disconnect();
-        return null;
-      }
-
-      String lastModified = conn.getHeaderField("Last-Modified");
-      conn.disconnect();
-
-      if (lastModified != null && !lastModified.isEmpty()) {
-        return "lm:" + lastModified;
-      }
-      return null;
-    }
-    catch (Exception e) {
-      log.debug("Failed to get local Last-Modified for {}/{}: {}", repoName, assetPath, e.getMessage());
       return null;
     }
   }
