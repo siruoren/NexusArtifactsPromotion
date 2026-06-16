@@ -108,6 +108,7 @@ public class SyncService {
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
+  private final DockerService dockerService;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -117,7 +118,8 @@ public class SyncService {
                       final TaskCacheManager cacheManager,
                       final PermissionChecker permissionChecker,
                       final SecurityHelper securityHelper,
-                      final FileWriteLockManager writeLockManager)
+                      final FileWriteLockManager writeLockManager,
+                      final DockerService dockerService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -125,6 +127,7 @@ public class SyncService {
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
+    this.dockerService = dockerService;
   }
 
   /**
@@ -182,6 +185,39 @@ public class SyncService {
    */
   public String sync(final SyncRequest request) {
     request.validate();
+
+    // Delegate Docker format syncs to DockerService
+    if ("docker".equalsIgnoreCase(request.getFormat())) {
+      log.info("Delegating Docker format sync to DockerService for repository: {}", request.getRepositoryName());
+      com.nexus.artifacts.promotion.model.DockerImageRequest dockerRequest =
+          new com.nexus.artifacts.promotion.model.DockerImageRequest();
+      dockerRequest.setSourceRepository(request.getRepositoryName());
+      dockerRequest.setFormat(request.getFormat());
+      // tags=null means all tags (isAllTags() returns true)
+      dockerRequest.setTags(null);
+      // Extract image name from path if provided
+      if (request.getPath() != null && !request.getPath().trim().isEmpty()) {
+        String path = request.getPath();
+        if (path.startsWith("v2/")) {
+          path = path.substring(3);
+        }
+        // Remove trailing /manifests/* or /blobs/*
+        int manifestsIdx = path.indexOf("/manifests/");
+        int blobsIdx = path.indexOf("/blobs/");
+        if (manifestsIdx > 0) {
+          path = path.substring(0, manifestsIdx);
+        }
+        else if (blobsIdx > 0) {
+          path = path.substring(0, blobsIdx);
+        }
+        dockerRequest.setImage(path);
+        dockerRequest.setAllImages(false);
+      }
+      else {
+        dockerRequest.setAllImages(true);
+      }
+      return dockerService.syncDockerImage(dockerRequest);
+    }
 
     // Check sync permission (also verifies it's a proxy repo)
     permissionChecker.checkSyncPermission(request.getRepositoryName(), request.getFormat());
@@ -316,6 +352,12 @@ public class SyncService {
    */
   public SyncTaskInfo syncScheduled(final SyncRequest request) {
     request.validate();
+
+    // Delegate Docker format syncs to DockerService (scheduled tasks not supported for Docker)
+    if ("docker".equalsIgnoreCase(request.getFormat())) {
+      throw new IllegalArgumentException(
+          "Docker scheduled sync is not supported via SyncService. Use DockerService.syncDockerImage() directly.");
+    }
 
     // No permission check for scheduled tasks — tasks are created by administrators
 

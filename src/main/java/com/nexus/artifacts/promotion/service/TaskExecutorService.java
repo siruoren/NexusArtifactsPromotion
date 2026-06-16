@@ -41,6 +41,7 @@ public class TaskExecutorService {
   private static final int DEFAULT_PROMOTION_POOL_SIZE = 4;
   private static final int DEFAULT_SYNC_POOL_SIZE = 4;
   private static final int DEFAULT_MAX_SYNC_QUEUE_SIZE = 20;
+  private static final int DEFAULT_MAX_PROMOTION_QUEUE_SIZE = 50;
   private static final int DEFAULT_MAX_SYNC_RECORDS = 200;
   private static final long TASK_TIMEOUT_MINUTES = 60;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
@@ -48,6 +49,7 @@ public class TaskExecutorService {
   private volatile int promotionPoolSize = DEFAULT_PROMOTION_POOL_SIZE;
   private volatile int syncPoolSize = DEFAULT_SYNC_POOL_SIZE;
   private volatile int maxSyncQueueSize = DEFAULT_MAX_SYNC_QUEUE_SIZE;
+  private volatile int maxPromotionQueueSize = DEFAULT_MAX_PROMOTION_QUEUE_SIZE;
   private volatile int maxSyncRecords = DEFAULT_MAX_SYNC_RECORDS;
 
   private ExecutorService promotionExecutor;
@@ -100,6 +102,13 @@ public class TaskExecutorService {
                                      final String taskId)
   {
     log.info("Submitting promotion task {}: {}", taskId, taskDescription);
+
+    // Check promotion queue capacity to prevent OOM
+    if (!hasPromotionQueueCapacity()) {
+      throw new IllegalStateException(
+          "Promotion queue is full (" + maxPromotionQueueSize
+              + "). Please wait for existing tasks to complete.");
+    }
 
     // Wrap task with timeout and error handling
     Callable<PromotionTaskCallback> wrappedTask = wrapTask(task, taskId, "promotion");
@@ -399,7 +408,16 @@ public class TaskExecutorService {
   public int getPromotionPoolSize() { return promotionPoolSize; }
   public int getSyncPoolSize() { return syncPoolSize; }
   public int getMaxSyncQueueSize() { return maxSyncQueueSize; }
+  public int getMaxPromotionQueueSize() { return maxPromotionQueueSize; }
   public int getMaxSyncRecords() { return maxSyncRecords; }
+
+  /**
+   * Update max promotion queue size.
+   */
+  public void updateMaxPromotionQueueSize(final int newSize) {
+    this.maxPromotionQueueSize = Math.max(1, newSize);
+    log.info("Max promotion queue size updated to {}", maxPromotionQueueSize);
+  }
 
   /**
    * Check if sync queue has capacity.
@@ -412,6 +430,19 @@ public class TaskExecutorService {
       }
     }
     return activeCount < maxSyncQueueSize;
+  }
+
+  /**
+   * Check if promotion queue has capacity.
+   */
+  public boolean hasPromotionQueueCapacity() {
+    int activeCount = 0;
+    for (TaskHandle handle : promotionTasks.values()) {
+      if (handle.status == TaskStatus.PENDING || handle.status == TaskStatus.RUNNING) {
+        activeCount++;
+      }
+    }
+    return activeCount < maxPromotionQueueSize;
   }
 
   /**

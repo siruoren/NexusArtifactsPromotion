@@ -34,13 +34,28 @@ public class RetryableOperation {
   public static final int DEFAULT_MAX_RETRIES = 3;
 
   /** Base delay in milliseconds for exponential backoff */
-  private static final long BASE_DELAY_MS = 1000;
+  private static volatile long baseDelayMs = 1000;
 
   /** Maximum delay cap in milliseconds */
-  private static final long MAX_DELAY_MS = 30_000;
+  private static volatile long maxDelayMs = 30_000;
 
   /** Jitter range in milliseconds (random 0~jitter added to delay) */
-  private static final long JITTER_MS = 500;
+  private static volatile long jitterMs = 500;
+
+  /**
+   * Update retry strategy parameters.
+   */
+  public static void configure(final long baseDelay, final long maxDelay, final long jitter) {
+    baseDelayMs = Math.max(100, baseDelay);
+    maxDelayMs = Math.max(1000, maxDelay);
+    jitterMs = Math.max(0, jitter);
+    log.info("Retry strategy configured: baseDelay={}ms, maxDelay={}ms, jitter={}ms",
+        baseDelayMs, maxDelayMs, jitterMs);
+  }
+
+  public static long getBaseDelayMs() { return baseDelayMs; }
+  public static long getMaxDelayMs() { return maxDelayMs; }
+  public static long getJitterMs() { return jitterMs; }
 
   /**
    * Execute a callable with retry and exponential backoff.
@@ -184,12 +199,12 @@ public class RetryableOperation {
 
   /**
    * Calculate delay for exponential backoff with jitter.
-   * Formula: min(MAX_DELAY, BASE_DELAY * 2^attempt) + random(0, JITTER)
+   * Formula: min(maxDelay, baseDelay * 2^attempt) + random(0, jitter)
    */
   private static long calculateDelay(int attempt) {
-    long exponentialDelay = (long) (BASE_DELAY_MS * Math.pow(2, attempt));
-    long cappedDelay = Math.min(exponentialDelay, MAX_DELAY_MS);
-    long jitter = ThreadLocalRandom.current().nextLong(0, JITTER_MS + 1);
+    long exponentialDelay = (long) (baseDelayMs * Math.pow(2, attempt));
+    long cappedDelay = Math.min(exponentialDelay, maxDelayMs);
+    long jitter = ThreadLocalRandom.current().nextLong(0, jitterMs + 1);
     return cappedDelay + jitter;
   }
 

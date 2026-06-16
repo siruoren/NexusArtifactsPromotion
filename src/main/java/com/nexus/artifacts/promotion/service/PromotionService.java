@@ -260,8 +260,10 @@ public class PromotionService {
 
           long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
           long promotedCount = promotedItems.size() - skippedCount;
-          log.info("Promotion task {} completed: {} items promoted, {} skipped from {} to {}",
-              taskId, promotedCount, skippedCount, request.getSourceRepository(), request.getTargetRepository());
+          long durationMs = result.getEndTime() - result.getStartTime();
+          log.info("Promotion task {} completed - source={}, target={}, totalFiles={}, success={}, skipped={}, duration={}ms",
+              taskId, request.getSourceRepository(), request.getTargetRepository(),
+              promotedItems.size(), promotedCount, skippedCount, durationMs);
         }
         catch (Exception e) {
           log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);

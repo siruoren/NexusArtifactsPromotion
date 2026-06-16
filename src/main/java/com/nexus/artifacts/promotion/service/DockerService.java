@@ -1029,30 +1029,62 @@ public class DockerService {
 
         String manifestContent = readStream(manifestConn.getInputStream());
         String manifestDigest = manifestConn.getHeaderField("Docker-Content-Digest");
+        String manifestMediaType = manifestConn.getContentType();
         manifestConn.disconnect();
 
-        // Step 2: Parse manifest to extract blob digests
-        Set<String> blobDigests = parseManifestBlobs(manifestContent);
-        log.info("[DOCKER-PROMO] Manifest for {}:{} references {} blobs", image, tag, blobDigests.size());
+        // Step 2: Parse manifest using DockerManifestParser
+        try {
+          DockerManifestParser.DockerManifest parsed = DockerManifestParser.parse(manifestContent, manifestMediaType);
 
-        // Step 3: Promote each blob (MD5 incremental check inside lock)
-        for (String digest : blobDigests) {
-          String blobPath = "v2/" + image + "/blobs/" + digest;
-          try {
-            PromotionTaskResult.FileItem blobItem = promoteDockerBlobLocked(
-                sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl);
-            items.add(blobItem);
+          if (parsed.isFatManifest()) {
+            // Fat Manifest (multi-arch): promote each platform sub-manifest and its blobs
+            log.info("[DOCKER-PROMO] {}:{} is a fat manifest with {} platform references",
+                image, tag, parsed.getManifestReferences().size());
+
+            for (DockerManifestParser.ManifestReference ref : parsed.getManifestReferences()) {
+              String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
+              try {
+                // Download and promote the sub-manifest's blobs
+                promoteSubManifestBlobs(sourceRepo, targetRepo, image, ref, cookieHeader, csrfToken, nexusBaseUrl, items);
+              }
+              catch (Exception e) {
+                log.error("Failed to promote sub-manifest {} for {}:{}: {}", ref.getDigest(), image, tag, e.getMessage());
+                PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(subManifestPath, "image");
+                failedItem.setStatus("failed");
+                failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                items.add(failedItem);
+              }
+            }
           }
-          catch (Exception e) {
-            log.error("Failed to promote blob {} for {}:{}: {}", digest, image, tag, e.getMessage());
-            PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
-            failedItem.setStatus("failed");
-            failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-            items.add(failedItem);
+          else {
+            // Single-platform manifest: promote config + layers
+            promoteBlobsForParsedManifest(sourceRepo, targetRepo, image, parsed, cookieHeader, csrfToken, nexusBaseUrl, items);
+          }
+        }
+        catch (Exception e) {
+          log.warn("[DOCKER-PROMO] Failed to parse manifest for {}:{}, falling back to legacy parser: {}",
+              image, tag, e.getMessage());
+          // Fallback to legacy parser
+          Set<String> blobDigests = parseManifestBlobs(manifestContent);
+          log.info("[DOCKER-PROMO] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
+          for (String digest : blobDigests) {
+            String blobPath = "v2/" + image + "/blobs/" + digest;
+            try {
+              PromotionTaskResult.FileItem blobItem = promoteDockerBlobLocked(
+                  sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl);
+              items.add(blobItem);
+            }
+            catch (Exception ex) {
+              log.error("Failed to promote blob {} for {}:{}: {}", digest, image, tag, ex.getMessage());
+              PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
+              failedItem.setStatus("failed");
+              failedItem.setErrorMessage(sanitizeErrorMessage(ex.getMessage()));
+              items.add(failedItem);
+            }
           }
         }
 
-        // Step 4: Upload manifest to target
+        // Step 3: Upload manifest to target
         try {
           PromotionTaskResult.FileItem manifestItem = uploadDockerManifest(
               targetRepo, manifestPath, manifestContent, cookieHeader, csrfToken, nexusBaseUrl);
@@ -1075,6 +1107,99 @@ public class DockerService {
     }
 
     return items;
+  }
+
+  /**
+   * Promote blobs for a single-platform parsed manifest.
+   */
+  private void promoteBlobsForParsedManifest(
+      final String sourceRepo, final String targetRepo,
+      final String image,
+      final DockerManifestParser.DockerManifest parsed,
+      final String cookieHeader, final String csrfToken,
+      final String nexusBaseUrl,
+      final List<PromotionTaskResult.FileItem> items) {
+
+    Set<String> blobDigests = parsed.getAllBlobDigests();
+    log.info("[DOCKER-PROMO] Promoting {} blobs for image {}", blobDigests.size(), image);
+
+    for (String digest : blobDigests) {
+      String blobPath = "v2/" + image + "/blobs/" + digest;
+      try {
+        PromotionTaskResult.FileItem blobItem = promoteDockerBlobLocked(
+            sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl);
+        items.add(blobItem);
+      }
+      catch (Exception e) {
+        log.error("Failed to promote blob {} for image {}: {}", digest, image, e.getMessage());
+        PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
+        failedItem.setStatus("failed");
+        failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        items.add(failedItem);
+      }
+    }
+  }
+
+  /**
+   * Promote blobs for a sub-manifest referenced by a fat manifest.
+   * Downloads the sub-manifest from source, parses it, and promotes its blobs.
+   */
+  private void promoteSubManifestBlobs(
+      final String sourceRepo, final String targetRepo,
+      final String image,
+      final DockerManifestParser.ManifestReference ref,
+      final String cookieHeader, final String csrfToken,
+      final String nexusBaseUrl,
+      final List<PromotionTaskResult.FileItem> items) throws IOException {
+
+    String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
+    log.info("[DOCKER-PROMO] Promoting sub-manifest {} for platform {}", ref.getDigest(), ref);
+
+    // Download sub-manifest from source
+    URL subManifestUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + subManifestPath);
+    HttpURLConnection subConn = (HttpURLConnection) subManifestUrl.openConnection();
+    subConn.setRequestMethod("GET");
+    subConn.setConnectTimeout(TIMEOUT_MS);
+    subConn.setReadTimeout(TIMEOUT_MS);
+    subConn.setRequestProperty("Accept",
+        DockerManifestParser.MEDIA_TYPE_DOCKER_V2 + ", "
+            + DockerManifestParser.MEDIA_TYPE_OCI_MANIFEST + ", "
+            + DockerManifestParser.MEDIA_TYPE_DOCKER_V1_SIGNED);
+    setAuthHeaders(subConn, cookieHeader, csrfToken);
+
+    int responseCode = subConn.getResponseCode();
+    if (responseCode != 200) {
+      String error = readErrorResponse(subConn);
+      subConn.disconnect();
+      throw new IOException("Failed to download sub-manifest " + subManifestPath + ": HTTP " + responseCode + " - " + error);
+    }
+
+    String subManifestContent = readStream(subConn.getInputStream());
+    String subMediaType = subConn.getContentType();
+    subConn.disconnect();
+
+    // Parse sub-manifest and promote its blobs
+    try {
+      DockerManifestParser.DockerManifest subParsed = DockerManifestParser.parse(subManifestContent, subMediaType);
+      promoteBlobsForParsedManifest(sourceRepo, targetRepo, image, subParsed, cookieHeader, csrfToken, nexusBaseUrl, items);
+    }
+    catch (Exception e) {
+      throw new IOException("Failed to parse sub-manifest " + ref.getDigest() + ": " + e.getMessage(), e);
+    }
+
+    // Upload sub-manifest to target
+    try {
+      PromotionTaskResult.FileItem subManifestItem = uploadDockerManifest(
+          targetRepo, subManifestPath, subManifestContent, cookieHeader, csrfToken, nexusBaseUrl);
+      items.add(subManifestItem);
+    }
+    catch (Exception e) {
+      log.error("Failed to upload sub-manifest {} for image {}: {}", ref.getDigest(), image, e.getMessage());
+      PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(subManifestPath, "image");
+      failedItem.setStatus("failed");
+      failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      items.add(failedItem);
+    }
   }
 
   /**
@@ -1478,28 +1603,92 @@ public class DockerService {
         return;
       }
 
-      // Step 3: Parse manifest to extract blob digests
-      Set<String> blobDigests = parseManifestBlobs(manifestContent);
-      log.info("[DOCKER-SYNC] Manifest for {}:{} references {} blobs", image, tag, blobDigests.size());
+      // Step 3: Parse manifest using DockerManifestParser
+      try {
+        DockerManifestParser.DockerManifest parsed = DockerManifestParser.parse(manifestContent, null);
 
-      // Step 4: Sync each referenced blob (still under the same lock)
-      for (String digest : blobDigests) {
-        String blobPath = "v2/" + image + "/blobs/" + digest;
-        try {
-          SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
-          details.add(blobDetail);
+        if (parsed.isFatManifest()) {
+          // Fat Manifest (multi-arch): sync each platform sub-manifest and its blobs
+          log.info("[DOCKER-SYNC] {}:{} is a fat manifest with {} platform references",
+              image, tag, parsed.getManifestReferences().size());
+
+          for (DockerManifestParser.ManifestReference ref : parsed.getManifestReferences()) {
+            String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
+            try {
+              // Sync the sub-manifest
+              SyncTaskInfo.SyncFileDetail subDetail = syncDockerAssetInternal(repo, subManifestPath);
+              details.add(subDetail);
+
+              // Read and parse the sub-manifest to get its blobs
+              String subManifestContent = readManifestContentFromCache(repo, subManifestPath);
+              if (subManifestContent != null && !subManifestContent.isEmpty()) {
+                DockerManifestParser.DockerManifest subParsed = DockerManifestParser.parse(subManifestContent, ref.getMediaType());
+                syncBlobsForManifest(repo, image, subParsed, details);
+              }
+            }
+            catch (Exception e) {
+              log.error("Failed to sync sub-manifest {} for {}:{}: {}", ref.getDigest(), image, tag, e.getMessage());
+              SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(subManifestPath, "image");
+              failedDetail.setStatus("failed");
+              failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+              details.add(failedDetail);
+            }
+          }
         }
-        catch (Exception e) {
-          log.error("Failed to sync blob {} for {}:{}: {}", digest, image, tag, e.getMessage());
-          SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
-          failedDetail.setStatus("failed");
-          failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-          details.add(failedDetail);
+        else {
+          // Single-platform manifest: sync config + layers
+          syncBlobsForManifest(repo, image, parsed, details);
+        }
+      }
+      catch (Exception e) {
+        log.warn("[DOCKER-SYNC] Failed to parse manifest for {}:{}, falling back to legacy parser: {}",
+            image, tag, e.getMessage());
+        // Fallback to legacy parser
+        Set<String> blobDigests = parseManifestBlobs(manifestContent);
+        log.info("[DOCKER-SYNC] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
+        for (String digest : blobDigests) {
+          String blobPath = "v2/" + image + "/blobs/" + digest;
+          try {
+            SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+            details.add(blobDetail);
+          }
+          catch (Exception ex) {
+            log.error("Failed to sync blob {} for {}:{}: {}", digest, image, tag, ex.getMessage());
+            SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
+            failedDetail.setStatus("failed");
+            failedDetail.setErrorMessage(sanitizeErrorMessage(ex.getMessage()));
+            details.add(failedDetail);
+          }
         }
       }
     });
 
     return details;
+  }
+
+  /**
+   * Sync all blobs (config + layers) for a single-platform manifest.
+   */
+  private void syncBlobsForManifest(final Repository repo, final String image,
+                                     final DockerManifestParser.DockerManifest manifest,
+                                     final List<SyncTaskInfo.SyncFileDetail> details) {
+    Set<String> blobDigests = manifest.getAllBlobDigests();
+    log.info("[DOCKER-SYNC] Syncing {} blobs for image {}", blobDigests.size(), image);
+
+    for (String digest : blobDigests) {
+      String blobPath = "v2/" + image + "/blobs/" + digest;
+      try {
+        SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+        details.add(blobDetail);
+      }
+      catch (Exception e) {
+        log.error("Failed to sync blob {} for image {}: {}", digest, image, e.getMessage());
+        SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
+        failedDetail.setStatus("failed");
+        failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        details.add(failedDetail);
+      }
+    }
   }
 
   /**
