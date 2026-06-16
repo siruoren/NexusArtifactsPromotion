@@ -4,14 +4,7 @@
 # Log file
 *.log
 
-# BlueJ files
-*.ctxt
-
-# Mobile Tools for Java (J2ME)
-.mtj.tmp/
-
-# Package Files #
-*.jar
+# Package Files (keep runtime jars out of git)
 *.war
 *.nar
 *.ear
@@ -19,6 +12,27 @@
 *.tar.gz
 *.rar
 
-# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+# Maven build output
+target/
+
+# IDE files
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.project
+.classpath
+.factorypath
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual machine crash logs
 hs_err_pid*
 replay_pid*
+
+# Nexus plugin cache
+.nexus-cache/

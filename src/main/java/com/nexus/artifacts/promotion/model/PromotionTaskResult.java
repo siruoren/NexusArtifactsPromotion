@@ -1,0 +1,94 @@
+package com.nexus.artifacts.promotion.model;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import com.fasterxml.jackson.annotation.JsonInclude;
+
+/**
+ * Result DTO for a promotion task.
+ */
+@JsonInclude(JsonInclude.Include.NON_NULL)
+public class PromotionTaskResult {
+
+  private String taskId;
+  private String sourceRepository;
+  private String targetRepository;
+  private String status;
+  private List<FileItem> items;
+  private String username;
+  private long startTime;
+  private long endTime;
+  private String errorMessage;
+
+  public PromotionTaskResult() {
+    this.items = new ArrayList<>();
+  }
+
+  public String getTaskId() { return taskId; }
+  public void setTaskId(String taskId) { this.taskId = taskId; }
+
+  public String getSourceRepository() { return sourceRepository; }
+  public void setSourceRepository(String sourceRepository) { this.sourceRepository = sourceRepository; }
+
+  public String getTargetRepository() { return targetRepository; }
+  public void setTargetRepository(String targetRepository) { this.targetRepository = targetRepository; }
+
+  public String getStatus() { return status; }
+  public void setStatus(String status) { this.status = status; }
+
+  public List<FileItem> getItems() { return items; }
+  public void setItems(List<FileItem> items) { this.items = items; }
+
+  public String getUsername() { return username; }
+  public void setUsername(String username) { this.username = username; }
+
+  public long getStartTime() { return startTime; }
+  public void setStartTime(long startTime) { this.startTime = startTime; }
+
+  public long getEndTime() { return endTime; }
+  public void setEndTime(long endTime) { this.endTime = endTime; }
+
+  public String getErrorMessage() { return errorMessage; }
+  public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+
+  /**
+   * Represents a single file/directory item in the promotion result.
+   */
+  @JsonInclude(JsonInclude.Include.NON_NULL)
+  public static class FileItem {
+    private String path;
+    private String type; // "directory", "file", "image"
+    private String status; // "success", "failed", "skipped"
+    private String errorMessage;
+    private String sourceMd5;
+    private String targetMd5;
+
+    public FileItem() {}
+
+    public FileItem(String path, String type) {
+      this.path = path;
+      this.type = type;
+      this.status = "success";
+    }
+
+    public String getPath() { return path; }
+    public void setPath(String path) { this.path = path; }
+
+    public String getType() { return type; }
+    public void setType(String type) { this.type = type; }
+
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+
+    public String getErrorMessage() { return errorMessage; }
+    public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+
+    public String getSourceMd5() { return sourceMd5; }
+    public void setSourceMd5(String sourceMd5) { this.sourceMd5 = sourceMd5; }
+
+    public String getTargetMd5() { return targetMd5; }
+    public void setTargetMd5(String targetMd5) { this.targetMd5 = targetMd5; }
+  }
+
+}
