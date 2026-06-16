@@ -1852,9 +1852,37 @@ public class SyncService {
       String searchPath = assetPath;
       if (searchPath.startsWith("/")) searchPath = searchPath.substring(1);
 
-      // Use Search API to find the specific asset and get its checksum
-      String searchUrl = remoteBaseUrl + "/service/rest/v1/search/assets?repository="
-          + remoteRepoName + "&name=" + java.net.URLEncoder.encode(searchPath, "UTF-8");
+      // Strategy A: Use Search API with name filter (exact match on asset name)
+      String md5 = searchRemoteAssetMd5(remoteBaseUrl, remoteRepoName, searchPath, effectiveAuth);
+      if (md5 != null) {
+        log.debug("Found remote MD5 via Search API for {}: {}", assetPath, md5);
+        return md5;
+      }
+
+      // Strategy B: Use Components API to find the asset by browsing components
+      md5 = searchRemoteAssetMd5ViaComponents(remoteBaseUrl, remoteRepoName, searchPath, effectiveAuth);
+      if (md5 != null) {
+        log.debug("Found remote MD5 via Components API for {}: {}", assetPath, md5);
+        return md5;
+      }
+
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 via API for {}: {}", assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Search remote asset MD5 via Nexus Search Assets API.
+   * Uses name parameter for exact asset name match.
+   */
+  private String searchRemoteAssetMd5(final String baseUrl, final String repoName,
+      final String assetPath, final String effectiveAuth) {
+    try {
+      String searchUrl = baseUrl + "/service/rest/v1/search/assets?repository="
+          + repoName + "&name=" + java.net.URLEncoder.encode(assetPath, "UTF-8");
 
       HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
       conn.setRequestMethod("GET");
@@ -1875,32 +1903,151 @@ public class SyncService {
       String json = readResponse(conn);
       conn.disconnect();
 
-      // Parse checksums from the first matching asset
-      String itemsSection = extractJsonArray(json, "items");
-      if (itemsSection == null) return null;
+      return parseMd5FromSearchResponse(json, assetPath);
+    }
+    catch (Exception e) {
+      log.debug("Search API failed for {}/{}: {}", repoName, assetPath, e.getMessage());
+      return null;
+    }
+  }
 
-      int objStart = itemsSection.indexOf('{');
-      if (objStart < 0) return null;
-      int objEnd = findMatchingBrace(itemsSection, objStart);
-      if (objEnd < 0) return null;
+  /**
+   * Search remote asset MD5 via Nexus Components API.
+   * Browses components and their assets to find a matching path.
+   */
+  private String searchRemoteAssetMd5ViaComponents(final String baseUrl, final String repoName,
+      final String assetPath, final String effectiveAuth) {
+    try {
+      String apiUrl = baseUrl + "/service/rest/v1/components?repository=" + repoName;
+      String continuationToken = null;
 
-      String item = itemsSection.substring(objStart, objEnd + 1);
+      do {
+        String url = apiUrl;
+        if (continuationToken != null) {
+          url += "&continuationToken=" + continuationToken;
+        }
 
-      // checksums is a JSON object like {"md5": "xxx", "sha1": "yyy", ...}
-      // Try to extract md5 value directly from the item string
-      // Look for "checksums":{...,"md5":"<value>",...} pattern
-      String md5 = extractChecksumValue(item, "md5");
-      if (md5 != null && !md5.isEmpty()) {
-        log.debug("Found remote MD5 via Search API for {}: {}", assetPath, md5);
-        return md5;
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(30_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        if (code != 200) {
+          conn.disconnect();
+          return null;
+        }
+
+        String json = readResponse(conn);
+        conn.disconnect();
+
+        // Parse components and their assets to find matching path
+        String itemsSection = extractJsonArray(json, "items");
+        if (itemsSection == null) return null;
+
+        // Look through each component's assets
+        int pos = 0;
+        while (pos < itemsSection.length()) {
+          int objStart = itemsSection.indexOf('{', pos);
+          if (objStart < 0) break;
+          int objEnd = findMatchingBrace(itemsSection, objStart);
+          if (objEnd < 0) break;
+
+          String component = itemsSection.substring(objStart, objEnd + 1);
+
+          // Extract assets array from this component
+          String assetsSection = extractJsonArray(component, "assets");
+          if (assetsSection != null) {
+            String md5 = findMd5InAssetsArray(assetsSection, assetPath);
+            if (md5 != null) {
+              return md5;
+            }
+          }
+
+          pos = objEnd + 1;
+        }
+
+        // Check for continuation token
+        continuationToken = extractJsonValue(json, "continuationToken");
+        if (continuationToken == null || continuationToken.isEmpty()
+            || "null".equals(continuationToken)) {
+          break;
+        }
       }
+      while (true);
 
       return null;
     }
     catch (Exception e) {
-      log.debug("Failed to get remote MD5 via API for {}: {}", assetPath, e.getMessage());
+      log.debug("Components API failed for {}/{}: {}", repoName, assetPath, e.getMessage());
       return null;
     }
+  }
+
+  /**
+   * Parse MD5 from Search API response, matching the exact asset path.
+   */
+  private String parseMd5FromSearchResponse(final String json, final String assetPath) {
+    String itemsSection = extractJsonArray(json, "items");
+    if (itemsSection == null) return null;
+
+    int pos = 0;
+    while (pos < itemsSection.length()) {
+      int objStart = itemsSection.indexOf('{', pos);
+      if (objStart < 0) break;
+      int objEnd = findMatchingBrace(itemsSection, objStart);
+      if (objEnd < 0) break;
+
+      String item = itemsSection.substring(objStart, objEnd + 1);
+
+      // Check if this asset's path matches
+      String itemPath = extractJsonValue(item, "path");
+      if (itemPath != null && (itemPath.equals(assetPath) || itemPath.equals("/" + assetPath)
+          || ("/" + itemPath).equals(assetPath))) {
+        String md5 = extractChecksumValue(item, "md5");
+        if (md5 != null && !md5.isEmpty()) {
+          return md5;
+        }
+      }
+
+      pos = objEnd + 1;
+    }
+
+    return null;
+  }
+
+  /**
+   * Find MD5 in a components assets array, matching the exact asset path.
+   */
+  private String findMd5InAssetsArray(final String assetsSection, final String assetPath) {
+    int pos = 0;
+    while (pos < assetsSection.length()) {
+      int objStart = assetsSection.indexOf('{', pos);
+      if (objStart < 0) break;
+      int objEnd = findMatchingBrace(assetsSection, objStart);
+      if (objEnd < 0) break;
+
+      String asset = assetsSection.substring(objStart, objEnd + 1);
+
+      // Check if this asset's path matches
+      String itemPath = extractJsonValue(asset, "path");
+      if (itemPath != null && (itemPath.equals(assetPath) || itemPath.equals("/" + assetPath)
+          || ("/" + itemPath).equals(assetPath))) {
+        String md5 = extractChecksumValue(asset, "md5");
+        if (md5 != null && !md5.isEmpty()) {
+          return md5;
+        }
+      }
+
+      pos = objEnd + 1;
+    }
+
+    return null;
   }
 
   /**
