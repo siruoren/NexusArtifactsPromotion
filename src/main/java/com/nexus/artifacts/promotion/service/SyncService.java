@@ -49,7 +49,6 @@ import com.google.common.hash.HashCode;
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
-import com.nexus.artifacts.promotion.security.CredentialEncryptor;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 /**
@@ -104,15 +103,8 @@ public class SyncService {
   /** Cached working local base URL */
   private volatile String cachedLocalNexusBase = null;
 
-  /** Default admin credentials for internal API calls */
-  private static final String DEFAULT_ADMIN_USERNAME = "admin";
-  private static final String DEFAULT_ADMIN_PASSWORD = "admin123";
-
   /** Maximum retry attempts for individual asset sync operations */
   private static final int SYNC_RETRY_ATTEMPTS = 2;
-
-  private volatile String adminUsername = DEFAULT_ADMIN_USERNAME;
-  private volatile String adminPassword = DEFAULT_ADMIN_PASSWORD;
 
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
@@ -184,33 +176,6 @@ public class SyncService {
       log.debug("Local connection test failed for {}: {}", baseUrl, e.getMessage());
       return false;
     }
-  }
-
-  /**
-   * Update admin credentials from capability configuration.
-   * Credentials are stored in encrypted form for security.
-   */
-  public void updateAdminCredentials(final String username, final String password) {
-    if (username != null && !username.isEmpty()) {
-      this.adminUsername = username;
-    }
-    if (password != null && !password.isEmpty()) {
-      // Encrypt the password for storage
-      this.adminPassword = CredentialEncryptor.encrypt(password);
-      log.info("Admin credentials updated for sync service (password encrypted)");
-    }
-  }
-
-  /**
-   * Get the current admin auth string (username:password).
-   * Decrypts the password if it was stored encrypted.
-   */
-  private String getAdminAuth() {
-    String password = adminPassword;
-    if (CredentialEncryptor.isEncrypted(password)) {
-      password = CredentialEncryptor.decrypt(password);
-    }
-    return adminUsername + ":" + password;
   }
 
   /**
@@ -603,7 +568,7 @@ public class SyncService {
       try {
         // Incremental check: compare checksums of remote and local assets
         String remoteMd5 = getRemoteAssetMd5(repo, filePath, repoAuth);
-        String localMd5 = getLocalAssetChecksum(repo, filePath);
+        String localMd5 = getLocalAssetChecksumForCompare(repo, filePath, remoteMd5);
 
         detail.setRemoteMd5(remoteMd5);
         detail.setLocalMd5(localMd5);
@@ -1191,12 +1156,12 @@ public class SyncService {
    *   2. If group filter returns 0 results (common for raw/hosted format where group doesn't
    *      match directory path), fall back to listing all assets and filtering by path prefix
    * Handles pagination via continuationToken.
-   * Uses proxy-configured credentials if provided, falls back to default admin credentials.
+   * Uses proxy-configured credentials if provided.
    */
   private List<String> listAssetsViaApi(final String repoName, final String directoryPath,
       final String authUsername, final String authPassword) throws Exception {
     String effectiveAuth = (authUsername != null && authPassword != null)
-        ? authUsername + ":" + authPassword : getAdminAuth();
+        ? authUsername + ":" + authPassword : null;
 
     // Full repository sync — list all assets without any path filter
     boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
@@ -1600,6 +1565,14 @@ public class SyncService {
         }
       }
 
+      // Strategy 4: For non-Docker formats, try HTTP HEAD to get ETag or Last-Modified
+      // as a change indicator for incremental sync
+      String httpChecksum = getRemoteAssetChecksumViaHttp(remoteUrl, assetPath, repoAuth);
+      if (httpChecksum != null) {
+        log.debug("Found remote checksum via HTTP HEAD for {}/{}: {}", proxyRepo.getName(), assetPath, httpChecksum);
+        return httpChecksum;
+      }
+
       // For external HTTP remotes where we cannot get MD5, return null
       // so sync will always proceed (full sync behavior)
       log.debug("Could not get remote MD5 for {}/{}, will sync unconditionally", proxyRepo.getName(), assetPath);
@@ -1607,6 +1580,76 @@ public class SyncService {
     }
     catch (Exception e) {
       log.debug("Failed to get remote MD5 for {}/{}: {}", proxyRepo.getName(), assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get remote asset checksum via HTTP HEAD request.
+   * Tries to get ETag, Content-MD5, or Last-Modified header as a change indicator.
+   * Returns a string in format "etag:<value>" or "lm:<value>" for comparison.
+   */
+  private String getRemoteAssetChecksumViaHttp(final String remoteUrl, final String assetPath,
+      final String[] repoAuth) {
+    try {
+      String urlStr = remoteUrl;
+      if (urlStr.endsWith("/")) {
+        urlStr = urlStr.substring(0, urlStr.length() - 1);
+      }
+      // Build the full URL to the remote asset
+      String normalizedPath = assetPath;
+      if (normalizedPath.startsWith("/")) {
+        normalizedPath = normalizedPath.substring(1);
+      }
+      String fullUrl = urlStr + "/" + normalizedPath;
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+
+      // Add auth if available from repository configuration
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        log.debug("HTTP HEAD for remote asset {} returned {}", fullUrl, code);
+        return null;
+      }
+
+      // Try ETag header first (most reliable for change detection)
+      String etag = conn.getHeaderField("ETag");
+      if (etag != null && !etag.isEmpty()) {
+        conn.disconnect();
+        // Normalize: remove quotes if present
+        etag = etag.replaceAll("^\"|\"$", "");
+        return "etag:" + etag;
+      }
+
+      // Try Content-MD5 header
+      String contentMd5 = conn.getHeaderField("Content-MD5");
+      if (contentMd5 != null && !contentMd5.isEmpty()) {
+        conn.disconnect();
+        return contentMd5;
+      }
+
+      // Try Last-Modified header as fallback
+      String lastModified = conn.getHeaderField("Last-Modified");
+      if (lastModified != null && !lastModified.isEmpty()) {
+        conn.disconnect();
+        return "lm:" + lastModified;
+      }
+
+      conn.disconnect();
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote checksum via HTTP HEAD for {}: {}", assetPath, e.getMessage());
       return null;
     }
   }
@@ -1878,10 +1921,101 @@ public class SyncService {
   }
 
   /**
-   * Get the local checksum for a Docker proxy repo asset.
-   * For Docker assets, returns SHA256 digest (matching Docker-Content-Digest format).
-   * For non-Docker assets, returns MD5.
+   * Get local asset checksum for comparison with remote checksum.
+   * If remote checksum is in ETag or Last-Modified format, gets the corresponding
+   * local value via HTTP HEAD. Otherwise uses the standard MD5/SHA256 checksum.
    */
+  private String getLocalAssetChecksumForCompare(final Repository repo, final String assetPath,
+      final String remoteChecksum) {
+    if (remoteChecksum != null) {
+      // If remote is ETag-based, get local ETag via HTTP HEAD
+      if (remoteChecksum.startsWith("etag:")) {
+        return getLocalAssetEtag(repo.getName(), assetPath);
+      }
+      // If remote is Last-Modified-based, get local Last-Modified via HTTP HEAD
+      if (remoteChecksum.startsWith("lm:")) {
+        return getLocalAssetLastModified(repo.getName(), assetPath);
+      }
+    }
+    // Default: use standard checksum (MD5 for non-Docker, SHA256 for Docker)
+    return getLocalAssetChecksum(repo, assetPath);
+  }
+
+  /**
+   * Get local asset ETag via HTTP HEAD request.
+   */
+  private String getLocalAssetEtag(final String repoName, final String assetPath) {
+    try {
+      String baseUrl = getLocalNexusBase();
+      String normalizedPath = assetPath;
+      if (normalizedPath.startsWith("/")) {
+        normalizedPath = normalizedPath.substring(1);
+      }
+      String urlStr = baseUrl + "/repository/" + repoName + "/" + normalizedPath;
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(5_000);
+      conn.setReadTimeout(10_000);
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      String etag = conn.getHeaderField("ETag");
+      conn.disconnect();
+
+      if (etag != null && !etag.isEmpty()) {
+        etag = etag.replaceAll("^\"|\"$", "");
+        return "etag:" + etag;
+      }
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get local ETag for {}/{}: {}", repoName, assetPath, e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get local asset Last-Modified via HTTP HEAD request.
+   */
+  private String getLocalAssetLastModified(final String repoName, final String assetPath) {
+    try {
+      String baseUrl = getLocalNexusBase();
+      String normalizedPath = assetPath;
+      if (normalizedPath.startsWith("/")) {
+        normalizedPath = normalizedPath.substring(1);
+      }
+      String urlStr = baseUrl + "/repository/" + repoName + "/" + normalizedPath;
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(urlStr).openConnection();
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(5_000);
+      conn.setReadTimeout(10_000);
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      String lastModified = conn.getHeaderField("Last-Modified");
+      conn.disconnect();
+
+      if (lastModified != null && !lastModified.isEmpty()) {
+        return "lm:" + lastModified;
+      }
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get local Last-Modified for {}/{}: {}", repoName, assetPath, e.getMessage());
+      return null;
+    }
+  }
+
   private String getLocalAssetChecksum(final Repository repo, final String assetPath) {
     String format = repo.getFormat().getValue();
     if ("docker".equals(format)) {
@@ -2080,17 +2214,6 @@ public class SyncService {
       log.debug("Failed to extract auth from repo {}: {}", repo.getName(), e.getMessage());
     }
     return null;
-  }
-
-  /**
-   * Build effective auth string for API calls.
-   * Uses proxy-configured credentials if available, otherwise falls back to default admin credentials.
-   */
-  private String getEffectiveAuth(final String[] repoAuth) {
-    if (repoAuth != null && repoAuth.length == 2 && repoAuth[0] != null && repoAuth[1] != null) {
-      return repoAuth[0] + ":" + repoAuth[1];
-    }
-    return getAdminAuth();
   }
 
   private String determineType(final String path) {

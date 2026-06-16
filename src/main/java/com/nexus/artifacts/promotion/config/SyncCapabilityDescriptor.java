@@ -11,7 +11,6 @@ import org.sonatype.nexus.capability.CapabilityType;
 import org.sonatype.nexus.capability.Tag;
 import org.sonatype.nexus.formfields.FormField;
 import org.sonatype.nexus.formfields.NumberTextFormField;
-import org.sonatype.nexus.formfields.PasswordFormField;
 import org.sonatype.nexus.formfields.StringTextFormField;
 
 import com.google.common.collect.Lists;
@@ -30,8 +29,6 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
   public static final String PROP_SYNC_POOL_SIZE = "syncPoolSize";
   public static final String PROP_MAX_SYNC_QUEUE_SIZE = "maxSyncQueueSize";
   public static final String PROP_MAX_SYNC_RECORDS = "maxSyncRecords";
-  public static final String PROP_ADMIN_USERNAME = "adminUsername";
-  public static final String PROP_ADMIN_PASSWORD = "adminPassword";
   public static final String PROP_DOCKER_RELEASE_REPOS = "dockerReleaseRepos";
 
   private static final NumberTextFormField POOL_SIZE_FIELD = new NumberTextFormField(
@@ -50,18 +47,6 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
       PROP_MAX_SYNC_RECORDS,
       "Max Sync Queue Records",
       "Maximum number of sync task records to retain (1-10000, default: 200)",
-      false);
-
-  private static final StringTextFormField ADMIN_USERNAME_FIELD = new StringTextFormField(
-      PROP_ADMIN_USERNAME,
-      "Admin Username",
-      "Username for internal API calls (default: admin)",
-      false);
-
-  private static final PasswordFormField ADMIN_PASSWORD_FIELD = new PasswordFormField(
-      PROP_ADMIN_PASSWORD,
-      "Admin Password",
-      "Password for internal API calls (default: admin123)",
       false);
 
   private static final StringTextFormField DOCKER_RELEASE_REPOS_FIELD = new StringTextFormField(
@@ -92,7 +77,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, ADMIN_USERNAME_FIELD, ADMIN_PASSWORD_FIELD, DOCKER_RELEASE_REPOS_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, DOCKER_RELEASE_REPOS_FIELD);
   }
 
   public Set<Tag> getTags() {

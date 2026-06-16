@@ -80,14 +80,6 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
       }
     }
 
-    // Update admin credentials for internal API calls
-    String adminUser = props.get(PROP_ADMIN_USERNAME);
-    String adminPass = props.get(PROP_ADMIN_PASSWORD);
-    if (adminUser != null || adminPass != null) {
-      syncService.updateAdminCredentials(adminUser, adminPass);
-      log.info("Admin credentials updated from capability configuration");
-    }
-
     // Update Docker release repositories configuration
     String dockerReleaseRepos = props.get(PROP_DOCKER_RELEASE_REPOS);
     if (dockerReleaseRepos != null && !dockerReleaseRepos.trim().isEmpty()) {

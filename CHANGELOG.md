@@ -51,10 +51,6 @@ All notable changes to this project will be documented in this file.
   - Progress polling during Docker promote/sync
   - Docker-specific button text on asset/folder panels
   - **Docker Registry API v2 error handling**: detailed error parsing for 401/404/429/5xx, retry on transient failures
-- **Credential Encryption**: admin credentials stored with AES-256-GCM encryption
-  - Passwords encrypted with ENC: prefix before storage in memory
-  - Derived key via PBKDF2 with instance-specific passphrase
-  - Automatic decrypt-on-use, backward compatible with plaintext passwords
 - **Task State Persistence**: async task results survive Nexus restarts
   - TaskStateStore persists completed/failed task states to disk as JSON
   - Automatic loading of persisted states on startup
@@ -94,10 +90,37 @@ All notable changes to this project will be documented in this file.
   - Auto-refresh every 3 seconds while active tasks exist
 - **Capability Configuration**:
   - `Promotion Capability`: configurable thread pool size
-  - `Sync Capability`: configurable thread pool size, max sync queue size, **max sync queue records** (default: 200), and admin credentials
+  - `Sync Capability`: configurable thread pool size, max sync queue size, max sync queue records, Docker release repositories
 - **Security**: Shiro-based permission integration
   - Promotion: requires `repository-view:edit` on target repository
   - Sync: requires `repository-view:delete` on proxy repository
   - Sync Queue: requires authentication only (no admin role needed)
 - **Self-signed HTTPS support**: trust all SSL certificates for promotion HTTP calls
 - **Reverse proxy support**: extract base URL from `X-Forwarded-*` headers
+
+### Changed
+
+- **Docker Promotion**: use Docker v2 API for manifest and blob push instead of direct PUT upload
+  - Manifests: `PUT /v2/<name>/manifests/<tag>` with proper Content-Type header
+  - Blobs: `POST /v2/<name>/blobs/uploads/` + `PUT` with digest parameter
+  - Pre-parse manifest to push referenced blobs before manifest (fixes BLOB_UNKNOWN error)
+  - Sort Docker files: blobs promoted before manifests
+- **Docker Sync**: use Docker Registry v2 API to fetch manifest digest for incremental sync
+  - Support Bearer token authentication for private registries
+  - SHA256 digest comparison for Docker assets (instead of MD5)
+- **Non-Docker Proxy Sync**: use HTTP HEAD to get ETag/Last-Modified for incremental sync
+  - Strategy 4: HTTP HEAD request to get ETag, Content-MD5, or Last-Modified as change indicator
+  - Local comparison via HTTP HEAD for corresponding header values
+- **Docker Promotion Modal**: fix button stuck in "promoting" state after task completion
+  - Hide promote button and change cancel button to "close" after task starts
+  - Add `findDockerPathIndex` for matching backend Docker paths to frontend image:tag format
+- **Docker Sync/Same mechanism**: Docker format uses the same sync mechanism as other formats
+
+### Removed
+
+- **Admin Credentials Configuration**: removed username/password fields from Sync Capability
+  - Removed `PROP_ADMIN_USERNAME` and `PROP_ADMIN_PASSWORD` from SyncCapabilityDescriptor
+  - Removed `updateAdminCredentials` from SyncService and DockerService
+  - Removed `getAdminAuth` and `getEffectiveAuth` fallback methods
+  - Removed `CredentialEncryptor` utility class (AES-256-GCM encryption)
+  - API calls now use repository-configured HTTP authentication only

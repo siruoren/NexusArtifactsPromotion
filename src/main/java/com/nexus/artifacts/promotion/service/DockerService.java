@@ -51,7 +51,6 @@ import com.nexus.artifacts.promotion.model.DockerImageRequest;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
-import com.nexus.artifacts.promotion.security.CredentialEncryptor;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 /**
@@ -169,13 +168,6 @@ public class DockerService {
     }
   }
 
-  /** Default admin credentials for internal API calls */
-  private static final String DEFAULT_ADMIN_USERNAME = "admin";
-  private static final String DEFAULT_ADMIN_PASSWORD = "admin123";
-
-  private volatile String adminUsername = DEFAULT_ADMIN_USERNAME;
-  private volatile String adminPassword = DEFAULT_ADMIN_PASSWORD;
-
   /** Set of Docker repository names configured as release repositories */
   private volatile Set<String> dockerReleaseRepos = new HashSet<>();
 
@@ -220,19 +212,6 @@ public class DockerService {
   }
 
   /**
-   * Update admin credentials from capability configuration.
-   * Credentials are stored in encrypted form for security.
-   */
-  public void updateAdminCredentials(final String username, final String password) {
-    if (username != null && !username.isEmpty()) {
-      this.adminUsername = username;
-    }
-    if (password != null && !password.isEmpty()) {
-      this.adminPassword = CredentialEncryptor.encrypt(password);
-    }
-  }
-
-  /**
    * Update Docker release repositories from capability configuration.
    * @param repos Comma-separated list of repository names
    */
@@ -270,14 +249,6 @@ public class DockerService {
       }
     }
     return true;
-  }
-
-  private String getAdminAuth() {
-    String password = adminPassword;
-    if (CredentialEncryptor.isEncrypted(password)) {
-      password = CredentialEncryptor.decrypt(password);
-    }
-    return adminUsername + ":" + password;
   }
 
   // ==================== Docker Image Listing ====================
@@ -355,7 +326,7 @@ public class DockerService {
     try {
       String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
-      String effectiveAuth = getAdminAuth();
+      String effectiveAuth = null;
 
       do {
         String url = apiUrl;
@@ -623,7 +594,7 @@ public class DockerService {
   private List<String> listDockerTagsViaLocalApi(final String repositoryName, final String imageName) {
     List<String> tags = new ArrayList<>();
     try {
-      String effectiveAuth = getAdminAuth();
+      String effectiveAuth = null;
       String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
 
