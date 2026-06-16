@@ -516,7 +516,7 @@ public class SyncService {
         try {
           // Incremental check: compare checksums of remote and local assets
           String remoteMd5 = getRemoteAssetMd5(repo, assetPath, repoAuth);
-          String localMd5 = getLocalAssetChecksum(repo, assetPath);
+          String localMd5 = getLocalAssetChecksumForCompare(repo, assetPath, remoteMd5);
 
           detail.setRemoteMd5(remoteMd5);
           detail.setLocalMd5(localMd5);
