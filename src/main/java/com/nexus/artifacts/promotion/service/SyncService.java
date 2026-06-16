@@ -107,6 +107,7 @@ public class SyncService {
   private final TaskCacheManager cacheManager;
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
+  private final FileWriteLockManager writeLockManager;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -115,13 +116,15 @@ public class SyncService {
                       final TaskExecutorService taskExecutor,
                       final TaskCacheManager cacheManager,
                       final PermissionChecker permissionChecker,
-                      final SecurityHelper securityHelper)
+                      final SecurityHelper securityHelper,
+                      final FileWriteLockManager writeLockManager)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
+    this.writeLockManager = writeLockManager;
   }
 
   /**
@@ -586,40 +589,42 @@ public class SyncService {
       final String[] repoAuth) throws Exception {
     log.info("Syncing asset {} via ViewFacet.dispatch()", assetPath);
 
-    try {
-      // Step 1: Delete cached asset if it exists, using internal StorageTx API
-      deleteCachedAssetInternal(repo, assetPath);
+    // Use file write lock to prevent concurrent sync of the same asset in the same repo
+    writeLockManager.executeWithFileLockVoid(repo.getName(), assetPath, () -> {
+      try {
+        // Step 1: Delete cached asset if it exists, using internal StorageTx API
+        deleteCachedAssetInternal(repo, assetPath);
 
-      // Step 2: Invalidate negative cache so previously 404'd assets can be retried
-      invalidateNegativeCache(repo, assetPath);
+        // Step 2: Invalidate negative cache so previously 404'd assets can be retried
+        invalidateNegativeCache(repo, assetPath);
 
-      // Step 3: Use ViewFacet.dispatch() - routes through full Nexus pipeline
-      // This properly sets up TokenMatcher.State and other context attributes
-      ViewFacet viewFacet = repo.facet(ViewFacet.class);
-      if (viewFacet != null) {
-        Request request = new Request.Builder()
-            .action("GET")
-            .path("/" + assetPath)
-            .build();
+        // Step 3: Use ViewFacet.dispatch() - routes through full Nexus pipeline
+        ViewFacet viewFacet = repo.facet(ViewFacet.class);
+        if (viewFacet != null) {
+          Request request = new Request.Builder()
+              .action("GET")
+              .path("/" + assetPath)
+              .build();
 
-        Response response = viewFacet.dispatch(request);
+          Response response = viewFacet.dispatch(request);
 
-        if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-          log.info("Successfully synced asset {} from remote (HTTP {})",
-              assetPath, response.getStatus().getCode());
+          if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
+            log.info("Successfully synced asset {} from remote (HTTP {})",
+                assetPath, response.getStatus().getCode());
+          }
+          else {
+            log.warn("Failed to sync asset {}: HTTP {}", assetPath, response.getStatus().getCode());
+          }
         }
         else {
-          log.warn("Failed to sync asset {}: HTTP {}", assetPath, response.getStatus().getCode());
+          log.warn("Repository {} does not have ViewFacet, skipping sync", repo.getName());
         }
       }
-      else {
-        log.warn("Repository {} does not have ViewFacet, skipping sync", repo.getName());
+      catch (Exception e) {
+        log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
+        throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
       }
-    }
-    catch (Exception e) {
-      log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
-      throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
-    }
+    });
   }
 
   // ========================================================================

@@ -99,6 +99,7 @@ public class PromotionService {
   private final TaskCacheManager cacheManager;
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
+  private final FileWriteLockManager writeLockManager;
 
   private final Map<String, PromotionTaskResult> taskResults = new ConcurrentHashMap<>();
 
@@ -107,13 +108,16 @@ public class PromotionService {
                            final TaskExecutorService taskExecutor,
                            final TaskCacheManager cacheManager,
                            final PermissionChecker permissionChecker,
-                           final SecurityHelper securityHelper)
+                           final SecurityHelper securityHelper,
+                           final FileWriteLockManager writeLockManager)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
+
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
+    this.writeLockManager = writeLockManager;
   }
 
   // ==================== Public API ====================
@@ -493,34 +497,44 @@ public class PromotionService {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.debug("Promoting via HTTP: {} -> {}/{}", fullSourcePath, targetRepo, filePath);
 
-    // Incremental check: compare MD5 of source and target assets via internal Java API
-    String sourceMd5 = getAssetMd5(sourceRepo, filePath);
-    String targetMd5 = getAssetMd5(targetRepo, filePath);
-
-    if (sourceMd5 != null && targetMd5 != null && sourceMd5.equalsIgnoreCase(targetMd5)) {
-      log.info("Skipping promotion (MD5 match): {} -> {}/{}, MD5={}",
-          fullSourcePath, targetRepo, filePath, sourceMd5);
-      PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(filePath, determineType(filePath));
-      skippedItem.setStatus("skipped");
-      skippedItem.setSourceMd5(sourceMd5);
-      skippedItem.setTargetMd5(targetMd5);
-      return skippedItem;
-    }
-
-    log.info("MD5 differs or missing, promoting: sourceMd5={}, targetMd5={}, path={}",
-        sourceMd5, targetMd5, filePath);
-
-    // Use retry for the actual download+upload operation
+    // Use file write lock to ensure MD5 check and file transfer are atomic (TOCTOU-safe)
     try {
-      PromotionTaskResult.FileItem result = RetryableOperation.execute(
+      return RetryableOperation.execute(
           "promote " + filePath,
-          () -> doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5),
+          () -> writeLockManager.executeWithFileLock(targetRepo, filePath, () -> {
+            // Incremental check inside lock: compare MD5 of source and target assets
+            String sourceMd5 = getAssetMd5(sourceRepo, filePath);
+            String targetMd5 = getAssetMd5(targetRepo, filePath);
+
+            if (sourceMd5 != null && targetMd5 != null && sourceMd5.equalsIgnoreCase(targetMd5)) {
+              log.info("Skipping promotion (MD5 match): {} -> {}/{}, MD5={}",
+                  fullSourcePath, targetRepo, filePath, sourceMd5);
+              PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(filePath, determineType(filePath));
+              skippedItem.setStatus("skipped");
+              skippedItem.setSourceMd5(sourceMd5);
+              skippedItem.setTargetMd5(targetMd5);
+              return skippedItem;
+            }
+
+            log.info("MD5 differs or missing, promoting: sourceMd5={}, targetMd5={}, path={}",
+                sourceMd5, targetMd5, filePath);
+
+            // Perform the actual file transfer (still inside the lock)
+            try {
+              return doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+            }
+            catch (IOException e) {
+              throw new RuntimeException(e);
+            }
+          }),
           FILE_RETRY_ATTEMPTS);
-      return result;
     }
     catch (Exception e) {
       if (e instanceof IOException) {
         throw (IOException) e;
+      }
+      if (e.getCause() instanceof IOException) {
+        throw (IOException) e.getCause();
       }
       throw new IOException("Promotion failed after retries: " + e.getMessage(), e);
     }

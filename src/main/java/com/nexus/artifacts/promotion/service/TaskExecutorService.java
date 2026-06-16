@@ -148,8 +148,9 @@ public class TaskExecutorService {
   }
 
   /**
-   * Cancel duplicate sync task for the same source directory.
-   * Only keeps the latest sync task, old tasks are terminated and marked as migrated.
+   * Cancel duplicate sync task for the same source directory and target repository.
+   * Only keeps the latest sync task when both source and target match.
+   * Tasks with different targets are allowed to run in parallel.
    */
   private void cancelDuplicateSyncTask(final String sourceRepository,
                                         final String sourcePath,
@@ -163,19 +164,26 @@ public class TaskExecutorService {
           && handle.sourcePath.equals(sourcePath)
           && (handle.status == TaskStatus.PENDING || handle.status == TaskStatus.RUNNING))
       {
-        String oldTaskId = handle.taskId;
-        log.info("Cancelling duplicate sync task {} for source {}:{}, migrating to {}",
-            oldTaskId, sourceRepository, sourcePath, newTaskId);
+        // Only cancel if target repository also matches (or both are null/default)
+        boolean sameTarget = (handle.targetRepository == null && sourceRepository == null)
+            || (handle.targetRepository != null && handle.targetRepository.equals(sourceRepository))
+            || (handle.targetRepository != null && handle.targetRepository.equals(handle.sourceRepository));
 
-        handle.future.cancel(true);
-        handle.status = TaskStatus.MIGRATED;
-        handle.migratedToTaskId = newTaskId;
-        handle.endTime = System.currentTimeMillis();
+        if (sameTarget) {
+          String oldTaskId = handle.taskId;
+          log.info("Cancelling duplicate sync task {} for source {}:{}, migrating to {}",
+              oldTaskId, sourceRepository, sourcePath, newTaskId);
 
-        // Cleanup old task cache
-        cacheManager.cleanupTask(oldTaskId);
+          handle.future.cancel(true);
+          handle.status = TaskStatus.MIGRATED;
+          handle.migratedToTaskId = newTaskId;
+          handle.endTime = System.currentTimeMillis();
 
-        log.info("Sync task {} migrated to {}", oldTaskId, newTaskId);
+          // Cleanup old task cache
+          cacheManager.cleanupTask(oldTaskId);
+
+          log.info("Sync task {} migrated to {}", oldTaskId, newTaskId);
+        }
       }
     }
   }
@@ -465,20 +473,27 @@ public class TaskExecutorService {
     public volatile long endTime;
     public final String sourceRepository;
     public final String sourcePath;
+    public final String targetRepository;
     public volatile String migratedToTaskId;
 
     public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime) {
-      this(taskId, future, status, startTime, null, null);
+      this(taskId, future, status, startTime, null, null, null);
     }
 
     public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime,
                        String sourceRepository, String sourcePath) {
+      this(taskId, future, status, startTime, sourceRepository, sourcePath, sourceRepository);
+    }
+
+    public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime,
+                       String sourceRepository, String sourcePath, String targetRepository) {
       this.taskId = taskId;
       this.future = future;
       this.status = status;
       this.startTime = startTime;
       this.sourceRepository = sourceRepository;
       this.sourcePath = sourcePath;
+      this.targetRepository = targetRepository;
     }
   }
 

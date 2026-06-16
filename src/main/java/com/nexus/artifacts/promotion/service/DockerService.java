@@ -196,6 +196,7 @@ public class DockerService {
   private final TaskCacheManager cacheManager;
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
+  private final FileWriteLockManager writeLockManager;
 
   private final Map<String, PromotionTaskResult> promotionTaskResults = new ConcurrentHashMap<>();
   private final Map<String, SyncTaskInfo> syncTaskInfos = new ConcurrentHashMap<>();
@@ -205,13 +206,15 @@ public class DockerService {
                        final TaskExecutorService taskExecutor,
                        final TaskCacheManager cacheManager,
                        final PermissionChecker permissionChecker,
-                       final SecurityHelper securityHelper)
+                       final SecurityHelper securityHelper,
+                       final FileWriteLockManager writeLockManager)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
+    this.writeLockManager = writeLockManager;
   }
 
   /**
@@ -1005,66 +1008,104 @@ public class DockerService {
 
     log.info("[DOCKER-PROMO] Promoting {}:{} (manifest path: {})", image, tag, manifestPath);
 
-    // Step 1: Download manifest from source
-    URL manifestSourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + manifestPath);
-    HttpURLConnection manifestConn = (HttpURLConnection) manifestSourceUrl.openConnection();
-    manifestConn.setRequestMethod("GET");
-    manifestConn.setConnectTimeout(TIMEOUT_MS);
-    manifestConn.setReadTimeout(TIMEOUT_MS);
-    manifestConn.setRequestProperty("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json");
-    setAuthHeaders(manifestConn, cookieHeader, csrfToken);
-
-    int manifestResponseCode = manifestConn.getResponseCode();
-    if (manifestResponseCode != 200) {
-      String error = readErrorResponse(manifestConn);
-      manifestConn.disconnect();
-      throw new IOException("Failed to download manifest " + manifestPath + ": HTTP " + manifestResponseCode + " - " + error);
-    }
-
-    String manifestContent = readStream(manifestConn.getInputStream());
-    String manifestDigest = manifestConn.getHeaderField("Docker-Content-Digest");
-    manifestConn.disconnect();
-
-    // Step 2: Parse manifest to extract blob digests
-    Set<String> blobDigests = parseManifestBlobs(manifestContent);
-    log.info("[DOCKER-PROMO] Manifest for {}:{} references {} blobs", image, tag, blobDigests.size());
-
-    // Step 3: Promote each blob (MD5 incremental check)
-    for (String digest : blobDigests) {
-      String blobPath = "v2/" + image + "/blobs/" + digest;
-      try {
-        PromotionTaskResult.FileItem blobItem = promoteDockerBlob(
-            sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl);
-        items.add(blobItem);
-      }
-      catch (Exception e) {
-        log.error("Failed to promote blob {} for {}:{}: {}", digest, image, tag, e.getMessage());
-        PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
-        failedItem.setStatus("failed");
-        failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-        items.add(failedItem);
-      }
-    }
-
-    // Step 4: Upload manifest to target
+    // Use image:tag level lock to ensure Manifest + Blob atomicity for promotion
     try {
-      PromotionTaskResult.FileItem manifestItem = uploadDockerManifest(
-          targetRepo, manifestPath, manifestContent, cookieHeader, csrfToken, nexusBaseUrl);
-      items.add(manifestItem);
+      writeLockManager.executeWithFileLockVoid(targetRepo, manifestPath, () -> {
+        // Step 1: Download manifest from source
+        URL manifestSourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + manifestPath);
+        HttpURLConnection manifestConn = (HttpURLConnection) manifestSourceUrl.openConnection();
+        manifestConn.setRequestMethod("GET");
+        manifestConn.setConnectTimeout(TIMEOUT_MS);
+        manifestConn.setReadTimeout(TIMEOUT_MS);
+        manifestConn.setRequestProperty("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json");
+        setAuthHeaders(manifestConn, cookieHeader, csrfToken);
+
+        int manifestResponseCode = manifestConn.getResponseCode();
+        if (manifestResponseCode != 200) {
+          String error = readErrorResponse(manifestConn);
+          manifestConn.disconnect();
+          throw new RuntimeException(new IOException("Failed to download manifest " + manifestPath + ": HTTP " + manifestResponseCode + " - " + error));
+        }
+
+        String manifestContent = readStream(manifestConn.getInputStream());
+        String manifestDigest = manifestConn.getHeaderField("Docker-Content-Digest");
+        manifestConn.disconnect();
+
+        // Step 2: Parse manifest to extract blob digests
+        Set<String> blobDigests = parseManifestBlobs(manifestContent);
+        log.info("[DOCKER-PROMO] Manifest for {}:{} references {} blobs", image, tag, blobDigests.size());
+
+        // Step 3: Promote each blob (MD5 incremental check inside lock)
+        for (String digest : blobDigests) {
+          String blobPath = "v2/" + image + "/blobs/" + digest;
+          try {
+            PromotionTaskResult.FileItem blobItem = promoteDockerBlobLocked(
+                sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl);
+            items.add(blobItem);
+          }
+          catch (Exception e) {
+            log.error("Failed to promote blob {} for {}:{}: {}", digest, image, tag, e.getMessage());
+            PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
+            failedItem.setStatus("failed");
+            failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+            items.add(failedItem);
+          }
+        }
+
+        // Step 4: Upload manifest to target
+        try {
+          PromotionTaskResult.FileItem manifestItem = uploadDockerManifest(
+              targetRepo, manifestPath, manifestContent, cookieHeader, csrfToken, nexusBaseUrl);
+          items.add(manifestItem);
+        }
+        catch (Exception e) {
+          log.error("Failed to upload manifest for {}:{}: {}", image, tag, e.getMessage());
+          PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
+          failedItem.setStatus("failed");
+          failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          items.add(failedItem);
+        }
+      });
     }
     catch (Exception e) {
-      log.error("Failed to upload manifest for {}:{}: {}", image, tag, e.getMessage());
-      PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
-      failedItem.setStatus("failed");
-      failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-      items.add(failedItem);
+      if (e.getCause() instanceof IOException) {
+        throw (IOException) e.getCause();
+      }
+      throw new IOException("Docker tag promotion failed: " + e.getMessage(), e);
     }
 
     return items;
   }
 
   /**
-   * Promote a single Docker blob with MD5 incremental check.
+   * Promote a single Docker blob with MD5 incremental check (called within lock scope).
+   * MD5 check and transfer are atomic under the image:tag lock.
+   */
+  private PromotionTaskResult.FileItem promoteDockerBlobLocked(
+      final String sourceRepo, final String targetRepo,
+      final String blobPath,
+      final String cookieHeader, final String csrfToken,
+      final String nexusBaseUrl) throws IOException
+  {
+    // MD5 incremental check (already inside lock, TOCTOU-safe)
+    String sourceMd5 = getAssetMd5(sourceRepo, blobPath);
+    String targetMd5 = getAssetMd5(targetRepo, blobPath);
+
+    if (sourceMd5 != null && targetMd5 != null && sourceMd5.equalsIgnoreCase(targetMd5)) {
+      log.debug("Skipping blob promotion (MD5 match): {}", blobPath);
+      PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(blobPath, "image");
+      item.setStatus("skipped");
+      item.setSourceMd5(sourceMd5);
+      item.setTargetMd5(targetMd5);
+      return item;
+    }
+
+    // Perform blob transfer directly (already inside lock)
+    return doPromoteBlobTransfer(sourceRepo, targetRepo, blobPath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+  }
+
+  /**
+   * Promote a single Docker blob with MD5 incremental check (standalone, acquires lock).
    */
   private PromotionTaskResult.FileItem promoteDockerBlob(
       final String sourceRepo, final String targetRepo,
@@ -1423,46 +1464,48 @@ public class DockerService {
 
     log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {})", image, tag, manifestPath);
 
-    // Step 1: Sync manifest - delete cached, invalidate neg cache, dispatch
-    SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAsset(repo, manifestPath);
-    details.add(manifestDetail);
+    // Use image:tag level lock to ensure Manifest + Blob atomicity
+    writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
+      // Step 1: Sync manifest - delete cached, invalidate neg cache, dispatch
+      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath);
+      details.add(manifestDetail);
 
-    // Step 2: Read manifest content from local cache to parse blob references
-    String manifestContent = readManifestContentFromCache(repo, manifestPath);
+      // Step 2: Read manifest content from local cache to parse blob references
+      String manifestContent = readManifestContentFromCache(repo, manifestPath);
 
-    if (manifestContent == null || manifestContent.isEmpty()) {
-      log.warn("Could not read manifest content for {}:{}, cannot determine blob dependencies", image, tag);
-      return details;
-    }
-
-    // Step 3: Parse manifest to extract blob digests
-    Set<String> blobDigests = parseManifestBlobs(manifestContent);
-    log.info("[DOCKER-SYNC] Manifest for {}:{} references {} blobs", image, tag, blobDigests.size());
-
-    // Step 4: Sync each referenced blob
-    for (String digest : blobDigests) {
-      String blobPath = "v2/" + image + "/blobs/" + digest;
-      try {
-        SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAsset(repo, blobPath);
-        details.add(blobDetail);
+      if (manifestContent == null || manifestContent.isEmpty()) {
+        log.warn("Could not read manifest content for {}:{}, cannot determine blob dependencies", image, tag);
+        return;
       }
-      catch (Exception e) {
-        log.error("Failed to sync blob {} for {}:{}: {}", digest, image, tag, e.getMessage());
-        SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
-        failedDetail.setStatus("failed");
-        failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
-        details.add(failedDetail);
+
+      // Step 3: Parse manifest to extract blob digests
+      Set<String> blobDigests = parseManifestBlobs(manifestContent);
+      log.info("[DOCKER-SYNC] Manifest for {}:{} references {} blobs", image, tag, blobDigests.size());
+
+      // Step 4: Sync each referenced blob (still under the same lock)
+      for (String digest : blobDigests) {
+        String blobPath = "v2/" + image + "/blobs/" + digest;
+        try {
+          SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+          details.add(blobDetail);
+        }
+        catch (Exception e) {
+          log.error("Failed to sync blob {} for {}:{}: {}", digest, image, tag, e.getMessage());
+          SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
+          failedDetail.setStatus("failed");
+          failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          details.add(failedDetail);
+        }
       }
-    }
+    });
 
     return details;
   }
 
   /**
-   * Sync a single Docker asset (manifest or blob) via ViewFacet.dispatch.
-   * Always re-sync: delete cached asset, invalidate negative cache, then dispatch GET.
+   * Internal method to sync a single Docker asset without acquiring lock (called within lock scope).
    */
-  private SyncTaskInfo.SyncFileDetail syncDockerAsset(final Repository repo, final String assetPath) throws Exception {
+  private SyncTaskInfo.SyncFileDetail syncDockerAssetInternal(final Repository repo, final String assetPath) throws Exception {
     SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, "image");
 
     // Always re-sync: delete cached asset + invalidate negative cache + dispatch GET

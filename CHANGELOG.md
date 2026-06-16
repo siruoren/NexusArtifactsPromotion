@@ -21,6 +21,16 @@ All notable changes to this project will be documented in this file.
   - Every sync operation re-downloads all assets from remote
 - **Removed Last-Modified Checksum Comparison**: non-Docker proxy sync no longer uses Last-Modified header for comparison (was incorrect)
 
+### Fixed
+
+- **Concurrent Write Lock (HIGH)**: added `FileWriteLockManager` to prevent file corruption from concurrent writes to the same target repository path
+  - PromotionService: MD5 check and file transfer are now atomic under file lock (fixes TOCTOU race condition)
+  - SyncService: asset sync operations are protected by per-file write lock
+  - DockerService: Docker tag sync/promotion uses image:tag level lock for Manifest+Blob atomicity
+  - Maven metadata merge is protected by the same file lock as the promotion operation
+- **Sync Task Deduplication (MEDIUM)**: `cancelDuplicateSyncTask` now checks target repository in addition to source, preventing incorrect cancellation of tasks with different targets
+- **TaskCacheManager Concurrency (MEDIUM)**: added per-file locks in `storeFile` to prevent concurrent write conflicts in cache directory
+
 ### Removed
 
 - **Incremental Sync Methods**: removed all checksum comparison related methods
