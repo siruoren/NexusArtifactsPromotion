@@ -47,6 +47,21 @@ All notable changes to this project will be documented in this file.
   - On Nexus startup, persisted active tasks are automatically recovered and resubmitted
   - Only the latest snapshot is kept; old state files are cleaned up
   - Recovered tasks are resubmitted through the normal sync flow with permission checks
+- **HTTP Connection Pool Reuse**: added `HttpClientPool` for connection pooling across promotion and sync operations
+  - Leverages JDK built-in HTTP Keep-Alive connection pooling (increased `http.maxConnections` to 20)
+  - Centralized timeout configuration (connect timeout, read timeout, chunk size)
+  - Core promotion and Docker blob transfer paths now use connection pool
+  - Maven metadata merge operations use connection pool
+  - Docker manifest download and sub-manifest processing use connection pool
+  - Chunked streaming mode for large uploads avoids buffering entire files in memory
+  - Connection reuse significantly reduces TLS handshake overhead in batch scenarios
+- **Unit Tests**: added `DockerManifestParserTest` with 21 test cases covering all manifest formats
+  - Docker V2 Schema 2 parsing and blob digest extraction
+  - OCI Image Manifest V1 parsing
+  - Docker Fat Manifest (Manifest List) with multi-architecture platform references
+  - OCI Image Index V1 parsing
+  - Auto-detection when Content-Type header is missing
+  - Edge cases: empty manifest, null manifest, missing config/layers, missing platform info
 
 ### Changed
 

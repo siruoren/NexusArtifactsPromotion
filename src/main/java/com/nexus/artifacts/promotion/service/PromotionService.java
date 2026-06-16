@@ -100,6 +100,7 @@ public class PromotionService {
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
+  private final HttpClientPool httpClientPool;
 
   private final Map<String, PromotionTaskResult> taskResults = new ConcurrentHashMap<>();
 
@@ -109,7 +110,8 @@ public class PromotionService {
                            final TaskCacheManager cacheManager,
                            final PermissionChecker permissionChecker,
                            final SecurityHelper securityHelper,
-                           final FileWriteLockManager writeLockManager)
+                           final FileWriteLockManager writeLockManager,
+                           final HttpClientPool httpClientPool)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -118,6 +120,7 @@ public class PromotionService {
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
+    this.httpClientPool = httpClientPool;
   }
 
   // ==================== Public API ====================
@@ -570,59 +573,26 @@ public class PromotionService {
       return promoteDockerAsset(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
     }
 
+    // Download from source and upload to target using connection pool
+    Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
+
     // Download from source
-    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
-    HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
-    downloadConn.setRequestMethod("GET");
-    downloadConn.setConnectTimeout(TIMEOUT_MS);
-    downloadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(downloadConn, cookieHeader, csrfToken);
+    String downloadUrl = nexusBaseUrl + "/repository/" + fullSourcePath;
+    HttpClientPool.HttpResponse downloadResponse = httpClientPool.get(downloadUrl, authHeaders);
 
-    int responseCode = downloadConn.getResponseCode();
-    if (responseCode != 200) {
-      String errorMsg = readErrorResponse(downloadConn);
-      downloadConn.disconnect();
-      throw new IOException("Download from " + fullSourcePath + " failed: HTTP " + responseCode + " - " + errorMsg);
+    if (!downloadResponse.isSuccess()) {
+      throw new IOException("Download from " + fullSourcePath + " failed: HTTP " + downloadResponse.getStatusCode() + " - " + downloadResponse.getBody());
     }
 
-    // Upload to target — use chunked streaming for large files
-    URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
-    HttpURLConnection uploadConn = (HttpURLConnection) targetUrl.openConnection();
-    uploadConn.setRequestMethod("PUT");
-    uploadConn.setDoOutput(true);
-    uploadConn.setConnectTimeout(TIMEOUT_MS);
-    uploadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(uploadConn, cookieHeader, csrfToken);
+    // Upload to target using connection pool with chunked streaming
+    String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+    byte[] fileData = downloadResponse.getBody().getBytes("UTF-8");
+    HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
+        uploadUrl, fileData, "application/octet-stream", authHeaders);
 
-    // Enable chunked streaming with 64KB chunks — avoids buffering entire file in memory
-    // This is critical for large Docker blobs (can be GBs)
-    uploadConn.setChunkedStreamingMode(64 * 1024);
-
-    // Stream content from download to upload
-    try (InputStream input = downloadConn.getInputStream();
-         OutputStream output = uploadConn.getOutputStream()) {
-
-      byte[] buffer = new byte[BUFFER_SIZE];
-      int bytesRead;
-      while ((bytesRead = input.read(buffer)) != -1) {
-        output.write(buffer, 0, bytesRead);
-      }
-      output.flush();
-    }
-    finally {
-      downloadConn.disconnect();
-    }
-
-    int uploadResponse = uploadConn.getResponseCode();
-    String uploadMsg = "";
-    if (uploadResponse >= 400) {
-      uploadMsg = readErrorResponse(uploadConn);
-    }
-    uploadConn.disconnect();
-
-    if (uploadResponse < 200 || uploadResponse > 299) {
+    if (!uploadResponse.isSuccess()) {
       throw new IOException("Upload to " + targetRepo + "/" + filePath +
-          " failed: HTTP " + uploadResponse + " - " + uploadMsg);
+          " failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
     }
 
     log.info("Successfully promoted: {} -> {}/{}",
@@ -650,68 +620,43 @@ public class PromotionService {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.info("Promoting maven-metadata.xml with merge: {}", fullSourcePath);
 
-    // Download source metadata
-    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + fullSourcePath);
-    HttpURLConnection sourceConn = (HttpURLConnection) sourceUrl.openConnection();
-    sourceConn.setRequestMethod("GET");
-    sourceConn.setConnectTimeout(TIMEOUT_MS);
-    sourceConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(sourceConn, cookieHeader, csrfToken);
+    // Download source metadata using connection pool
+    Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
+    String sourceUrl = nexusBaseUrl + "/repository/" + fullSourcePath;
+    HttpClientPool.HttpResponse sourceResponse = httpClientPool.get(sourceUrl, authHeaders);
 
-    int sourceResponse = sourceConn.getResponseCode();
-    if (sourceResponse != 200) {
-      String error = readErrorResponse(sourceConn);
-      sourceConn.disconnect();
-      throw new IOException("Download maven-metadata.xml failed: HTTP " + sourceResponse + " - " + error);
+    if (!sourceResponse.isSuccess()) {
+      throw new IOException("Download maven-metadata.xml failed: HTTP " + sourceResponse.getStatusCode() + " - " + sourceResponse.getBody());
     }
-    String sourceContent = readStream(sourceConn.getInputStream());
-    sourceConn.disconnect();
+    String sourceContent = sourceResponse.getBody();
 
     String mergedContent = sourceContent;
 
     // If target already has the metadata, download and merge
     if (targetMd5 != null) {
       try {
-        URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
-        HttpURLConnection targetConn = (HttpURLConnection) targetUrl.openConnection();
-        targetConn.setRequestMethod("GET");
-        targetConn.setConnectTimeout(TIMEOUT_MS);
-        targetConn.setReadTimeout(TIMEOUT_MS);
-        setAuthHeaders(targetConn, cookieHeader, csrfToken);
+        String targetUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+        HttpClientPool.HttpResponse targetResponse = httpClientPool.get(targetUrl, authHeaders);
 
-        if (targetConn.getResponseCode() == 200) {
-          String targetContent = readStream(targetConn.getInputStream());
+        if (targetResponse.isSuccess()) {
+          String targetContent = targetResponse.getBody();
           mergedContent = MavenMetadataMerger.merge(sourceContent, targetContent);
           log.info("Merged maven-metadata.xml for {}/{}", targetRepo, filePath);
         }
-        targetConn.disconnect();
       }
       catch (Exception e) {
         log.warn("Failed to merge maven-metadata.xml, using source content: {}", e.getMessage());
       }
     }
 
-    // Upload merged content to target
-    URL uploadUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath);
-    HttpURLConnection uploadConn = (HttpURLConnection) uploadUrl.openConnection();
-    uploadConn.setRequestMethod("PUT");
-    uploadConn.setDoOutput(true);
-    uploadConn.setConnectTimeout(TIMEOUT_MS);
-    uploadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(uploadConn, cookieHeader, csrfToken);
+    // Upload merged content to target using connection pool
+    String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+    HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
+        uploadUrl, mergedContent.getBytes("UTF-8"), "application/xml", authHeaders);
 
-    try (OutputStream output = uploadConn.getOutputStream()) {
-      output.write(mergedContent.getBytes("UTF-8"));
-      output.flush();
+    if (!uploadResponse.isSuccess()) {
+      throw new IOException("Upload merged maven-metadata.xml failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
     }
-
-    int uploadResponse = uploadConn.getResponseCode();
-    if (uploadResponse >= 400) {
-      String error = readErrorResponse(uploadConn);
-      uploadConn.disconnect();
-      throw new IOException("Upload merged maven-metadata.xml failed: HTTP " + uploadResponse + " - " + error);
-    }
-    uploadConn.disconnect();
 
     PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "file");
     item.setSourceMd5(sourceMd5);
@@ -1232,6 +1177,22 @@ public class PromotionService {
     }
     conn.setRequestProperty("X-Nexus-UI", "true");
     conn.setRequestProperty("Accept", "*/*");
+  }
+
+  /**
+   * Build auth headers map for HttpClientPool requests.
+   */
+  private Map<String, String> buildAuthHeaders(final String cookieHeader, final String csrfToken) {
+    Map<String, String> headers = new java.util.HashMap<>();
+    if (cookieHeader != null && !cookieHeader.isEmpty()) {
+      headers.put("Cookie", cookieHeader);
+    }
+    if (csrfToken != null && !csrfToken.isEmpty()) {
+      headers.put("NX-ANTI-CSRF-TOKEN", csrfToken);
+    }
+    headers.put("X-Nexus-UI", "true");
+    headers.put("Accept", "*/*");
+    return headers;
   }
 
   /**

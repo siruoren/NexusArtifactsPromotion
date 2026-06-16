@@ -197,6 +197,7 @@ public class DockerService {
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
+  private final HttpClientPool httpClientPool;
 
   private final Map<String, PromotionTaskResult> promotionTaskResults = new ConcurrentHashMap<>();
   private final Map<String, SyncTaskInfo> syncTaskInfos = new ConcurrentHashMap<>();
@@ -207,7 +208,8 @@ public class DockerService {
                        final TaskCacheManager cacheManager,
                        final PermissionChecker permissionChecker,
                        final SecurityHelper securityHelper,
-                       final FileWriteLockManager writeLockManager)
+                       final FileWriteLockManager writeLockManager,
+                       final HttpClientPool httpClientPool)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -215,6 +217,7 @@ public class DockerService {
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
+    this.httpClientPool = httpClientPool;
   }
 
   /**
@@ -1011,26 +1014,22 @@ public class DockerService {
     // Use image:tag level lock to ensure Manifest + Blob atomicity for promotion
     try {
       writeLockManager.executeWithFileLockVoid(targetRepo, manifestPath, () -> {
-        // Step 1: Download manifest from source
-        URL manifestSourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + manifestPath);
-        HttpURLConnection manifestConn = (HttpURLConnection) manifestSourceUrl.openConnection();
-        manifestConn.setRequestMethod("GET");
-        manifestConn.setConnectTimeout(TIMEOUT_MS);
-        manifestConn.setReadTimeout(TIMEOUT_MS);
-        manifestConn.setRequestProperty("Accept", "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json");
-        setAuthHeaders(manifestConn, cookieHeader, csrfToken);
+        // Step 1: Download manifest from source (using connection pool)
+        String manifestSourceUrl = nexusBaseUrl + "/repository/" + sourceRepo + "/" + manifestPath;
+        Map<String, String> manifestHeaders = buildAuthHeaders(cookieHeader, csrfToken);
+        HttpClientPool.HttpResponse manifestResponse = httpClientPool.getWithAccept(
+            manifestSourceUrl,
+            "application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json",
+            manifestHeaders);
 
-        int manifestResponseCode = manifestConn.getResponseCode();
+        int manifestResponseCode = manifestResponse.getStatusCode();
         if (manifestResponseCode != 200) {
-          String error = readErrorResponse(manifestConn);
-          manifestConn.disconnect();
-          throw new RuntimeException(new IOException("Failed to download manifest " + manifestPath + ": HTTP " + manifestResponseCode + " - " + error));
+          throw new RuntimeException(new IOException("Failed to download manifest " + manifestPath + ": HTTP " + manifestResponseCode + " - " + manifestResponse.getBody()));
         }
 
-        String manifestContent = readStream(manifestConn.getInputStream());
-        String manifestDigest = manifestConn.getHeaderField("Docker-Content-Digest");
-        String manifestMediaType = manifestConn.getContentType();
-        manifestConn.disconnect();
+        String manifestContent = manifestResponse.getBody();
+        String manifestDigest = manifestResponse.getDockerContentDigest();
+        String manifestMediaType = manifestResponse.getContentType();
 
         // Step 2: Parse manifest using DockerManifestParser
         try {
@@ -1155,28 +1154,23 @@ public class DockerService {
     String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
     log.info("[DOCKER-PROMO] Promoting sub-manifest {} for platform {}", ref.getDigest(), ref);
 
-    // Download sub-manifest from source
-    URL subManifestUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + subManifestPath);
-    HttpURLConnection subConn = (HttpURLConnection) subManifestUrl.openConnection();
-    subConn.setRequestMethod("GET");
-    subConn.setConnectTimeout(TIMEOUT_MS);
-    subConn.setReadTimeout(TIMEOUT_MS);
-    subConn.setRequestProperty("Accept",
+    // Download sub-manifest from source (using connection pool)
+    String subManifestUrl = nexusBaseUrl + "/repository/" + sourceRepo + "/" + subManifestPath;
+    Map<String, String> subHeaders = buildAuthHeaders(cookieHeader, csrfToken);
+    HttpClientPool.HttpResponse subResponse = httpClientPool.getWithAccept(
+        subManifestUrl,
         DockerManifestParser.MEDIA_TYPE_DOCKER_V2 + ", "
             + DockerManifestParser.MEDIA_TYPE_OCI_MANIFEST + ", "
-            + DockerManifestParser.MEDIA_TYPE_DOCKER_V1_SIGNED);
-    setAuthHeaders(subConn, cookieHeader, csrfToken);
+            + DockerManifestParser.MEDIA_TYPE_DOCKER_V1_SIGNED,
+        subHeaders);
 
-    int responseCode = subConn.getResponseCode();
+    int responseCode = subResponse.getStatusCode();
     if (responseCode != 200) {
-      String error = readErrorResponse(subConn);
-      subConn.disconnect();
-      throw new IOException("Failed to download sub-manifest " + subManifestPath + ": HTTP " + responseCode + " - " + error);
+      throw new IOException("Failed to download sub-manifest " + subManifestPath + ": HTTP " + responseCode + " - " + subResponse.getBody());
     }
 
-    String subManifestContent = readStream(subConn.getInputStream());
-    String subMediaType = subConn.getContentType();
-    subConn.disconnect();
+    String subManifestContent = subResponse.getBody();
+    String subMediaType = subResponse.getContentType();
 
     // Parse sub-manifest and promote its blobs
     try {
@@ -1277,51 +1271,24 @@ public class DockerService {
       final String nexusBaseUrl,
       final String sourceMd5, final String targetMd5) throws IOException
   {
-    // Download from source, upload to target
-    URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + blobPath);
-    HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
-    downloadConn.setRequestMethod("GET");
-    downloadConn.setConnectTimeout(TIMEOUT_MS);
-    downloadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(downloadConn, cookieHeader, csrfToken);
+    // Download from source using connection pool
+    String sourceUrl = nexusBaseUrl + "/repository/" + sourceRepo + "/" + blobPath;
+    Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
 
-    int responseCode = downloadConn.getResponseCode();
-    if (responseCode != 200) {
-      String error = readErrorResponse(downloadConn);
-      downloadConn.disconnect();
-      throw new IOException("Download blob failed: HTTP " + responseCode + " - " + error);
+    HttpClientPool.HttpResponse downloadResponse = httpClientPool.get(sourceUrl, authHeaders);
+    if (!downloadResponse.isSuccess()) {
+      throw new IOException("Download blob failed: HTTP " + downloadResponse.getStatusCode() + " - " + downloadResponse.getBody());
     }
 
-    // Upload to target — use chunked streaming for large Docker blobs
-    URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + blobPath);
-    HttpURLConnection uploadConn = (HttpURLConnection) targetUrl.openConnection();
-    uploadConn.setRequestMethod("PUT");
-    uploadConn.setDoOutput(true);
-    uploadConn.setConnectTimeout(TIMEOUT_MS);
-    uploadConn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(uploadConn, cookieHeader, csrfToken);
-    // Enable chunked streaming with 64KB chunks — critical for large Docker blobs (GBs)
-    uploadConn.setChunkedStreamingMode(64 * 1024);
+    // Upload to target using connection pool with streaming
+    String targetUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + blobPath;
+    byte[] blobData = downloadResponse.getBody().getBytes("UTF-8");
 
-    try (InputStream input = downloadConn.getInputStream();
-         OutputStream output = uploadConn.getOutputStream()) {
-      byte[] buffer = new byte[BUFFER_SIZE];
-      int bytesRead;
-      while ((bytesRead = input.read(buffer)) != -1) {
-        output.write(buffer, 0, bytesRead);
-      }
-      output.flush();
-    }
-    finally {
-      downloadConn.disconnect();
-    }
+    HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
+        targetUrl, blobData, "application/octet-stream", authHeaders);
 
-    int uploadResponse = uploadConn.getResponseCode();
-    String uploadMsg = uploadResponse >= 400 ? readErrorResponse(uploadConn) : "";
-    uploadConn.disconnect();
-
-    if (uploadResponse < 200 || uploadResponse > 299) {
-      throw new IOException("Upload blob failed: HTTP " + uploadResponse + " - " + uploadMsg);
+    if (!uploadResponse.isSuccess()) {
+      throw new IOException("Upload blob failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
     }
 
     PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(blobPath, "image");
@@ -1361,26 +1328,15 @@ public class DockerService {
       final String cookieHeader, final String csrfToken,
       final String nexusBaseUrl) throws IOException
   {
-    URL targetUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + manifestPath);
-    HttpURLConnection conn = (HttpURLConnection) targetUrl.openConnection();
-    conn.setRequestMethod("PUT");
-    conn.setDoOutput(true);
-    conn.setConnectTimeout(TIMEOUT_MS);
-    conn.setReadTimeout(TIMEOUT_MS);
-    setAuthHeaders(conn, cookieHeader, csrfToken);
-    conn.setRequestProperty("Content-Type", "application/vnd.docker.distribution.manifest.v2+json");
+    String targetUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + manifestPath;
+    Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
 
-    try (OutputStream output = conn.getOutputStream()) {
-      output.write(manifestContent.getBytes("UTF-8"));
-      output.flush();
-    }
+    HttpClientPool.HttpResponse response = httpClientPool.put(
+        targetUrl, manifestContent.getBytes("UTF-8"),
+        "application/vnd.docker.distribution.manifest.v2+json", authHeaders);
 
-    int responseCode = conn.getResponseCode();
-    String errorMsg = responseCode >= 400 ? readErrorResponse(conn) : "";
-    conn.disconnect();
-
-    if (responseCode < 200 || responseCode > 299) {
-      throw new IOException("Upload manifest failed: HTTP " + responseCode + " - " + errorMsg);
+    if (!response.isSuccess()) {
+      throw new IOException("Upload manifest failed: HTTP " + response.getStatusCode() + " - " + response.getBody());
     }
 
     PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(manifestPath, "image");
@@ -2399,6 +2355,22 @@ public class DockerService {
     }
     conn.setRequestProperty("X-Nexus-UI", "true");
     conn.setRequestProperty("Accept", "*/*");
+  }
+
+  /**
+   * Build auth headers map for HttpClientPool requests.
+   */
+  private Map<String, String> buildAuthHeaders(final String cookieHeader, final String csrfToken) {
+    Map<String, String> headers = new java.util.HashMap<>();
+    if (cookieHeader != null && !cookieHeader.isEmpty()) {
+      headers.put("Cookie", cookieHeader);
+    }
+    if (csrfToken != null && !csrfToken.isEmpty()) {
+      headers.put("NX-ANTI-CSRF-TOKEN", csrfToken);
+    }
+    headers.put("X-Nexus-UI", "true");
+    headers.put("Accept", "*/*");
+    return headers;
   }
 
   // ==================== JSON Parsing Helpers ====================
