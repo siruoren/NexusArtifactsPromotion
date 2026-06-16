@@ -1,6 +1,6 @@
 # Nexus Artifacts Promotion Plugin
 
-**Version**: 1.0.0-SNAPSHOT
+**Version**: 1.0.0
 **Updated**: 2026-06-15
 **Compatibility**: Nexus Repository Manager 3.45.0+ (PRO & OSS)
 
@@ -673,11 +673,3 @@ src/main/java/com/nexus/artifacts/promotion/
 | 5xx | 可重试：服务端临时错误 |
 
 ---
-
-## 未来改进方向
-
-- **断点续传**：大文件支持 Range 请求续传
-- **并发优化**：Docker Blob 并行下载/上传
-- **Webhook 通知**：任务完成后发送通知
-- **单元/集成测试**：补充 Sonatype Nexus Plugin Testing 框架测试
-- **Release 版本**：发布稳定的 1.0.0 版本
