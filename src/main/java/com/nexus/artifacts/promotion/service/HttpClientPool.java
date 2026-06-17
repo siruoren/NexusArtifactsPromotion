@@ -98,16 +98,17 @@ public class HttpClientPool {
   public HttpResponse get(final String url, final Map<String, String> headers) throws IOException {
     totalRequests.incrementAndGet();
     HttpURLConnection conn = null;
+    InputStream inputStream = null;
     try {
       conn = openConnection(url, "GET", headers);
-      trackConnectionReuse(conn);
 
       int statusCode = conn.getResponseCode();
       Map<String, String> responseHeaders = extractResponseHeaders(conn);
 
       String body;
       if (statusCode >= 200 && statusCode < 300) {
-        body = readStream(conn.getInputStream());
+        inputStream = conn.getInputStream();
+        body = readStream(inputStream);
       }
       else {
         body = readErrorResponse(conn);
@@ -116,6 +117,9 @@ public class HttpClientPool {
       return new HttpResponse(statusCode, body, responseHeaders);
     }
     finally {
+      if (inputStream != null) {
+        try { inputStream.close(); } catch (IOException ignored) {}
+      }
       if (conn != null) {
         conn.disconnect();
       }
@@ -150,14 +154,13 @@ public class HttpClientPool {
                            final Map<String, String> headers) throws IOException {
     totalRequests.incrementAndGet();
     HttpURLConnection conn = null;
+    InputStream responseStream = null;
     try {
       conn = openConnection(url, "PUT", headers);
       conn.setDoOutput(true);
       conn.setRequestProperty("Content-Type", contentType);
       // Use chunked streaming mode for efficient memory usage
       conn.setChunkedStreamingMode(chunkSize);
-
-      trackConnectionReuse(conn);
 
       try (OutputStream os = conn.getOutputStream()) {
         os.write(data);
@@ -169,7 +172,8 @@ public class HttpClientPool {
 
       String body;
       if (statusCode >= 200 && statusCode < 300) {
-        body = readStreamSafe(conn.getInputStream());
+        responseStream = conn.getInputStream();
+        body = readStream(responseStream);
       }
       else {
         body = readErrorResponse(conn);
@@ -178,6 +182,9 @@ public class HttpClientPool {
       return new HttpResponse(statusCode, body, responseHeaders);
     }
     finally {
+      if (responseStream != null) {
+        try { responseStream.close(); } catch (IOException ignored) {}
+      }
       if (conn != null) {
         conn.disconnect();
       }
@@ -199,6 +206,7 @@ public class HttpClientPool {
                                  final Map<String, String> headers) throws IOException {
     totalRequests.incrementAndGet();
     HttpURLConnection conn = null;
+    InputStream responseStream = null;
     try {
       conn = openConnection(url, "PUT", headers);
       conn.setDoOutput(true);
@@ -210,8 +218,6 @@ public class HttpClientPool {
       else {
         conn.setChunkedStreamingMode(chunkSize);
       }
-
-      trackConnectionReuse(conn);
 
       try (OutputStream os = conn.getOutputStream()) {
         byte[] buffer = new byte[chunkSize];
@@ -227,7 +233,8 @@ public class HttpClientPool {
 
       String body;
       if (statusCode >= 200 && statusCode < 300) {
-        body = readStreamSafe(conn.getInputStream());
+        responseStream = conn.getInputStream();
+        body = readStream(responseStream);
       }
       else {
         body = readErrorResponse(conn);
@@ -236,6 +243,9 @@ public class HttpClientPool {
       return new HttpResponse(statusCode, body, responseHeaders);
     }
     finally {
+      if (responseStream != null) {
+        try { responseStream.close(); } catch (IOException ignored) {}
+      }
       if (conn != null) {
         conn.disconnect();
       }
@@ -250,7 +260,6 @@ public class HttpClientPool {
     HttpURLConnection conn = null;
     try {
       conn = openConnection(url, "HEAD", headers);
-      trackConnectionReuse(conn);
 
       int statusCode = conn.getResponseCode();
       Map<String, String> responseHeaders = extractResponseHeaders(conn);
@@ -270,17 +279,23 @@ public class HttpClientPool {
   public HttpResponse delete(final String url, final Map<String, String> headers) throws IOException {
     totalRequests.incrementAndGet();
     HttpURLConnection conn = null;
+    InputStream responseStream = null;
     try {
       conn = openConnection(url, "DELETE", headers);
-      trackConnectionReuse(conn);
 
       int statusCode = conn.getResponseCode();
       Map<String, String> responseHeaders = extractResponseHeaders(conn);
 
-      String body = readStreamSafe(conn.getInputStream());
+      if (statusCode >= 200 && statusCode < 300 && conn.getInputStream() != null) {
+        responseStream = conn.getInputStream();
+      }
+      String body = responseStream != null ? readStream(responseStream) : "";
       return new HttpResponse(statusCode, body, responseHeaders);
     }
     finally {
+      if (responseStream != null) {
+        try { responseStream.close(); } catch (IOException ignored) {}
+      }
       if (conn != null) {
         conn.disconnect();
       }
@@ -307,11 +322,6 @@ public class HttpClientPool {
     return conn;
   }
 
-  private void trackConnectionReuse(final HttpURLConnection conn) {
-    // JDK doesn't expose reuse info directly, but we can track via statistics
-    // The actual reuse is handled by JDK's internal connection pool
-  }
-
   private Map<String, String> extractResponseHeaders(final HttpURLConnection conn) {
     Map<String, String> headers = new HashMap<>();
     for (Map.Entry<String, java.util.List<String>> entry : conn.getHeaderFields().entrySet()) {
@@ -331,15 +341,6 @@ public class HttpClientPool {
       bos.write(buffer, 0, bytesRead);
     }
     return bos.toString("UTF-8");
-  }
-
-  private String readStreamSafe(final InputStream is) {
-    try {
-      return readStream(is);
-    }
-    catch (IOException e) {
-      return "";
-    }
   }
 
   private String readErrorResponse(final HttpURLConnection conn) {

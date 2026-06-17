@@ -620,48 +620,62 @@ public class PromotionService {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.info("Promoting maven-metadata.xml with merge: {}", fullSourcePath);
 
-    // Download source metadata using connection pool
-    Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
-    String sourceUrl = nexusBaseUrl + "/repository/" + fullSourcePath;
-    HttpClientPool.HttpResponse sourceResponse = httpClientPool.get(sourceUrl, authHeaders);
+    // Use file-level lock to prevent concurrent merge corruption
+    try {
+      return writeLockManager.executeWithFileLock(targetRepo, filePath, () -> {
+        // Download source metadata using connection pool
+        Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
+        String sourceUrl = nexusBaseUrl + "/repository/" + fullSourcePath;
+        HttpClientPool.HttpResponse sourceResponse = httpClientPool.get(sourceUrl, authHeaders);
 
-    if (!sourceResponse.isSuccess()) {
-      throw new IOException("Download maven-metadata.xml failed: HTTP " + sourceResponse.getStatusCode() + " - " + sourceResponse.getBody());
-    }
-    String sourceContent = sourceResponse.getBody();
-
-    String mergedContent = sourceContent;
-
-    // If target already has the metadata, download and merge
-    if (targetMd5 != null) {
-      try {
-        String targetUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
-        HttpClientPool.HttpResponse targetResponse = httpClientPool.get(targetUrl, authHeaders);
-
-        if (targetResponse.isSuccess()) {
-          String targetContent = targetResponse.getBody();
-          mergedContent = MavenMetadataMerger.merge(sourceContent, targetContent);
-          log.info("Merged maven-metadata.xml for {}/{}", targetRepo, filePath);
+        if (!sourceResponse.isSuccess()) {
+          throw new IOException("Download maven-metadata.xml failed: HTTP " + sourceResponse.getStatusCode() + " - " + sourceResponse.getBody());
         }
-      }
-      catch (Exception e) {
-        log.warn("Failed to merge maven-metadata.xml, using source content: {}", e.getMessage());
-      }
+        String sourceContent = sourceResponse.getBody();
+
+        String mergedContent = sourceContent;
+
+        // If target already has the metadata, download and merge
+        if (targetMd5 != null) {
+          try {
+            String targetUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+            HttpClientPool.HttpResponse targetResponse = httpClientPool.get(targetUrl, authHeaders);
+
+            if (targetResponse.isSuccess()) {
+              String targetContent = targetResponse.getBody();
+              mergedContent = MavenMetadataMerger.merge(sourceContent, targetContent);
+              log.info("Merged maven-metadata.xml for {}/{}", targetRepo, filePath);
+            }
+          }
+          catch (Exception e) {
+            log.warn("Failed to merge maven-metadata.xml, using source content: {}", e.getMessage());
+          }
+        }
+
+        // Upload merged content to target using connection pool
+        String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+        HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
+            uploadUrl, mergedContent.getBytes("UTF-8"), "application/xml", authHeaders);
+
+        if (!uploadResponse.isSuccess()) {
+          throw new IOException("Upload merged maven-metadata.xml failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
+        }
+
+        PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "file");
+        item.setSourceMd5(sourceMd5);
+        item.setTargetMd5(targetMd5);
+        return item;
+      });
     }
-
-    // Upload merged content to target using connection pool
-    String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
-    HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
-        uploadUrl, mergedContent.getBytes("UTF-8"), "application/xml", authHeaders);
-
-    if (!uploadResponse.isSuccess()) {
-      throw new IOException("Upload merged maven-metadata.xml failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
+    catch (IOException e) {
+      throw e;
     }
-
-    PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "file");
-    item.setSourceMd5(sourceMd5);
-    item.setTargetMd5(targetMd5);
-    return item;
+    catch (Exception e) {
+      if (e.getCause() instanceof IOException) {
+        throw (IOException) e.getCause();
+      }
+      throw new IOException("Failed to promote maven-metadata.xml: " + e.getMessage(), e);
+    }
   }
 
   // ========================================================================

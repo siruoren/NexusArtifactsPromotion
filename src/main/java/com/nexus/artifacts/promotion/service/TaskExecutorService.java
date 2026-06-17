@@ -2,11 +2,13 @@ package com.nexus.artifacts.promotion.service;
 
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -46,6 +48,10 @@ public class TaskExecutorService {
   private static final long TASK_TIMEOUT_MINUTES = 60;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
+  // Bounded queue capacity for thread pool (prevents OOM from unbounded task accumulation)
+  private static final int PROMOTION_QUEUE_CAPACITY = 100;
+  private static final int SYNC_QUEUE_CAPACITY = 50;
+
   private volatile int promotionPoolSize = DEFAULT_PROMOTION_POOL_SIZE;
   private volatile int syncPoolSize = DEFAULT_SYNC_POOL_SIZE;
   private volatile int maxSyncQueueSize = DEFAULT_MAX_SYNC_QUEUE_SIZE;
@@ -67,21 +73,22 @@ public class TaskExecutorService {
   }
 
   private void initExecutors() {
-    this.promotionExecutor = createThreadPool("promotion", promotionPoolSize);
-    this.syncExecutor = createThreadPool("sync", syncPoolSize);
-    log.info("TaskExecutorService initialized - promotion pool: {}, sync pool: {}, max sync queue: {}",
-        promotionPoolSize, syncPoolSize, maxSyncQueueSize);
+    this.promotionExecutor = createThreadPool("promotion", promotionPoolSize, PROMOTION_QUEUE_CAPACITY);
+    this.syncExecutor = createThreadPool("sync", syncPoolSize, SYNC_QUEUE_CAPACITY);
+    log.info("TaskExecutorService initialized - promotion pool: {} (queue: {}), sync pool: {} (queue: {}), max sync queue: {}",
+        promotionPoolSize, PROMOTION_QUEUE_CAPACITY, syncPoolSize, SYNC_QUEUE_CAPACITY, maxSyncQueueSize);
   }
 
-  private ExecutorService createThreadPool(final String type, final int poolSize) {
+  private ExecutorService createThreadPool(final String type, final int poolSize, final int queueCapacity) {
+    BlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>(queueCapacity);
     return new ThreadPoolExecutor(
         poolSize,
         poolSize,
         0L,
         TimeUnit.MILLISECONDS,
-        new LinkedBlockingQueue<>(),
+        workQueue,
         new TaskThreadFactory("nexus-" + type + "-task-"),
-        new ThreadPoolExecutor.CallerRunsPolicy()
+        new ThreadPoolExecutor.AbortPolicy()
     );
   }
 
@@ -113,10 +120,16 @@ public class TaskExecutorService {
     // Wrap task with timeout and error handling
     Callable<PromotionTaskCallback> wrappedTask = wrapTask(task, taskId, "promotion");
 
-    Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
-    promotionTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis()));
-
-    return taskId;
+    try {
+      Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
+      promotionTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis()));
+      return taskId;
+    }
+    catch (RejectedExecutionException e) {
+      log.warn("Promotion task {} rejected - thread pool queue full", taskId);
+      throw new IllegalStateException(
+          "Promotion thread pool queue is full. Please wait for existing tasks to complete.", e);
+    }
   }
 
   /**
@@ -149,11 +162,17 @@ public class TaskExecutorService {
 
     Callable<SyncTaskCallback> wrappedTask = wrapTask(task, taskId, "sync");
 
-    Future<SyncTaskCallback> future = syncExecutor.submit(wrappedTask);
-    syncTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
-        sourceRepository, sourcePath));
-
-    return taskId;
+    try {
+      Future<SyncTaskCallback> future = syncExecutor.submit(wrappedTask);
+      syncTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
+          sourceRepository, sourcePath));
+      return taskId;
+    }
+    catch (RejectedExecutionException e) {
+      log.warn("Sync task {} rejected - thread pool queue full", taskId);
+      throw new IllegalStateException(
+          "Sync thread pool queue is full. Please wait for existing tasks to complete.", e);
+    }
   }
 
   /**

@@ -1,7 +1,7 @@
 # Nexus Artifacts Promotion Plugin
 
 **Version**: 1.0.2
-**Updated**: 2026-06-16
+**Updated**: 2026-06-17
 **Compatibility**: Nexus Repository Manager 3.45.0+ (PRO & OSS)
 
 Nexus 3 插件，提供制品晋级（Promotion）和 Proxy 仓库远程同步（Sync）功能。

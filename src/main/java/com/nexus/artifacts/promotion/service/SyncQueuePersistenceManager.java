@@ -49,6 +49,12 @@ public class SyncQueuePersistenceManager {
 
   private static final long PERSIST_INTERVAL_MS = 30_000L; // 30 seconds
 
+  /** Maximum age for a RUNNING task before it's considered a zombie (30 minutes) */
+  private static final long ZOMBIE_TASK_THRESHOLD_MS = 30 * 60 * 1000L;
+
+  /** Maximum number of active tasks to persist (prevents large JSON files) */
+  private static final int MAX_PERSISTED_TASKS = 100;
+
   private final Path stateDir;
   private final ObjectMapper objectMapper;
   private final TaskExecutorService taskExecutor;
@@ -86,6 +92,7 @@ public class SyncQueuePersistenceManager {
 
   /**
    * Recover persisted active sync tasks from disk and resubmit them.
+   * Detects and resets zombie tasks (RUNNING for over 30 minutes).
    */
   private void recoverQueueState() {
     if (!Files.exists(stateDir)) return;
@@ -100,6 +107,20 @@ public class SyncQueuePersistenceManager {
           List<SyncTaskInfo> tasks = objectMapper.readValue(json, listType);
 
           for (SyncTaskInfo task : tasks) {
+            // Detect zombie tasks: RUNNING for over 30 minutes
+            if (task.getStatus() == TaskStatus.RUNNING) {
+              long runningDuration = System.currentTimeMillis() - task.getStartTime();
+              if (runningDuration > ZOMBIE_TASK_THRESHOLD_MS) {
+                log.warn("Detected zombie sync task {} (running for {}ms, threshold={}ms), marking as FAILED",
+                    task.getTaskId(), runningDuration, ZOMBIE_TASK_THRESHOLD_MS);
+                task.setStatus(TaskStatus.FAILED);
+                task.setErrorMessage("Task was RUNNING when Nexus crashed - automatically marked as FAILED on recovery");
+                task.setEndTime(System.currentTimeMillis());
+                // Don't resubmit zombie tasks, just log them
+                continue;
+              }
+            }
+
             log.info("Recovering sync task: {} (source={}, path={}, status={})",
                 task.getTaskId(), task.getSourceRepository(), task.getPath(), task.getStatus());
 
@@ -181,6 +202,7 @@ public class SyncQueuePersistenceManager {
 
   /**
    * Persist all active (PENDING/RUNNING) sync tasks to disk.
+   * Limits the number of persisted tasks to prevent large JSON files.
    */
   public void persistActiveTasks() {
     Map<String, TaskExecutorService.TaskHandle> syncTasks = taskExecutor.getSyncTasks();
@@ -204,6 +226,14 @@ public class SyncQueuePersistenceManager {
       // Clean up old state files if no active tasks
       cleanupStateFiles();
       return;
+    }
+
+    // Limit the number of persisted tasks to prevent large JSON files
+    if (activeTasks.size() > MAX_PERSISTED_TASKS) {
+      log.warn("Active sync tasks ({}) exceeds max persisted limit ({}), truncating to most recent",
+          activeTasks.size(), MAX_PERSISTED_TASKS);
+      activeTasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
+      activeTasks = activeTasks.subList(0, MAX_PERSISTED_TASKS);
     }
 
     try {

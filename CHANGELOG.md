@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-06-17
+
+### Fixed
+
+- **Thread Pool Bounded Queue (OOM Prevention)**: replaced `LinkedBlockingQueue` (unbounded) with `ArrayBlockingQueue` (capacity: promotion=100, sync=50) in `TaskExecutorService`
+  - Uses `AbortPolicy` instead of `CallerRunsPolicy` to avoid blocking HTTP request threads
+  - `RejectedExecutionException` caught and converted to `IllegalStateException` with clear error message
+  - Prevents heap exhaustion when target repositories are unreachable and tasks accumulate
+- **HTTP Connection Leak Prevention**: fixed `HttpClientPool` to properly close `InputStream` in `finally` block before `conn.disconnect()`
+  - All HTTP methods (GET/PUT/PUTStream/HEAD/DELETE) now close response streams atomically with connection release
+  - Prevents Jetty connection pool exhaustion from unclosed streams during IOException
+- **Maven Metadata Merge Atomicity**: wrapped `promoteMavenMetadata` in `FileWriteLockManager.executeWithFileLock` to prevent concurrent merge corruption
+  - Per-file `ReentrantLock` ensures read-merge-write is atomic per target repo + path
+  - Prevents version entry loss when two promotion tasks write to the same Group/Artifact simultaneously
+- **Sync Queue Zombie Task Detection**: added zombie task detection in `SyncQueuePersistenceManager.recoverQueueState()`
+  - Tasks in RUNNING state for over 30 minutes are automatically marked as FAILED on recovery
+  - Prevents permanently stuck "in-progress" tasks after JVM crash
+  - Limited persisted tasks to 100 max to prevent large JSON files on startup
+
+### Verified
+
+- **Shiro Security Context Propagation**: confirmed all three services (PromotionService, DockerService, SyncService) correctly capture `SubjectThreadState` before thread pool submission, `bind()` in async thread, and `clear()` in `finally` block
+
 ## [1.0.1] - 2026-06-16
 
 ### Added
