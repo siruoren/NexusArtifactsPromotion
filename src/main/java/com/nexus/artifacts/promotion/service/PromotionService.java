@@ -721,6 +721,8 @@ public class PromotionService {
         return null;
       }
 
+      boolean isDocker = "docker".equals(repo.getFormat().getValue());
+
       StorageTx tx = repo.facet(StorageFacet.class).txSupplier().get();
       tx.begin();
       try {
@@ -772,6 +774,46 @@ public class PromotionService {
         }
         catch (Exception e) {
           log.debug("Blob header MD5 lookup failed for {}/{}: {}", repoName, assetPath, e.getMessage());
+        }
+
+        // Method 3: For Docker format, fallback to SHA256
+        if (isDocker) {
+          try {
+            HashCode sha256Hash = asset.getChecksum(HashAlgorithm.SHA256);
+            if (sha256Hash != null) {
+              String sha256 = sha256Hash.toString();
+              if (!sha256.isEmpty()) {
+                String result = sha256.startsWith("sha256:") ? sha256 : "sha256:" + sha256;
+                log.debug("Found SHA256 via Asset.getChecksum() for Docker {}/{}: {}", repoName, assetPath, result);
+                return result;
+              }
+            }
+          }
+          catch (Exception e) {
+            log.debug("Asset.getChecksum(SHA256) failed for Docker {}/{}: {}", repoName, assetPath, e.getMessage());
+          }
+
+          // Try blob headers for Content-Hash-SHA256
+          try {
+            if (asset.requireBlobRef() != null) {
+              Blob blob = tx.requireBlob(asset.requireBlobRef());
+              if (blob != null) {
+                Map<String, String> headers = blob.getHeaders();
+                String sha256 = headers.get("Content-Hash-SHA256");
+                if (sha256 == null || sha256.isEmpty()) {
+                  sha256 = headers.get("content-hash-sha256");
+                }
+                if (sha256 != null && !sha256.isEmpty()) {
+                  String result = sha256.startsWith("sha256:") ? sha256 : "sha256:" + sha256;
+                  log.debug("Found SHA256 via blob headers for Docker {}/{}: {}", repoName, assetPath, result);
+                  return result;
+                }
+              }
+            }
+          }
+          catch (Exception e) {
+            log.debug("Blob header SHA256 lookup failed for Docker {}/{}: {}", repoName, assetPath, e.getMessage());
+          }
         }
       }
       finally {

@@ -80,15 +80,15 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
       }
     }
 
-    // Update Docker release repositories configuration
-    String dockerReleaseRepos = props.get(PROP_DOCKER_RELEASE_REPOS);
-    if (dockerReleaseRepos != null && !dockerReleaseRepos.trim().isEmpty()) {
-      dockerService.updateDockerReleaseRepos(dockerReleaseRepos.trim());
-      log.info("Docker release repositories set to: {}", dockerReleaseRepos.trim());
+    // Update Docker release proxy repositories configuration
+    String dockerReleaseProxyRepos = props.get(PROP_DOCKER_RELEASE_PROXY_REPOS);
+    if (dockerReleaseProxyRepos != null && !dockerReleaseProxyRepos.trim().isEmpty()) {
+      dockerService.updateDockerReleaseProxyRepos(dockerReleaseProxyRepos.trim());
+      log.info("Docker release proxy repositories set to: {}", dockerReleaseProxyRepos.trim());
     }
     else {
-      dockerService.updateDockerReleaseRepos("");
-      log.info("Docker release repositories cleared");
+      dockerService.updateDockerReleaseProxyRepos("");
+      log.info("Docker release proxy repositories cleared");
     }
 
     log.info("Sync capability activated");
