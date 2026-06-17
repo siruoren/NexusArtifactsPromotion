@@ -219,10 +219,32 @@ public class SyncService {
           dockerRequest.setAllImages(false);
         }
         else {
-          // No /manifests/ or /blobs/ - could be "image" or "image/tag" format
-          // Pass the full path as image; DockerService will try fallback if no tags found
-          dockerRequest.setImage(path);
-          dockerRequest.setAllImages(false);
+          // No /manifests/ or /blobs/ - try to parse as "image/tag" format
+          // Docker proxy paths from Nexus UI are typically "image/tag" (e.g., "cnp/8.3.2.980")
+          // We need to determine if the last segment is a tag or part of the image name
+          int lastSlash = path.lastIndexOf('/');
+          if (lastSlash > 0) {
+            String possibleTag = path.substring(lastSlash + 1);
+            // Tags typically look like versions: contain digits/dots, or "latest", or start with "v"
+            if (possibleTag.matches(".*[0-9].*") || possibleTag.equals("latest") || possibleTag.startsWith("v")) {
+              // Treat as image/tag format - set specific tag to avoid unreliable listing APIs
+              String image = path.substring(0, lastSlash);
+              dockerRequest.setImage(image);
+              dockerRequest.setTags(Collections.singletonList(possibleTag));
+              dockerRequest.setAllImages(false);
+              log.info("Parsed Docker path '{}' as image='{}', tag='{}'", path, image, possibleTag);
+            }
+            else {
+              // Doesn't look like a tag - treat full path as image name
+              dockerRequest.setImage(path);
+              dockerRequest.setAllImages(false);
+            }
+          }
+          else {
+            // No slash - just an image name
+            dockerRequest.setImage(path);
+            dockerRequest.setAllImages(false);
+          }
         }
       }
       else {

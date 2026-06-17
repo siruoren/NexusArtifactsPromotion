@@ -607,7 +607,23 @@ public class DockerService {
           repositoryName, imageName, e.getMessage());
     }
 
-    // Strategy 3: For proxy repos, try remote Nexus API
+    // Strategy 3: For proxy repos, try Docker Registry V2 API first (standard /v2/<image>/tags/list)
+    try {
+      Repository repo = repositoryManager.get(repositoryName);
+      if (repo != null && "proxy".equals(repo.getType().getValue())) {
+        List<String> registryTags = listDockerTagsViaRegistryApi(repo, imageName);
+        if (!registryTags.isEmpty()) {
+          log.info("Found {} tags for image {} via Docker Registry V2 API", registryTags.size(), imageName);
+          return registryTags;
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Docker Registry V2 API listing failed for Docker tags {}/{}: {}",
+          repositoryName, imageName, e.getMessage());
+    }
+
+    // Strategy 4: For proxy repos, try remote Nexus Search API
     try {
       Repository repo = repositoryManager.get(repositoryName);
       if (repo != null && "proxy".equals(repo.getType().getValue())) {
@@ -1415,8 +1431,22 @@ public class DockerService {
             imageFilter = normalizedPath.substring(0, blobsIdx);
           }
           else {
-            // Could be "image" or "image/tag" format
-            imageFilter = normalizedPath;
+            // Try to parse as "image/tag" format
+            int lastSlash = normalizedPath.lastIndexOf('/');
+            if (lastSlash > 0) {
+              String possibleTag = normalizedPath.substring(lastSlash + 1);
+              if (possibleTag.matches(".*[0-9].*") || possibleTag.equals("latest") || possibleTag.startsWith("v")) {
+                imageFilter = normalizedPath.substring(0, lastSlash);
+                tagFilter = possibleTag;
+                log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}'", normalizedPath, imageFilter, tagFilter);
+              }
+              else {
+                imageFilter = normalizedPath;
+              }
+            }
+            else {
+              imageFilter = normalizedPath;
+            }
           }
         }
       }
@@ -1434,7 +1464,7 @@ public class DockerService {
       }
       else if (imageFilter != null) {
         // Specific image requested - list tags using remote API first
-        List<String> tags = listDockerTagsRemote(repo, imageFilter);
+        List<String> tags = listDockerTags(repoName, imageFilter);
         if (!tags.isEmpty()) {
           imageTagsMap.put(imageFilter, tags);
         }
@@ -1447,7 +1477,7 @@ public class DockerService {
         for (DockerImageInfo img : images) {
           List<String> tags = img.getTags();
           if (tags == null || tags.isEmpty()) {
-            tags = listDockerTagsRemote(repo, img.getName());
+            tags = listDockerTags(repoName, img.getName());
           }
           if (!tags.isEmpty()) {
             imageTagsMap.put(img.getName(), tags);
@@ -1591,7 +1621,7 @@ public class DockerService {
               String imageName = img.getName();
               List<String> tags = img.getTags();
               if (tags == null || tags.isEmpty()) {
-                tags = listDockerTagsRemote(repo, imageName);
+                tags = listDockerTags(request.getSourceRepository(), imageName);
               }
 
               // Filter tags for release proxy repository
@@ -1631,8 +1661,8 @@ public class DockerService {
             // Determine which tags to sync
             List<String> tags = request.getTags();
             if (request.isAllTags()) {
-              tags = listDockerTagsRemote(repo, request.getImage());
-              log.info("Docker sync: found {} tags for image {} in remote", tags.size(), request.getImage());
+              tags = listDockerTags(request.getSourceRepository(), request.getImage());
+              log.info("Docker sync: found {} tags for image {} in {}", tags.size(), request.getImage(), request.getSourceRepository());
             }
 
             // Filter tags for release proxy repository
@@ -1964,6 +1994,66 @@ public class DockerService {
     // Fallback: list tags from local proxy cache (may not have all remote tags)
     log.info("Falling back to local tag listing for {}", imageName);
     return listDockerTags(repo.getName(), imageName);
+  }
+
+  /**
+   * List Docker tags via Docker Registry V2 API (/v2/<image>/tags/list).
+   * This is the standard Docker distribution API and works with any Docker v2 compatible registry.
+   */
+  private List<String> listDockerTagsViaRegistryApi(final Repository repo, final String imageName) {
+    List<String> tags = new ArrayList<>();
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null || config.getAttributes() == null || !config.getAttributes().containsKey("proxy")) {
+        return tags;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) {
+        return tags;
+      }
+
+      if (!remoteUrl.endsWith("/")) {
+        remoteUrl += "/";
+      }
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String authUsername = (repoAuth != null) ? repoAuth[0] : null;
+      String authPassword = (repoAuth != null) ? repoAuth[1] : null;
+
+      // Try Docker Registry V2 tags/list API
+      String tagsUrl = remoteUrl + "v2/" + imageName + "/tags/list";
+      HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(15_000);
+      conn.setReadTimeout(30_000);
+      conn.setRequestProperty("Accept", "application/json");
+
+      if (authUsername != null && authPassword != null) {
+        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+      }
+
+      try {
+        int code = conn.getResponseCode();
+        if (code == 200) {
+          String json = readResponse(conn);
+          tags = parseDockerTagsList(json);
+          log.info("Docker Registry V2 API found {} tags for image {}", tags.size(), imageName);
+        }
+        else {
+          log.debug("Docker Registry V2 API returned HTTP {} for image {}", code, imageName);
+        }
+      }
+      finally {
+        conn.disconnect();
+      }
+    }
+    catch (Exception e) {
+      log.debug("Docker Registry V2 API failed for {}: {}", imageName, e.getMessage());
+    }
+    return tags;
   }
 
   // ==================== Manifest Parsing ====================
