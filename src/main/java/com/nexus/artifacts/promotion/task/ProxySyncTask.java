@@ -10,8 +10,10 @@ import org.sonatype.nexus.repository.manager.RepositoryManager;
 import org.sonatype.nexus.scheduling.TaskConfiguration;
 import org.sonatype.nexus.scheduling.TaskSupport;
 
+import com.nexus.artifacts.promotion.model.DockerImageRequest;
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
+import com.nexus.artifacts.promotion.service.DockerService;
 import com.nexus.artifacts.promotion.service.SyncService;
 
 /**
@@ -35,13 +37,16 @@ public class ProxySyncTask
 
   private final SyncService syncService;
   private final RepositoryManager repositoryManager;
+  private final DockerService dockerService;
 
   @Inject
   public ProxySyncTask(final SyncService syncService,
-                       final RepositoryManager repositoryManager)
+                       final RepositoryManager repositoryManager,
+                       final DockerService dockerService)
   {
     this.syncService = syncService;
     this.repositoryManager = repositoryManager;
+    this.dockerService = dockerService;
   }
 
   @Override
@@ -71,7 +76,45 @@ public class ProxySyncTask
         isFullSync ? "full repository sync" : "directory sync",
         repositoryName, format);
 
-    // Build sync request
+    // Handle Docker repositories separately
+    if ("docker".equalsIgnoreCase(format)) {
+      log.info("Docker repository detected, delegating to DockerService");
+      DockerImageRequest dockerRequest = new DockerImageRequest();
+      dockerRequest.setSourceRepository(repositoryName);
+      dockerRequest.setFormat(format);
+      // tags=null means all tags (isAllTags() returns true)
+      dockerRequest.setTags(null);
+      // Extract image name from path if provided
+      if (syncPath != null && !syncPath.trim().isEmpty()) {
+        String path = syncPath;
+        if (path.startsWith("v2/")) {
+          path = path.substring(3);
+        }
+        // Remove trailing /manifests/* or /blobs/*
+        int manifestsIdx = path.indexOf("/manifests/");
+        int blobsIdx = path.indexOf("/blobs/");
+        if (manifestsIdx > 0) {
+          path = path.substring(0, manifestsIdx);
+        }
+        else if (blobsIdx > 0) {
+          path = path.substring(0, blobsIdx);
+        }
+        dockerRequest.setImage(path);
+        dockerRequest.setAllImages(false);
+      }
+      else {
+        dockerRequest.setAllImages(true);
+      }
+      String taskId = dockerService.syncDockerImage(dockerRequest);
+      String message = String.format("Docker sync task submitted for %s%s - Task ID: %s",
+          repositoryName,
+          isFullSync ? " (all images)" : ":" + syncPath,
+          taskId);
+      log.info(message);
+      return message;
+    }
+
+    // Build sync request for non-Docker repositories
     SyncRequest request = new SyncRequest();
     request.setRepositoryName(repositoryName);
     request.setPath(isFullSync ? "" : syncPath);
