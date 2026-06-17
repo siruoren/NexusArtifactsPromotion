@@ -6,6 +6,20 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Docker Sync Path Resolution (Remote-First)**: Docker sync path parsing now probes the remote API to determine whether a path like `cnp/8.3.2.925` is a directory (image name with tags) or a specific image:tag
+  - First tries treating the full path as an image name and listing tags from remote
+  - If remote returns tags → sync all tags for that image (directory mode)
+  - If remote returns 0 tags → treat last segment as a tag and sync that specific image:tag
+  - No longer relies on the `isDirectory` flag from UI, which was unreliable for Docker paths
+- **Docker Sync Remote-First Tag Listing**: `listDockerTags()` now prioritizes remote APIs (Docker Registry V2 → Remote Nexus API) for proxy repositories, instead of local cache
+  - `listDockerTagsRemote()` no longer falls back to local cache — only returns tags actually available on remote
+  - Prevents syncing stale or incomplete tag lists from local proxy cache
+- **Docker Sync Task Error on Empty Remote Tags**: when remote returns 0 tags for an image, the sync task now correctly reports FAILED instead of silently completing
+  - `syncDockerImage()`: throws IOException when remote has 0 tags
+  - `syncDockerImageScheduled()`: sets task status to FAILED with error message when no images/tags found
+- **Docker Sync Task Status Display**: fixed task status being incorrectly shown as COMPLETED when the sync actually failed
+  - Root cause: `TaskExecutorService.wrapTask()` finally block overwrote FAILED status with COMPLETED
+  - `DockerService.getSyncTaskInfo()` and `SyncService.getTaskInfo()` now preserve terminal states (FAILED/COMPLETED) set by the service layer, preventing override by TaskExecutor
 - **Thread Pool Bounded Queue (OOM Prevention)**: replaced `LinkedBlockingQueue` (unbounded) with `ArrayBlockingQueue` (capacity: promotion=100, sync=50) in `TaskExecutorService`
   - Uses `AbortPolicy` instead of `CallerRunsPolicy` to avoid blocking HTTP request threads
   - `RejectedExecutionException` caught and converted to `IllegalStateException` with clear error message

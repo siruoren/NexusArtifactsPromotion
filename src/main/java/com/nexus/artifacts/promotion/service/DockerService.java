@@ -580,7 +580,42 @@ public class DockerService {
   public List<String> listDockerTags(final String repositoryName, final String imageName) {
     List<String> tags = new ArrayList<>();
 
-    // Strategy 1: Try internal StorageTx API first (most reliable, no HTTP auth issues)
+    // For proxy repos, try remote APIs first to get accurate remote tag list
+    try {
+      Repository repo = repositoryManager.get(repositoryName);
+      if (repo != null && "proxy".equals(repo.getType().getValue())) {
+        // Strategy 1: Try Docker Registry V2 API (standard /v2/<image>/tags/list)
+        try {
+          List<String> registryTags = listDockerTagsViaRegistryApi(repo, imageName);
+          if (!registryTags.isEmpty()) {
+            log.info("Found {} tags for image {} via Docker Registry V2 API", registryTags.size(), imageName);
+            return registryTags;
+          }
+        }
+        catch (Exception e) {
+          log.debug("Docker Registry V2 API listing failed for Docker tags {}/{}: {}",
+              repositoryName, imageName, e.getMessage());
+        }
+
+        // Strategy 2: Try remote Nexus Search API
+        try {
+          List<String> remoteTags = listDockerTagsViaRemoteApi(repo, imageName);
+          if (!remoteTags.isEmpty()) {
+            return remoteTags;
+          }
+        }
+        catch (Exception e) {
+          log.debug("Remote API listing failed for Docker tags {}/{}: {}",
+              repositoryName, imageName, e.getMessage());
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Remote API listing failed for Docker tags {}/{}, falling back: {}",
+          repositoryName, imageName, e.getMessage());
+    }
+
+    // Strategy 3: Try internal StorageTx API
     try {
       Repository repo = repositoryManager.get(repositoryName);
       if (repo != null) {
@@ -595,7 +630,7 @@ public class DockerService {
           repositoryName, imageName, e.getMessage());
     }
 
-    // Strategy 2: Try local Nexus REST API
+    // Strategy 4: Try local Nexus REST API
     try {
       List<String> localTags = listDockerTagsViaLocalApi(repositoryName, imageName);
       if (!localTags.isEmpty()) {
@@ -605,36 +640,6 @@ public class DockerService {
     catch (Exception e) {
       log.debug("Local REST API listing failed for Docker tags {}/{}, falling back: {}",
           repositoryName, imageName, e.getMessage());
-    }
-
-    // Strategy 3: For proxy repos, try Docker Registry V2 API first (standard /v2/<image>/tags/list)
-    try {
-      Repository repo = repositoryManager.get(repositoryName);
-      if (repo != null && "proxy".equals(repo.getType().getValue())) {
-        List<String> registryTags = listDockerTagsViaRegistryApi(repo, imageName);
-        if (!registryTags.isEmpty()) {
-          log.info("Found {} tags for image {} via Docker Registry V2 API", registryTags.size(), imageName);
-          return registryTags;
-        }
-      }
-    }
-    catch (Exception e) {
-      log.debug("Docker Registry V2 API listing failed for Docker tags {}/{}: {}",
-          repositoryName, imageName, e.getMessage());
-    }
-
-    // Strategy 4: For proxy repos, try remote Nexus Search API
-    try {
-      Repository repo = repositoryManager.get(repositoryName);
-      if (repo != null && "proxy".equals(repo.getType().getValue())) {
-        List<String> remoteTags = listDockerTagsViaRemoteApi(repo, imageName);
-        if (!remoteTags.isEmpty()) {
-          return remoteTags;
-        }
-      }
-    }
-    catch (Exception e) {
-      log.info("Remote API listing failed for Docker tags {}/{}: {}", repositoryName, imageName, e.getMessage());
     }
 
     return tags;
@@ -1431,28 +1436,38 @@ public class DockerService {
             imageFilter = normalizedPath.substring(0, blobsIdx);
           }
           else {
-            // Try to parse as "image/tag" format
+            // Determine if path is a directory (image name) or a specific image:tag
+            // by probing the remote API
             int lastSlash = normalizedPath.lastIndexOf('/');
             if (lastSlash > 0) {
-              String possibleTag = normalizedPath.substring(lastSlash + 1);
-              if (possibleTag.matches(".*[0-9].*") || possibleTag.equals("latest") || possibleTag.startsWith("v")) {
-                imageFilter = normalizedPath.substring(0, lastSlash);
-                tagFilter = possibleTag;
-                log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}'", normalizedPath, imageFilter, tagFilter);
+              // Path like "cnp/8.3.2.925" - could be image=cnp tag=8.3.2.925,
+              // or image=cnp/8.3.2.925 with all tags
+              // Probe remote: first try treating full path as image name (directory)
+              List<String> remoteTags = listDockerTagsRemote(repo, normalizedPath);
+              if (!remoteTags.isEmpty()) {
+                // Remote has tags for this image name -> it's a directory/image
+                imageFilter = normalizedPath;
+                log.info("Parsed Docker scheduled path '{}' as image='{}' (remote has {} tags), will sync all tags from remote",
+                    normalizedPath, imageFilter, remoteTags.size());
               }
               else {
-                imageFilter = normalizedPath;
+                // Remote doesn't have tags for full path -> treat last segment as tag
+                imageFilter = normalizedPath.substring(0, lastSlash);
+                tagFilter = normalizedPath.substring(lastSlash + 1);
+                log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}' (remote has no tags for full path)",
+                    normalizedPath, imageFilter, tagFilter);
               }
             }
             else {
+              // No slash - just an image name, sync all tags
               imageFilter = normalizedPath;
+              log.info("Parsed Docker scheduled path '{}' as image name, will sync all tags from remote", normalizedPath);
             }
           }
         }
       }
 
-      // Step 2: Get image list using the same strategy as 1.0.1
-      // listDockerImages uses: StorageTx internal API -> Local REST API -> Remote Nexus API
+      // Step 2: Get image list using remote API first for sync operations
       Map<String, List<String>> imageTagsMap = new LinkedHashMap<>();
 
       if (imageFilter != null && tagFilter != null) {
@@ -1464,20 +1479,21 @@ public class DockerService {
       }
       else if (imageFilter != null) {
         // Specific image requested - list tags using remote API first
-        List<String> tags = listDockerTags(repoName, imageFilter);
+        List<String> tags = listDockerTagsRemote(repo, imageFilter);
         if (!tags.isEmpty()) {
           imageTagsMap.put(imageFilter, tags);
         }
-        log.info("Docker scheduled sync: found {} tags for image {} in {}", tags.size(), imageFilter, repoName);
+        log.info("Docker scheduled sync: found {} tags for image {} from remote {}", tags.size(), imageFilter, repoName);
       }
       else {
         // Full sync: list all images using remote API first
         DockerImageListResponse imageList = listDockerImages(repoName);
         List<DockerImageInfo> images = imageList.getImages();
         for (DockerImageInfo img : images) {
-          List<String> tags = img.getTags();
-          if (tags == null || tags.isEmpty()) {
-            tags = listDockerTags(repoName, img.getName());
+          // Always list tags from remote first for sync operations
+          List<String> tags = listDockerTagsRemote(repo, img.getName());
+          if (tags.isEmpty() && img.getTags() != null && !img.getTags().isEmpty()) {
+            tags = img.getTags();
           }
           if (!tags.isEmpty()) {
             imageTagsMap.put(img.getName(), tags);
@@ -1487,9 +1503,10 @@ public class DockerService {
       }
 
       if (imageTagsMap.isEmpty()) {
-        taskInfo.setStatus(TaskStatus.COMPLETED);
+        taskInfo.setStatus(TaskStatus.FAILED);
         taskInfo.setEndTime(System.currentTimeMillis());
-        taskInfo.setResult("No Docker images found to sync");
+        taskInfo.setErrorMessage("No Docker images or tags found in remote repository " + repoName);
+        taskInfo.setResult("Failed: No Docker images or tags found in remote repository");
         syncTaskInfos.put(taskId, taskInfo);
         return taskInfo;
       }
@@ -1612,16 +1629,17 @@ public class DockerService {
             log.info("Docker sync (all images): found {} images in {}", images.size(), request.getSourceRepository());
 
             if (images.isEmpty()) {
-              throw new IOException("No Docker images found in repository " + request.getSourceRepository());
+              throw new IOException("No Docker images found in remote repository " + request.getSourceRepository());
             }
 
             boolean isReleaseProxy = isDockerReleaseProxyRepo(request.getSourceRepository());
 
             for (DockerImageInfo img : images) {
               String imageName = img.getName();
-              List<String> tags = img.getTags();
-              if (tags == null || tags.isEmpty()) {
-                tags = listDockerTags(request.getSourceRepository(), imageName);
+              // Always list tags from remote first for sync operations
+              List<String> tags = listDockerTagsRemote(repo, imageName);
+              if (tags.isEmpty() && img.getTags() != null && !img.getTags().isEmpty()) {
+                tags = img.getTags();
               }
 
               // Filter tags for release proxy repository
@@ -1661,8 +1679,9 @@ public class DockerService {
             // Determine which tags to sync
             List<String> tags = request.getTags();
             if (request.isAllTags()) {
-              tags = listDockerTags(request.getSourceRepository(), request.getImage());
-              log.info("Docker sync: found {} tags for image {} in {}", tags.size(), request.getImage(), request.getSourceRepository());
+              // List tags from remote first for sync operations - don't use local cache
+              tags = listDockerTagsRemote(repo, request.getImage());
+              log.info("Docker sync: found {} tags for image {} from remote {}", tags.size(), request.getImage(), request.getSourceRepository());
             }
 
             // Filter tags for release proxy repository
@@ -1683,7 +1702,7 @@ public class DockerService {
             }
 
             if (tags.isEmpty()) {
-              throw new IOException("No tags found for image " + request.getImage() + " in remote repository");
+              throw new IOException("No tags found for image " + request.getImage() + " in remote repository " + request.getSourceRepository());
             }
 
             for (String tag : tags) {
@@ -1935,7 +1954,8 @@ public class DockerService {
 
   /**
    * List Docker tags from the remote repository (for proxy sync).
-   * Tries Docker Registry V2 API first, then falls back to local listing.
+   * Tries Docker Registry V2 API first, then remote Nexus Search API.
+   * Does NOT fall back to local cache - only returns tags actually available on remote.
    */
   private List<String> listDockerTagsRemote(final Repository repo, final String imageName) {
     List<String> tags = new ArrayList<>();
@@ -1991,9 +2011,9 @@ public class DockerService {
       log.debug("Docker Registry V2 API failed for {}: {}", imageName, e.getMessage());
     }
 
-    // Fallback: list tags from local proxy cache (may not have all remote tags)
-    log.info("Falling back to local tag listing for {}", imageName);
-    return listDockerTags(repo.getName(), imageName);
+    // Return empty list - do not fall back to local cache for sync operations
+    log.info("No tags found for image {} from remote, returning empty list (not using local cache)", imageName);
+    return tags;
   }
 
   /**
@@ -2236,11 +2256,15 @@ public class DockerService {
     cleanupExpiredSyncTaskInfos();
     SyncTaskInfo info = syncTaskInfos.get(taskId);
     if (info != null) {
-      TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
-      if (status != null) {
-        info.setStatus(status);
+      // Only override status from TaskExecutor if info is not already in a terminal state
+      // (DockerService sets FAILED/COMPLETED internally before TaskExecutor's finally block)
+      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED) {
+        TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
+        if (status != null) {
+          info.setStatus(status);
+        }
       }
-      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED) {
+      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED) {
         taskExecutor.cleanupSyncTaskHandle(taskId);
       }
     }

@@ -219,31 +219,39 @@ public class SyncService {
           dockerRequest.setAllImages(false);
         }
         else {
-          // No /manifests/ or /blobs/ - try to parse as "image/tag" format
-          // Docker proxy paths from Nexus UI are typically "image/tag" (e.g., "cnp/8.3.2.980")
-          // We need to determine if the last segment is a tag or part of the image name
+          // No /manifests/ or /blobs/ - determine if path is a directory (image name)
+          // or a specific image:tag by probing the remote API
           int lastSlash = path.lastIndexOf('/');
           if (lastSlash > 0) {
-            String possibleTag = path.substring(lastSlash + 1);
-            // Tags typically look like versions: contain digits/dots, or "latest", or start with "v"
-            if (possibleTag.matches(".*[0-9].*") || possibleTag.equals("latest") || possibleTag.startsWith("v")) {
-              // Treat as image/tag format - set specific tag to avoid unreliable listing APIs
-              String image = path.substring(0, lastSlash);
-              dockerRequest.setImage(image);
-              dockerRequest.setTags(Collections.singletonList(possibleTag));
+            // Path like "cnp/8.3.2.925" - could be image=cnp tag=8.3.2.925,
+            // or image=cnp/8.3.2.925 with all tags
+            // Probe remote: first try treating full path as image name (directory)
+            List<String> remoteTags = dockerService.listDockerTags(request.getRepositoryName(), path);
+            if (!remoteTags.isEmpty()) {
+              // Remote has tags for this image name -> it's a directory/image
+              dockerRequest.setImage(path);
+              dockerRequest.setTags(null);
               dockerRequest.setAllImages(false);
-              log.info("Parsed Docker path '{}' as image='{}', tag='{}'", path, image, possibleTag);
+              log.info("Parsed Docker path '{}' as image='{}' (remote has {} tags), will sync all tags from remote",
+                  path, path, remoteTags.size());
             }
             else {
-              // Doesn't look like a tag - treat full path as image name
-              dockerRequest.setImage(path);
+              // Remote doesn't have tags for full path -> treat last segment as tag
+              String image = path.substring(0, lastSlash);
+              String tag = path.substring(lastSlash + 1);
+              dockerRequest.setImage(image);
+              dockerRequest.setTags(Collections.singletonList(tag));
               dockerRequest.setAllImages(false);
+              log.info("Parsed Docker path '{}' as image='{}', tag='{}' (remote has no tags for full path)",
+                  path, image, tag);
             }
           }
           else {
-            // No slash - just an image name
+            // No slash - just an image name, sync all tags
             dockerRequest.setImage(path);
+            dockerRequest.setTags(null);
             dockerRequest.setAllImages(false);
+            log.info("Parsed Docker path '{}' as image name, will sync all tags from remote", path);
           }
         }
       }
@@ -474,11 +482,14 @@ public class SyncService {
     cleanupExpiredTaskInfos();
     SyncTaskInfo info = taskInfos.get(taskId);
     if (info != null) {
-      TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
-      if (status != null) {
-        info.setStatus(status);
+      // Only override status from TaskExecutor if info is not already in a terminal state
+      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED) {
+        TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
+        if (status != null) {
+          info.setStatus(status);
+        }
       }
-      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED) {
+      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED || info.getStatus() == TaskStatus.MIGRATED) {
         taskExecutor.cleanupSyncTaskHandle(taskId);
       }
       return info;
