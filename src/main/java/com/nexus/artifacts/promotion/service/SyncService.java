@@ -434,27 +434,6 @@ public class SyncService {
   }
 
   /**
-   * Register an external task info (e.g., from DockerService).
-   * Used to unify task tracking across different services.
-   */
-  public void registerTaskInfo(final SyncTaskInfo taskInfo) {
-    if (taskInfo != null && taskInfo.getTaskId() != null) {
-      taskInfos.put(taskInfo.getTaskId(), taskInfo);
-      log.debug("Registered external task info: {}", taskInfo.getTaskId());
-    }
-  }
-
-  /**
-   * Update an existing task info (e.g., status update from DockerService).
-   */
-  public void updateTaskInfo(final SyncTaskInfo taskInfo) {
-    if (taskInfo != null && taskInfo.getTaskId() != null) {
-      taskInfos.put(taskInfo.getTaskId(), taskInfo);
-      log.debug("Updated task info: {} with status: {}", taskInfo.getTaskId(), taskInfo.getStatus());
-    }
-  }
-
-  /**
    * Get sync task info by ID.
    */
   public SyncTaskInfo getTaskInfo(final String taskId) {

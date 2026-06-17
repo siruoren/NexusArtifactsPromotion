@@ -198,7 +198,6 @@ public class DockerService {
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
   private final HttpClientPool httpClientPool;
-  private final SyncService syncService;
 
   private final Map<String, PromotionTaskResult> promotionTaskResults = new ConcurrentHashMap<>();
   private final Map<String, SyncTaskInfo> syncTaskInfos = new ConcurrentHashMap<>();
@@ -210,8 +209,7 @@ public class DockerService {
                        final PermissionChecker permissionChecker,
                        final SecurityHelper securityHelper,
                        final FileWriteLockManager writeLockManager,
-                       final HttpClientPool httpClientPool,
-                       final SyncService syncService)
+                       final HttpClientPool httpClientPool)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -220,7 +218,6 @@ public class DockerService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.httpClientPool = httpClientPool;
-    this.syncService = syncService;
   }
 
   /**
@@ -1373,19 +1370,6 @@ public class DockerService {
         ? new SubjectThreadState(subject) : null;
     final String preTaskId = "docker-sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
 
-    // Create initial task info and register in SyncService before submission
-    SyncTaskInfo initialInfo = new SyncTaskInfo();
-    initialInfo.setTaskId(preTaskId);
-    initialInfo.setSourceRepository(request.getSourceRepository());
-    initialInfo.setTargetRepository(request.getSourceRepository());
-    initialInfo.setPath(request.isAllImages() ? "v2/" : "v2/" + request.getImage());
-    initialInfo.setDirectory(true);
-    initialInfo.setFormat(request.getFormat());
-    initialInfo.setUsername(username);
-    initialInfo.setStartTime(System.currentTimeMillis());
-    initialInfo.setStatus(TaskStatus.PENDING);
-    syncService.registerTaskInfo(initialInfo);
-
     return taskExecutor.submitSyncTask(() -> {
       if (threadState != null) { threadState.bind(); }
       try {
@@ -1399,9 +1383,6 @@ public class DockerService {
         taskInfo.setUsername(username);
         taskInfo.setStartTime(System.currentTimeMillis());
         taskInfo.setStatus(TaskStatus.RUNNING);
-
-        // Register task in SyncService so it appears in sync queue
-        syncService.registerTaskInfo(taskInfo);
 
         try {
           Repository repo = repositoryManager.get(request.getSourceRepository());
@@ -1533,9 +1514,6 @@ public class DockerService {
         }
 
         syncTaskInfos.put(preTaskId, taskInfo);
-
-        // Update task in SyncService so sync queue shows final status
-        syncService.updateTaskInfo(taskInfo);
 
         return new TaskExecutorService.SyncTaskCallback() {
           @Override public String getTaskId() { return preTaskId; }
