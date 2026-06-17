@@ -49,6 +49,7 @@ import com.nexus.artifacts.promotion.model.DockerImageInfo;
 import com.nexus.artifacts.promotion.model.DockerImageListResponse;
 import com.nexus.artifacts.promotion.model.DockerImageRequest;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
+import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
@@ -1356,6 +1357,241 @@ public class DockerService {
    * 3. Sync each blob (delete cache + invalidate neg cache + ViewFacet.dispatch)
    * 4. Sync manifest
    */
+
+  /**
+   * Synchronous Docker proxy sync for scheduled tasks.
+   * Uses asset-based approach: browses all Docker manifest assets, matches the sync path,
+   * then syncs each matched image:tag combination.
+   *
+   * @param request the sync request containing repository name and optional path filter
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request) {
+    String repoName = request.getRepositoryName();
+    String syncPath = request.getPath();
+    boolean isFullSync = (syncPath == null || syncPath.trim().isEmpty());
+
+    Repository repo = repositoryManager.get(repoName);
+    if (repo == null) {
+      throw new IllegalArgumentException("Repository not found: " + repoName);
+    }
+    if (!"proxy".equals(repo.getType().getValue())) {
+      throw new IllegalArgumentException("Repository is not a proxy type: " + repoName);
+    }
+
+    String taskId = "docker-scheduled-sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
+
+    SyncTaskInfo taskInfo = new SyncTaskInfo();
+    taskInfo.setTaskId(taskId);
+    taskInfo.setSourceRepository(repoName);
+    taskInfo.setTargetRepository(repoName);
+    taskInfo.setPath(isFullSync ? "" : syncPath);
+    taskInfo.setDirectory(true);
+    taskInfo.setFormat("docker");
+    taskInfo.setUsername("system");
+    taskInfo.setStartTime(System.currentTimeMillis());
+    taskInfo.setStatus(TaskStatus.RUNNING);
+
+    syncTaskInfos.put(taskId, taskInfo);
+
+    try {
+      // Step 1: Get all Docker manifest assets and extract image:tag pairs
+      Map<String, List<String>> imageTagsMap = listDockerImageTagsFromAssets(repo, syncPath);
+
+      if (imageTagsMap.isEmpty()) {
+        taskInfo.setStatus(TaskStatus.COMPLETED);
+        taskInfo.setEndTime(System.currentTimeMillis());
+        taskInfo.setResult("No Docker images found to sync");
+        syncTaskInfos.put(taskId, taskInfo);
+        return taskInfo;
+      }
+
+      log.info("Docker scheduled sync: found {} images to sync in {} (path filter: {})",
+          imageTagsMap.size(), repoName, isFullSync ? "none" : syncPath);
+
+      boolean isReleaseProxy = isDockerReleaseProxyRepo(repoName);
+      List<SyncTaskInfo.SyncFileDetail> syncedFiles = new ArrayList<>();
+
+      // Step 2: Sync each image:tag
+      for (Map.Entry<String, List<String>> entry : imageTagsMap.entrySet()) {
+        String imageName = entry.getKey();
+        List<String> tags = entry.getValue();
+
+        // Filter tags for release proxy repository
+        if (isReleaseProxy) {
+          List<String> originalTags = new ArrayList<>(tags);
+          tags = new ArrayList<>();
+          for (String tag : originalTags) {
+            if (isReleaseTag(tag)) {
+              tags.add(tag);
+            } else {
+              String manifestPath = "v2/" + imageName + "/manifests/" + tag;
+              SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+              skippedDetail.setStatus("skipped");
+              skippedDetail.setErrorMessage("Skipped: non-release tag (source is a release proxy repository)");
+              syncedFiles.add(skippedDetail);
+            }
+          }
+        }
+
+        for (String tag : tags) {
+          try {
+            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+            syncedFiles.addAll(tagFiles);
+          }
+          catch (Exception e) {
+            log.error("Failed to sync {}:{}: {}", imageName, tag, e.getMessage());
+            String manifestPath = "v2/" + imageName + "/manifests/" + tag;
+            SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+            failedDetail.setStatus("failed");
+            failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+            syncedFiles.add(failedDetail);
+          }
+        }
+      }
+
+      taskInfo.setFileDetails(syncedFiles);
+      taskInfo.setStatus(TaskStatus.COMPLETED);
+      taskInfo.setEndTime(System.currentTimeMillis());
+
+      long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+      long failedCount = syncedFiles.stream().filter(f -> "failed".equals(f.getStatus())).count();
+      long syncedCount = syncedFiles.size() - skippedCount - failedCount;
+      taskInfo.setResult("Synced " + syncedCount + " items" +
+          (skippedCount > 0 ? ", skipped " + skippedCount : "") +
+          (failedCount > 0 ? ", failed " + failedCount : ""));
+
+      log.info("Docker scheduled sync completed: {} synced, {} skipped, {} failed for {}",
+          syncedCount, skippedCount, failedCount, repoName);
+    }
+    catch (Exception e) {
+      log.error("Docker scheduled sync task failed: {}", e.getMessage(), e);
+      taskInfo.setStatus(TaskStatus.FAILED);
+      taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setEndTime(System.currentTimeMillis());
+      taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
+    }
+
+    syncTaskInfos.put(taskId, taskInfo);
+    return taskInfo;
+  }
+
+  /**
+   * List Docker image:tag pairs from repository assets, optionally filtered by path.
+   * Uses Nexus internal StorageTx API to browse manifest assets.
+   *
+   * @param repo the repository to browse
+   * @param pathFilter optional path filter (e.g., "cnp" or "cnp/8.3.2.891"), null/empty for all
+   * @return map of image name -> list of tags
+   */
+  private Map<String, List<String>> listDockerImageTagsFromAssets(final Repository repo, final String pathFilter) {
+    Map<String, List<String>> imageTagsMap = new LinkedHashMap<>();
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) {
+        return imageTagsMap;
+      }
+
+      // Normalize path filter
+      String normalizedFilter = null;
+      if (pathFilter != null && !pathFilter.trim().isEmpty()) {
+        normalizedFilter = pathFilter.trim();
+        if (normalizedFilter.startsWith("v2/")) {
+          normalizedFilter = normalizedFilter.substring(3);
+        }
+        // Remove trailing /manifests/* or /blobs/*
+        int manifestsIdx = normalizedFilter.indexOf("/manifests/");
+        int blobsIdx = normalizedFilter.indexOf("/blobs/");
+        if (manifestsIdx > 0) {
+          // Path like "cnp/manifests/8.3.2.891" -> extract image and specific tag
+          String image = normalizedFilter.substring(0, manifestsIdx);
+          String tag = normalizedFilter.substring(manifestsIdx + "/manifests/".length());
+          List<String> tags = new ArrayList<>();
+          tags.add(tag);
+          imageTagsMap.put(image, tags);
+          log.info("Path filter contains specific manifest: image={}, tag={}", image, tag);
+          return imageTagsMap;
+        }
+        else if (blobsIdx > 0) {
+          normalizedFilter = normalizedFilter.substring(0, blobsIdx);
+        }
+      }
+
+      // Browse all manifest assets and match against filter
+      Iterable<Asset> assets = tx.browseAssets(bucket);
+      for (Asset asset : assets) {
+        String name = asset.name();
+        if (name == null) continue;
+
+        // Normalize: strip leading slash
+        String normalizedName = name.startsWith("/") ? name.substring(1) : name;
+
+        // Only process manifest assets: v2/<image>/manifests/<tag>
+        int manifestsIdx = normalizedName.indexOf("/manifests/");
+        if (manifestsIdx <= 0) continue;
+        if (!normalizedName.startsWith("v2/")) continue;
+
+        String image = normalizedName.substring(3, manifestsIdx); // strip "v2/" prefix
+        String tag = normalizedName.substring(manifestsIdx + "/manifests/".length());
+        if (tag.isEmpty() || tag.endsWith("/")) continue;
+
+        // Apply path filter
+        if (normalizedFilter != null) {
+          // Check if the filter matches this image
+          // Support "cnp" matching image "cnp", or "cnp/8.3.2.891" matching image "cnp" with tag "8.3.2.891"
+          if (image.equals(normalizedFilter)) {
+            // Exact image match
+          }
+          else if (normalizedFilter.contains("/")) {
+            // Filter like "cnp/8.3.2.891" - could be image="cnp" with tag filter, or image="cnp/sub"
+            int lastSlash = normalizedFilter.lastIndexOf('/');
+            String possibleImage = normalizedFilter.substring(0, lastSlash);
+            String possibleTag = normalizedFilter.substring(lastSlash + 1);
+
+            if (image.equals(possibleImage)) {
+              // Image matches, check if tag also matches
+              if (!tag.equals(possibleTag)) {
+                continue; // Tag doesn't match, skip
+              }
+            }
+            else if (image.equals(normalizedFilter)) {
+              // Full path matches as image name
+            }
+            else {
+              continue; // No match
+            }
+          }
+          else if (image.startsWith(normalizedFilter + "/")) {
+            // Filter "cnp" matches images like "cnp/subimage"
+          }
+          else {
+            continue; // No match
+          }
+        }
+
+        imageTagsMap.computeIfAbsent(image, k -> new ArrayList<>());
+        if (!imageTagsMap.get(image).contains(tag)) {
+          imageTagsMap.get(image).add(tag);
+        }
+      }
+
+      log.info("Asset-based listing found {} Docker images in {} (filter: {})",
+          imageTagsMap.size(), repo.getName(), normalizedFilter == null ? "none" : normalizedFilter);
+    }
+    catch (Exception e) {
+      log.error("Failed to list Docker image tags from assets in {}: {}", repo.getName(), e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return imageTagsMap;
+  }
+
   public String syncDockerImage(final DockerImageRequest request) {
     request.validate();
     permissionChecker.checkSyncPermission(request.getSourceRepository(), request.getFormat());
@@ -1470,6 +1706,36 @@ public class DockerService {
                   skippedDetail.setStatus("skipped");
                   skippedDetail.setErrorMessage("Skipped: non-release tag (source is a release proxy repository)");
                   syncedFiles.add(skippedDetail);
+                }
+              }
+            }
+
+            if (tags.isEmpty()) {
+              // Fallback: try splitting path as "image/tag" (e.g., "cnp/8.3.2.891" -> image="cnp", tag="8.3.2.891")
+              int lastSlash = request.getImage().lastIndexOf('/');
+              if (lastSlash > 0) {
+                String possibleImage = request.getImage().substring(0, lastSlash);
+                String possibleTag = request.getImage().substring(lastSlash + 1);
+                // Verify the tag looks like a version (not a sub-image path component)
+                // Tags typically contain digits, dots, or start with a letter+digit pattern
+                if (possibleTag.matches(".*[0-9].*") || possibleTag.equals("latest") || possibleTag.startsWith("v")) {
+                  log.info("No tags found for image '{}', trying fallback: image='{}', tag='{}'",
+                      request.getImage(), possibleImage, possibleTag);
+                  List<String> fallbackTags = listDockerTagsRemote(repo, possibleImage);
+                  if (fallbackTags.contains(possibleTag)) {
+                    // Found the image+tag combination
+                    request.setImage(possibleImage);
+                    tags = new ArrayList<>();
+                    tags.add(possibleTag);
+                    log.info("Fallback successful: found tag '{}' for image '{}'", possibleTag, possibleImage);
+                  }
+                  else if (!fallbackTags.isEmpty()) {
+                    // The image exists but the specific tag wasn't found; sync all tags instead
+                    log.info("Fallback: image '{}' exists with {} tags, but tag '{}' not found. Syncing all tags.",
+                        possibleImage, fallbackTags.size(), possibleTag);
+                    request.setImage(possibleImage);
+                    tags = fallbackTags;
+                  }
                 }
               }
             }
@@ -2011,6 +2277,27 @@ public class DockerService {
       syncTaskInfos.remove(id);
       taskExecutor.cleanupSyncTaskHandle(id);
     }
+  }
+
+  /**
+   * Get all Docker sync task infos (for queue display).
+   * Called by SyncService to merge Docker sync tasks into the unified queue view.
+   */
+  public List<SyncTaskInfo> getAllSyncTaskInfos() {
+    cleanupExpiredSyncTaskInfos();
+    List<SyncTaskInfo> tasks = new ArrayList<>();
+    for (Map.Entry<String, SyncTaskInfo> entry : syncTaskInfos.entrySet()) {
+      SyncTaskInfo info = entry.getValue();
+      TaskStatus status = taskExecutor.getSyncTaskStatus(entry.getKey());
+      if (status != null) {
+        info.setStatus(status);
+      }
+      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED) {
+        taskExecutor.cleanupSyncTaskHandle(entry.getKey());
+      }
+      tasks.add(info);
+    }
+    return tasks;
   }
 
   /**

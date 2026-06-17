@@ -8,6 +8,7 @@ import java.net.URL;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -205,13 +206,24 @@ public class SyncService {
         int manifestsIdx = path.indexOf("/manifests/");
         int blobsIdx = path.indexOf("/blobs/");
         if (manifestsIdx > 0) {
-          path = path.substring(0, manifestsIdx);
+          // Path like v2/cnp/manifests/8.3.2.891 -> image=cnp, tag=8.3.2.891
+          String image = path.substring(0, manifestsIdx);
+          String tag = path.substring(manifestsIdx + "/manifests/".length());
+          dockerRequest.setImage(image);
+          dockerRequest.setTags(Collections.singletonList(tag));
+          dockerRequest.setAllImages(false);
         }
         else if (blobsIdx > 0) {
           path = path.substring(0, blobsIdx);
+          dockerRequest.setImage(path);
+          dockerRequest.setAllImages(false);
         }
-        dockerRequest.setImage(path);
-        dockerRequest.setAllImages(false);
+        else {
+          // No /manifests/ or /blobs/ - could be "image" or "image/tag" format
+          // Pass the full path as image; DockerService will try fallback if no tags found
+          dockerRequest.setImage(path);
+          dockerRequest.setAllImages(false);
+        }
       }
       else {
         dockerRequest.setAllImages(true);
@@ -353,10 +365,10 @@ public class SyncService {
   public SyncTaskInfo syncScheduled(final SyncRequest request) {
     request.validate();
 
-    // Delegate Docker format syncs to DockerService (scheduled tasks not supported for Docker)
+    // Delegate Docker format syncs to DockerService (synchronous, asset-based approach)
     if ("docker".equalsIgnoreCase(request.getFormat())) {
-      throw new IllegalArgumentException(
-          "Docker scheduled sync is not supported via SyncService. Use DockerService.syncDockerImage() directly.");
+      log.info("Delegating Docker scheduled sync to DockerService for repository: {}", request.getRepositoryName());
+      return dockerService.syncDockerImageScheduled(request);
     }
 
     // No permission check for scheduled tasks — tasks are created by administrators
@@ -447,8 +459,23 @@ public class SyncService {
       if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED) {
         taskExecutor.cleanupSyncTaskHandle(taskId);
       }
+      return info;
     }
-    return info;
+
+    // Also check Docker sync tasks
+    if (taskId != null && taskId.startsWith("docker-sync-")) {
+      try {
+        info = dockerService.getSyncTaskInfo(taskId);
+        if (info != null) {
+          return info;
+        }
+      }
+      catch (Exception e) {
+        log.warn("Failed to retrieve Docker sync task info for {}: {}", taskId, e.getMessage());
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -469,6 +496,16 @@ public class SyncService {
       }
       tasks.add(info);
     }
+
+    // Merge Docker sync tasks into the unified queue view
+    try {
+      List<SyncTaskInfo> dockerTasks = dockerService.getAllSyncTaskInfos();
+      tasks.addAll(dockerTasks);
+    }
+    catch (Exception e) {
+      log.warn("Failed to retrieve Docker sync task infos: {}", e.getMessage());
+    }
+
     tasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
     int maxRecords = taskExecutor.getMaxSyncRecords();
     if (tasks.size() > maxRecords) {
