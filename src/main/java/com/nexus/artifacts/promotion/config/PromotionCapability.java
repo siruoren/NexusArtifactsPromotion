@@ -10,7 +10,6 @@ import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.capability.CapabilitySupport;
 
 import com.nexus.artifacts.promotion.service.DockerService;
-import com.nexus.artifacts.promotion.service.NexusApiConfigService;
 import com.nexus.artifacts.promotion.service.RetryableOperation;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
@@ -29,14 +28,11 @@ public class PromotionCapability extends CapabilitySupport<Map<String, String>> 
 
   private final TaskExecutorService taskExecutor;
   private final DockerService dockerService;
-  private final NexusApiConfigService apiConfigService;
 
   @Inject
-  public PromotionCapability(final TaskExecutorService taskExecutor, final DockerService dockerService,
-                              final NexusApiConfigService apiConfigService) {
+  public PromotionCapability(final TaskExecutorService taskExecutor, final DockerService dockerService) {
     this.taskExecutor = taskExecutor;
     this.dockerService = dockerService;
-    this.apiConfigService = apiConfigService;
   }
 
   @Override
@@ -107,41 +103,6 @@ public class PromotionCapability extends CapabilitySupport<Map<String, String>> 
     else {
       dockerService.updateDockerReleaseRepos("");
       log.info("Docker release repositories cleared");
-    }
-
-    // Configure API page size
-    String apiPageSizeStr = props.get(PROP_API_PAGE_SIZE);
-    if (apiPageSizeStr != null) {
-      try {
-        int apiPageSize = Integer.parseInt(apiPageSizeStr);
-        apiConfigService.updateApiPageSize(apiPageSize);
-        log.info("API page size set to {} from capability configuration", apiPageSize);
-      }
-      catch (NumberFormatException e) {
-        log.warn("Invalid API page size value: {}", apiPageSizeStr);
-      }
-      catch (IllegalArgumentException e) {
-        log.warn("API page size out of range: {}", e.getMessage());
-      }
-    }
-
-    // Configure sort field
-    String sortField = props.get(PROP_SORT_FIELD);
-    if (sortField != null && !sortField.trim().isEmpty()) {
-      apiConfigService.updateSortField(sortField.trim());
-      log.info("Sort field set to '{}' from capability configuration", sortField.trim());
-    }
-
-    // Configure sort direction
-    String sortDirection = props.get(PROP_SORT_DIRECTION);
-    if (sortDirection != null && !sortDirection.trim().isEmpty()) {
-      try {
-        apiConfigService.updateSortDirection(sortDirection.trim());
-        log.info("Sort direction set to '{}' from capability configuration", sortDirection.trim());
-      }
-      catch (IllegalArgumentException e) {
-        log.warn("Invalid sort direction value: {}", sortDirection.trim());
-      }
     }
 
     log.info("Promotion capability activated");

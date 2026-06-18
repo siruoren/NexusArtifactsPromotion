@@ -31,9 +31,6 @@ public class PromotionCapabilityDescriptor extends CapabilityDescriptorSupport<O
   public static final String PROP_RETRY_BASE_DELAY_MS = "retryBaseDelayMs";
   public static final String PROP_RETRY_MAX_DELAY_MS = "retryMaxDelayMs";
   public static final String PROP_DOCKER_RELEASE_REPOS = "dockerReleaseRepos";
-  public static final String PROP_API_PAGE_SIZE = "apiPageSize";
-  public static final String PROP_SORT_FIELD = "sortField";
-  public static final String PROP_SORT_DIRECTION = "sortDirection";
 
   private static final NumberTextFormField POOL_SIZE_FIELD = new NumberTextFormField(
       PROP_PROMOTION_POOL_SIZE,
@@ -68,28 +65,6 @@ public class PromotionCapabilityDescriptor extends CapabilityDescriptorSupport<O
           + "(tags containing SNAPSHOT/dev/alpha/beta/RC are filtered out). Example: docker-release,prod-docker",
       false);
 
-  private static final NumberTextFormField API_PAGE_SIZE_FIELD = new NumberTextFormField(
-      PROP_API_PAGE_SIZE,
-      "API Page Size",
-      "Number of items returned per Nexus REST API call (1-1000, default: 50). "
-          + "Increase this value if you have repositories with many components to reduce pagination overhead.",
-      false);
-
-  private static final StringTextFormField SORT_FIELD_FIELD = new StringTextFormField(
-      PROP_SORT_FIELD,
-      "Sort Field",
-      "Field used to sort search results (default: version). "
-          + "Common values: version, name, group, repository. "
-          + "Controls the default ordering when browsing components via API.",
-      false);
-
-  private static final StringTextFormField SORT_DIRECTION_FIELD = new StringTextFormField(
-      PROP_SORT_DIRECTION,
-      "Sort Direction",
-      "Sort direction for search results: 'asc' (ascending) or 'desc' (descending, default). "
-          + "For version field, 'desc' shows newest versions first.",
-      false);
-
   public PromotionCapabilityDescriptor() {
   }
 
@@ -110,8 +85,7 @@ public class PromotionCapabilityDescriptor extends CapabilityDescriptorSupport<O
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, RETRY_BASE_DELAY_FIELD, RETRY_MAX_DELAY_FIELD,
-        DOCKER_RELEASE_REPOS_FIELD, API_PAGE_SIZE_FIELD, SORT_FIELD_FIELD, SORT_DIRECTION_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, RETRY_BASE_DELAY_FIELD, RETRY_MAX_DELAY_FIELD, DOCKER_RELEASE_REPOS_FIELD);
   }
 
   public Set<Tag> getTags() {

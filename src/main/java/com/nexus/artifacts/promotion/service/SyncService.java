@@ -110,7 +110,6 @@ public class SyncService {
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
   private final DockerService dockerService;
-  private final NexusApiConfigService apiConfigService;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -121,8 +120,7 @@ public class SyncService {
                       final PermissionChecker permissionChecker,
                       final SecurityHelper securityHelper,
                       final FileWriteLockManager writeLockManager,
-                      final DockerService dockerService,
-                      final NexusApiConfigService apiConfigService)
+                      final DockerService dockerService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -131,7 +129,6 @@ public class SyncService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.dockerService = dockerService;
-    this.apiConfigService = apiConfigService;
   }
 
   /**
@@ -941,8 +938,7 @@ public class SyncService {
           ? authUsername + ":" + authPassword : null;
 
       // Try Search API with pagination
-      String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName
-          + "&size=" + apiConfigService.getApiPageSize();
+      String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
       String continuationToken = null;
 
       do {
@@ -1037,8 +1033,7 @@ public class SyncService {
     List<String> results = new ArrayList<>();
     try {
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
-      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName
-          + "&size=" + apiConfigService.getApiPageSize();
+      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName;
       String continuationToken = null;
 
       do {
@@ -1311,8 +1306,7 @@ public class SyncService {
     // Full repository sync — list all assets without any path filter
     boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
     if (isFullSync) {
-      String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName
-          + "&size=" + apiConfigService.getApiPageSize();
+      String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
       List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
       log.info("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
       return allAssets;
@@ -1327,8 +1321,7 @@ public class SyncService {
 
     // Step 1: Try with group filter first (efficient for Maven2 repos)
     String groupApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName
-        + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8")
-        + "&size=" + apiConfigService.getApiPageSize();
+        + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
     List<String> assetsWithGroup = listAssetsViaApiUrl(groupApiUrl, effectiveAuth);
 
     // Check if group filter returned results — if yes, return them directly
@@ -1344,8 +1337,7 @@ public class SyncService {
     // and filtering by path prefix. This handles raw/hosted repos where the Search API's
     // group parameter doesn't correspond to the file system directory path.
     log.info("Group filter returned 0 results for '{}', falling back to path-prefix filter", normalizedDir);
-    String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName
-        + "&size=" + apiConfigService.getApiPageSize();
+    String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
     List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
     List<String> filtered = filterByPathPrefix(allAssets, pathPrefix);
 
