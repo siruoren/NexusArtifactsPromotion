@@ -101,6 +101,7 @@ public class PromotionService {
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
   private final HttpClientPool httpClientPool;
+  private final NexusApiConfigService apiConfigService;
 
   private final Map<String, PromotionTaskResult> taskResults = new ConcurrentHashMap<>();
 
@@ -111,7 +112,8 @@ public class PromotionService {
                            final PermissionChecker permissionChecker,
                            final SecurityHelper securityHelper,
                            final FileWriteLockManager writeLockManager,
-                           final HttpClientPool httpClientPool)
+                           final HttpClientPool httpClientPool,
+                           final NexusApiConfigService apiConfigService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -121,6 +123,7 @@ public class PromotionService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.httpClientPool = httpClientPool;
+    this.apiConfigService = apiConfigService;
   }
 
   // ==================== Public API ====================
@@ -908,7 +911,10 @@ public class PromotionService {
           .replace(" ", "%20").replace("/", "%2F");
 
       String searchUrlStr = nexusBaseUrl + "/service/rest/v1/search?repository=" +
-          repository + "&name=" + encodedPrefix + "*";
+          repository + "&name=" + encodedPrefix + "*" +
+          "&size=" + apiConfigService.getApiPageSize() +
+          "&sort=" + apiConfigService.getSortField() +
+          "&direction=" + apiConfigService.getSortDirection();
 
       URL url = new URL(searchUrlStr);
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -943,7 +949,8 @@ public class PromotionService {
                                          final String nexusBaseUrl) throws IOException {
     List<String> results = new ArrayList<>();
     try {
-      String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository;
+      String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository +
+          "&size=" + apiConfigService.getApiPageSize();
       URL url = new URL(urlStr);
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
       conn.setRequestMethod("GET");

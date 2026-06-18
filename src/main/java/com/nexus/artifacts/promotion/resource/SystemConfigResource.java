@@ -15,6 +15,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.rest.Resource;
 
+import com.nexus.artifacts.promotion.service.NexusApiConfigService;
 import com.nexus.artifacts.promotion.service.TaskCacheManager;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
@@ -35,13 +36,16 @@ public class SystemConfigResource implements Resource {
 
   private final TaskExecutorService taskExecutor;
   private final TaskCacheManager cacheManager;
+  private final NexusApiConfigService apiConfigService;
 
   @Inject
   public SystemConfigResource(final TaskExecutorService taskExecutor,
-                                final TaskCacheManager cacheManager)
+                                final TaskCacheManager cacheManager,
+                                final NexusApiConfigService apiConfigService)
   {
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
+    this.apiConfigService = apiConfigService;
   }
 
   /**
@@ -60,7 +64,10 @@ public class SystemConfigResource implements Resource {
               + "\"syncPoolSize\":" + taskExecutor.getSyncPoolSize() + ","
               + "\"maxSyncQueueSize\":" + taskExecutor.getMaxSyncQueueSize() + ","
               + "\"activeCacheCount\":" + cacheManager.getActiveCacheCount() + ","
-              + "\"totalCacheSizeBytes\":" + cacheManager.getTotalCacheSize()
+              + "\"totalCacheSizeBytes\":" + cacheManager.getTotalCacheSize() + ","
+              + "\"apiPageSize\":" + apiConfigService.getApiPageSize() + ","
+              + "\"sortField\":\"" + apiConfigService.getSortField() + "\","
+              + "\"sortDirection\":\"" + apiConfigService.getSortDirection() + "\""
               + "}")
           .build();
     }
@@ -152,6 +159,92 @@ public class SystemConfigResource implements Resource {
       log.error("Failed to update max sync queue size: {}", e.getMessage());
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
           .entity("{\"error\":\"Failed to update max queue size\"}")
+          .build();
+    }
+  }
+
+  /**
+   * Update API page size.
+   */
+  @PUT
+  @Path("/api/pageSize")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("Update Nexus API page size (items per API call)")
+  public Response updateApiPageSize(@QueryParam("size") final int size)
+  {
+    try {
+      if (size < NexusApiConfigService.MIN_API_PAGE_SIZE || size > NexusApiConfigService.MAX_API_PAGE_SIZE) {
+        return Response.status(Response.Status.BAD_REQUEST)
+            .entity("{\"error\":\"API page size must be between "
+                + NexusApiConfigService.MIN_API_PAGE_SIZE + " and "
+                + NexusApiConfigService.MAX_API_PAGE_SIZE + "\"}")
+            .build();
+      }
+      apiConfigService.updateApiPageSize(size);
+      return Response.ok()
+          .entity("{\"apiPageSize\":" + size + "}")
+          .build();
+    }
+    catch (Exception e) {
+      log.error("Failed to update API page size: {}", e.getMessage());
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to update API page size\"}")
+          .build();
+    }
+  }
+
+  /**
+   * Update sort field for search results.
+   */
+  @PUT
+  @Path("/api/sortField")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("Update sort field for Nexus search results")
+  public Response updateSortField(@QueryParam("field") final String field)
+  {
+    try {
+      if (field == null || field.trim().isEmpty()) {
+        return Response.status(Response.Status.BAD_REQUEST)
+            .entity("{\"error\":\"Sort field must not be empty\"}")
+            .build();
+      }
+      apiConfigService.updateSortField(field.trim());
+      return Response.ok()
+          .entity("{\"sortField\":\"" + field.trim() + "\"}")
+          .build();
+    }
+    catch (Exception e) {
+      log.error("Failed to update sort field: {}", e.getMessage());
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to update sort field\"}")
+          .build();
+    }
+  }
+
+  /**
+   * Update sort direction for search results.
+   */
+  @PUT
+  @Path("/api/sortDirection")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("Update sort direction for Nexus search results (asc/desc)")
+  public Response updateSortDirection(@QueryParam("direction") final String direction)
+  {
+    try {
+      if (direction == null || (!"asc".equalsIgnoreCase(direction) && !"desc".equalsIgnoreCase(direction))) {
+        return Response.status(Response.Status.BAD_REQUEST)
+            .entity("{\"error\":\"Sort direction must be 'asc' or 'desc'\"}")
+            .build();
+      }
+      apiConfigService.updateSortDirection(direction.trim());
+      return Response.ok()
+          .entity("{\"sortDirection\":\"" + direction.trim().toLowerCase() + "\"}")
+          .build();
+    }
+    catch (Exception e) {
+      log.error("Failed to update sort direction: {}", e.getMessage());
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to update sort direction\"}")
           .build();
     }
   }

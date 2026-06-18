@@ -1078,10 +1078,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var taskId = result.taskId || '';
     var fullPath = repoName + '/' + path;
 
+    // Calculate width based on content length
+    var contentLen = Math.max(fullPath.length, taskId.length);
+    var winWidth = Math.min(Math.max(450, contentLen * 9 + 150), 800);
+
     var win = Ext.create('Ext.window.Window', {
       title: isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text'),
-      width: 450,
-      height: 220,
+      width: winWidth,
+      autoHeight: true,
       modal: true,
       closable: true,
       layout: 'fit',
@@ -1699,9 +1703,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 // ==================== Sync Queue Created Dialog ====================
 
 function showSyncQueueCreatedDialog(result) {
+  var taskId = result.taskId || result.queueId || '';
+  var repoPath = (result.repository || '') + '/' + (result.path || '');
+  var contentLen = Math.max(repoPath.length, taskId.length);
+  var winWidth = Math.min(Math.max(400, contentLen * 9 + 150), 800);
+
   var win = Ext.create('Ext.window.Window', {
     title: _t('sync.queue.created.title'),
-    width: 400,
+    width: winWidth,
+    autoHeight: true,
     modal: true,
     layout: 'fit',
     items: [{

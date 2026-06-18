@@ -199,6 +199,7 @@ public class DockerService {
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
   private final HttpClientPool httpClientPool;
+  private final NexusApiConfigService apiConfigService;
 
   private final Map<String, PromotionTaskResult> promotionTaskResults = new ConcurrentHashMap<>();
   private final Map<String, SyncTaskInfo> syncTaskInfos = new ConcurrentHashMap<>();
@@ -210,7 +211,8 @@ public class DockerService {
                        final PermissionChecker permissionChecker,
                        final SecurityHelper securityHelper,
                        final FileWriteLockManager writeLockManager,
-                       final HttpClientPool httpClientPool)
+                       final HttpClientPool httpClientPool,
+                       final NexusApiConfigService apiConfigService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -219,6 +221,7 @@ public class DockerService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.httpClientPool = httpClientPool;
+    this.apiConfigService = apiConfigService;
   }
 
   /**
@@ -360,7 +363,8 @@ public class DockerService {
   private Map<String, DockerImageInfo> listDockerImagesViaLocalApi(final String repositoryName) {
     Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
     try {
-      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName
+          + "&size=" + apiConfigService.getApiPageSize();
       String continuationToken = null;
       String effectiveAuth = null;
 
@@ -432,7 +436,7 @@ public class DockerService {
 
       // Use Search API with docker format filter
       String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName
-          + "&format=docker";
+          + "&format=docker&size=" + apiConfigService.getApiPageSize();
       String continuationToken = null;
 
       do {
@@ -486,7 +490,8 @@ public class DockerService {
       final String remoteBaseUrl, final String remoteRepoName, final String effectiveAuth) {
     Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
     try {
-      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName;
+      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName
+          + "&size=" + apiConfigService.getApiPageSize();
       String continuationToken = null;
 
       do {
@@ -739,7 +744,8 @@ public class DockerService {
     List<String> tags = new ArrayList<>();
     try {
       String effectiveAuth = null;
-      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName
+          + "&size=" + apiConfigService.getApiPageSize();
       String continuationToken = null;
 
       do {
@@ -832,7 +838,8 @@ public class DockerService {
 
       // Try remote Nexus Search API
       String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName
-          + "&format=docker&group=" + java.net.URLEncoder.encode("v2/" + imageName, "UTF-8");
+          + "&format=docker&group=" + java.net.URLEncoder.encode("v2/" + imageName, "UTF-8")
+          + "&size=" + apiConfigService.getApiPageSize();
       String continuationToken = null;
 
       do {
