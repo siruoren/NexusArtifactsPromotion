@@ -25,6 +25,7 @@ import org.sonatype.nexus.rest.Resource;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
+import com.nexus.artifacts.promotion.service.DockerService;
 import com.nexus.artifacts.promotion.service.PromotionService;
 import com.nexus.artifacts.promotion.service.SyncService;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
@@ -48,16 +49,19 @@ public class SyncQueueResource implements Resource {
 
   private final SyncService syncService;
   private final PromotionService promotionService;
+  private final DockerService dockerService;
   private final TaskExecutorService taskExecutor;
   private final PermissionChecker permissionChecker;
 
   @Inject
   public SyncQueueResource(final SyncService syncService,
                             final PromotionService promotionService,
+                            final DockerService dockerService,
                             final TaskExecutorService taskExecutor,
                             final PermissionChecker permissionChecker) {
     this.syncService = syncService;
     this.promotionService = promotionService;
+    this.dockerService = dockerService;
     this.taskExecutor = taskExecutor;
     this.permissionChecker = permissionChecker;
   }
@@ -294,12 +298,11 @@ public class SyncQueueResource implements Resource {
         log.info("Task {} terminated by user {}", safeTaskId, permissionChecker.getCurrentUsername());
 
         // Update sync task info if it exists
-        SyncTaskInfo syncInfo = syncService.getTaskInfo(safeTaskId);
-        if (syncInfo != null) {
-          syncInfo.setStatus(TaskStatus.CANCELLED);
-          syncInfo.setEndTime(System.currentTimeMillis());
-          syncInfo.setResult("Terminated by user");
-        }
+        syncService.cancelSyncTask(safeTaskId);
+
+        // Update Docker task results if they exist
+        dockerService.cancelDockerPromotionTask(safeTaskId);
+        dockerService.cancelDockerSyncTask(safeTaskId);
 
         return Response.ok()
             .entity("{\"taskId\":\"" + jsonEscape(safeTaskId) + "\",\"status\":\"cancelled\",\"message\":\"Task terminated successfully\"}")

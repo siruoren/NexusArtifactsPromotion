@@ -247,7 +247,7 @@ public class PromotionResource implements Resource {
         if (status != null) {
           // If task is already completed/failed but result not yet in taskResults,
           // wait briefly for the result to appear (race condition between wrapTask.finally and taskResults.put)
-          if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED) {
+          if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.CANCELLED) {
             for (int i = 0; i < 10; i++) {
               try { Thread.sleep(200); } catch (InterruptedException e) { break; }
               result = promotionService.getTaskResult(taskId);

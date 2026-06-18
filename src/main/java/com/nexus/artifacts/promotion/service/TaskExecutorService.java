@@ -44,7 +44,8 @@ public class TaskExecutorService {
   private static final int DEFAULT_SYNC_POOL_SIZE = 4;
   private static final int DEFAULT_MAX_SYNC_QUEUE_SIZE = 20;
   private static final int DEFAULT_MAX_PROMOTION_QUEUE_SIZE = 50;
-  private static final int DEFAULT_MAX_SYNC_RECORDS = 200;
+  private static final int DEFAULT_MAX_TASK_QUEUE_RECORDS = 200;
+  private static final int DEFAULT_TASK_LOG_TTL_MINUTES = 30;
   private static final long TASK_TIMEOUT_MINUTES = 60;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
@@ -56,7 +57,8 @@ public class TaskExecutorService {
   private volatile int syncPoolSize = DEFAULT_SYNC_POOL_SIZE;
   private volatile int maxSyncQueueSize = DEFAULT_MAX_SYNC_QUEUE_SIZE;
   private volatile int maxPromotionQueueSize = DEFAULT_MAX_PROMOTION_QUEUE_SIZE;
-  private volatile int maxSyncRecords = DEFAULT_MAX_SYNC_RECORDS;
+  private volatile int maxTaskQueueRecords = DEFAULT_MAX_TASK_QUEUE_RECORDS;
+  private volatile int taskLogTtlMinutes = DEFAULT_TASK_LOG_TTL_MINUTES;
 
   private ExecutorService promotionExecutor;
   private ExecutorService syncExecutor;
@@ -327,7 +329,8 @@ public class TaskExecutorService {
         handle.status = TaskStatus.COMPLETED;
       }
       catch (Exception e) {
-        handle.status = TaskStatus.FAILED;
+        // Cancellation means the task was terminated, not failed
+        handle.status = TaskStatus.CANCELLED;
       }
     }
     return handle.status;
@@ -347,7 +350,8 @@ public class TaskExecutorService {
         handle.status = TaskStatus.COMPLETED;
       }
       catch (Exception e) {
-        handle.status = TaskStatus.FAILED;
+        // Cancellation means the task was terminated, not failed
+        handle.status = TaskStatus.CANCELLED;
       }
     }
     return handle.status;
@@ -437,9 +441,14 @@ public class TaskExecutorService {
     log.info("Max sync queue size updated to {}", maxSyncQueueSize);
   }
 
-  public void updateMaxSyncRecords(final int newMax) {
-    this.maxSyncRecords = Math.max(1, newMax);
-    log.info("Max sync records updated to {}", maxSyncRecords);
+  public void updateMaxTaskQueueRecords(final int newMax) {
+    this.maxTaskQueueRecords = Math.max(1, newMax);
+    log.info("Max task queue records updated to {}", maxTaskQueueRecords);
+  }
+
+  public void updateTaskLogTtlMinutes(final int newTtl) {
+    this.taskLogTtlMinutes = Math.max(1, newTtl);
+    log.info("Task log TTL updated to {} minutes", taskLogTtlMinutes);
   }
 
   private void reconfigurePool(final ExecutorService executor, final int newSize, final String type) {
@@ -455,7 +464,9 @@ public class TaskExecutorService {
   public int getSyncPoolSize() { return syncPoolSize; }
   public int getMaxSyncQueueSize() { return maxSyncQueueSize; }
   public int getMaxPromotionQueueSize() { return maxPromotionQueueSize; }
-  public int getMaxSyncRecords() { return maxSyncRecords; }
+  public int getMaxTaskQueueRecords() { return maxTaskQueueRecords; }
+  public int getTaskLogTtlMinutes() { return taskLogTtlMinutes; }
+  public long getTaskLogTtlMs() { return taskLogTtlMinutes * 60 * 1000L; }
 
   /**
    * Update max promotion queue size.

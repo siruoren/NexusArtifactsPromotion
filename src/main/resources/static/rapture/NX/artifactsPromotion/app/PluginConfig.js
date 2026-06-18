@@ -58,9 +58,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.pending": "Pending",
     "promotion.progress.success": "Success",
     "promotion.progress.failed": "Failed",
+    "promotion.progress.cancelled": "Cancelled",
     "promotion.progress.skipped": "Skipped",
     "promotion.result.title.success": "Promotion Success",
     "promotion.result.title.failed": "Promotion Failed",
+    "promotion.result.title.cancelled": "Promotion Cancelled",
     "promotion.result.targetRepository": "Target Repository:",
     "promotion.result.status": "Status:",
     "promotion.result.error": "Error:",
@@ -119,7 +121,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.filter.reset": "Reset",
     "sync.queue.status.failed": "Failed",
     "sync.queue.status.running": "Running",
-    "sync.queue.status.cancelled": "Cancelled",
+    "sync.queue.status.cancelled": "Terminated",
     "sync.queue.status.completed": "Completed",
     "sync.queue.table.duration": "Duration (min)",
     "sync.queue.table.taskType": "Type",
@@ -192,9 +194,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.pending": "\u7b49\u5f85\u4e2d",
     "promotion.progress.success": "\u6210\u529f",
     "promotion.progress.failed": "\u5931\u8d25",
+    "promotion.progress.cancelled": "\u7ec8\u6b62",
     "promotion.progress.skipped": "\u672a\u66f4\u65b0",
     "promotion.result.title.success": "\u664b\u7ea7\u6210\u529f",
     "promotion.result.title.failed": "\u664b\u7ea7\u5931\u8d25",
+    "promotion.result.title.cancelled": "\u664b\u7ea7\u7ec8\u6b62",
     "promotion.result.targetRepository": "\u76ee\u6807\u4ed3\u5e93\uff1a",
     "promotion.result.status": "\u72b6\u6001\uff1a",
     "promotion.result.error": "\u9519\u8bef\uff1a",
@@ -253,7 +257,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.filter.reset": "\u91cd\u7f6e",
     "sync.queue.status.failed": "\u5931\u8d25",
     "sync.queue.status.running": "\u8fdb\u884c\u4e2d",
-    "sync.queue.status.cancelled": "\u53d6\u6d88",
+    "sync.queue.status.cancelled": "\u7ec8\u6b62",
     "sync.queue.status.completed": "\u5b8c\u6210",
     "sync.queue.table.duration": "\u8017\u65f6\uff08\u5206\u949f\uff09",
     "sync.queue.table.taskType": "\u7c7b\u578b",
@@ -1597,18 +1601,22 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             statusField.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('sync.progress.success') + '</span>');
           } else if (statusStr === 'failed') {
             statusField.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('sync.progress.failed') + '</span>');
+          } else if (statusStr === 'cancelled') {
+            statusField.setValue('<span style="color:#f0ad4e;font-weight:bold;">' + _t('sync.queue.status.cancelled') + '</span>');
           } else if (statusStr === 'pending') {
             statusField.setValue('<span style="color:#999;">' + _t('sync.progress.pending') + '</span>');
           }
         }
 
         // Check if task is finished
-        if (statusStr === 'completed' || statusStr === 'failed') {
+        if (statusStr === 'completed' || statusStr === 'failed' || statusStr === 'cancelled') {
           isFinished = true;
           stopPolling();
 
           // Update window title
-          if (statusStr === 'failed') {
+          if (statusStr === 'cancelled') {
+            win.setTitle(_t('sync.queue.status.cancelled'));
+          } else if (statusStr === 'failed') {
             win.setTitle(_t('sync.progress.failed'));
           } else {
             win.setTitle(_t('sync.progress.success'));
@@ -1660,6 +1668,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       targetOptions.push({ text: repo.name + ' (' + repo.format + ' - ' + repo.type + ')', value: repo.name });
     });
 
+    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    var statusMap = {};
+    if (preview && preview.files) {
+      Ext.each(preview.files, function (f) {
+        if (f.path) { statusMap[f.path] = 'pending'; }
+      });
+    }
+
     var fileStore = Ext.create('Ext.data.Store', {
       fields: ['path', 'type', 'size', 'status'],
       pageSize: 10,
@@ -1676,56 +1692,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       })() : []
     });
 
-    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
-    var statusMap = {};
-    if (preview && preview.files) {
-      Ext.each(preview.files, function (f) {
-        if (f.path) { statusMap[f.path] = 'pending'; }
+    // Sync statusMap to current page records whenever store loads (handles page navigation)
+    fileStore.on('load', function (store) {
+      store.each(function (rec) {
+        var recPath = rec.get('path');
+        if (statusMap[recPath] && statusMap[recPath] !== rec.get('status')) {
+          rec.set('status', statusMap[recPath]);
+        }
       });
-    }
-
-    // Helper: iterate ALL records in store (not just current page)
-    // In ExtJS 6 with memory proxy + enablePaging, getData().items only has current page.
-    // Use getData().getSource() to get all Model instances across pages.
-    function eachAllRecords(s, fn) {
-      var allItems = [];
-      // Try getSource() first (ExtJS 6 paging collection - returns Model instances)
-      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
-        var source = s.getData().getSource();
-        allItems = source.items || source;
-      }
-      // Fallback to getData().items (current page only, but they are Model instances)
-      else if (s.getData && s.getData().items) {
-        allItems = s.getData().items;
-      }
-      else if (s.data && s.data.items) {
-        allItems = s.data.items;
-      }
-      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
-      for (var i = 0; i < allItems.length; i++) {
-        if (fn(allItems[i], i) === false) break;
-      }
-    }
-
-    // Helper: find record index across ALL pages
-    function findAllIndex(s, prop, val) {
-      var allItems = [];
-      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
-        var source = s.getData().getSource();
-        allItems = source.items || source;
-      }
-      else if (s.getData && s.getData().items) {
-        allItems = s.getData().items;
-      }
-      else if (s.data && s.data.items) {
-        allItems = s.data.items;
-      }
-      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
-      for (var i = 0; i < allItems.length; i++) {
-        if (allItems[i].get(prop) === val) return i;
-      }
-      return -1;
-    }
+    });
 
     var totalFiles = Object.keys(statusMap).length || fileStore.getTotalCount() || fileStore.getCount();
 
@@ -1737,6 +1712,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         case 'failed':
           return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'cancelled':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
         default:
@@ -1889,7 +1866,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               });
 
               // Start polling for task status
-              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles, statusMap, eachAllRecords, findAllIndex);
+              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles, statusMap);
             })
             .catch(function (err) {
               promoteBtn.setText(_t('promotion.modal.promote'));
@@ -1912,7 +1889,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     win.show();
   },
 
-  startPollingInWindow: function (win, taskId, fileList, totalFiles, statusMap, eachAllRecords, findAllIndex) {
+  startPollingInWindow: function (win, taskId, fileList, totalFiles, statusMap) {
     var isFinished = false;
     var pollCount = 0;
     var MAX_POLLS = 400; // ~10 minutes at 1.5s interval
@@ -1954,8 +1931,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             }
           }
         }
-        // Update ALL store records (not just current page)
-        eachAllRecords(store, function (rec) {
+        // Update current page store records (other pages synced via 'load' event)
+        store.each(function (rec) {
           var st = rec.get('status');
           if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
             rec.set('status', (taskFailed || hasUnprocessed) ? 'failed' : 'success');
@@ -1973,7 +1950,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           done = 0;
           for (var k in statusMap) {
             var sv = statusMap[k];
-            if (sv === 'success' || sv === 'failed' || sv === 'skipped') done++;
+          if (sv === 'success' || sv === 'failed' || sv === 'skipped' || sv === 'cancelled') done++;
           }
           total = total || Object.keys(statusMap).length;
         }
@@ -2048,40 +2025,42 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           statusMap[item.path] = itemStatus;
         }
 
-        // Sync ALL store records from statusMap
-        eachAllRecords(store, function (rec) {
+        // Sync current page store records from statusMap
+        // (other pages will be synced via the 'load' event when user navigates)
+        store.each(function (rec) {
           var recPath = rec.get('path');
           if (statusMap[recPath] && statusMap[recPath] !== rec.get('status')) {
             rec.set('status', statusMap[recPath]);
           }
         });
 
-        if (statusStr === 'completed' || statusStr === 'failed') {
-            var taskFailed = (statusStr === 'failed');
+        if (statusStr === 'completed' || statusStr === 'failed' || statusStr === 'cancelled') {
+            var taskFailed = (statusStr === 'failed' || statusStr === 'cancelled');
 
             // Mark any remaining pending/processing items in statusMap
             // If backend processed fewer items than total, remaining items were NOT promoted
             var backendProcessedCount = 0;
             for (var bk in statusMap) {
-              if (statusMap[bk] === 'success' || statusMap[bk] === 'failed' || statusMap[bk] === 'skipped') {
+              if (statusMap[bk] === 'success' || statusMap[bk] === 'failed' || statusMap[bk] === 'skipped' || statusMap[bk] === 'cancelled') {
                 backendProcessedCount++;
               }
             }
             var hasUnprocessed = (backendProcessedCount < currentTotal);
 
             for (var p in statusMap) {
-              if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped') {
-                // If task failed or there are unprocessed items, mark remaining as failed
+              if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped' && statusMap[p] !== 'cancelled') {
+                // If task failed/cancelled or there are unprocessed items, mark remaining as cancelled
                 // Only mark as success if task completed AND all items were processed
-                statusMap[p] = (taskFailed || hasUnprocessed) ? 'failed' : 'success';
+                statusMap[p] = (taskFailed || hasUnprocessed) ? 'cancelled' : 'success';
               }
             }
 
-            // Sync ALL store records from statusMap
-            eachAllRecords(store, function (rec) {
+            // Sync current page store records from statusMap
+            // (other pages will be synced via the 'load' event when user navigates)
+            store.each(function (rec) {
               var st = rec.get('status');
-              if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
-                rec.set('status', (taskFailed || hasUnprocessed) ? 'failed' : 'success');
+              if (st !== 'success' && st !== 'failed' && st !== 'skipped' && st !== 'cancelled') {
+                rec.set('status', (taskFailed || hasUnprocessed) ? 'cancelled' : 'success');
               }
             });
 
@@ -2091,7 +2070,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             progressBar.updateText(_t('promotion.progress.completed', doneCount, currentTotal));
 
             // Update window title
-            if (taskFailed) {
+            if (statusStr === 'cancelled') {
+              win.setTitle(_t('promotion.result.title.cancelled'));
+            } else if (taskFailed) {
               win.setTitle(_t('promotion.progress.failed'));
             } else {
               win.setTitle(_t('promotion.progress.success'));
@@ -2105,9 +2086,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             return;
           }
 
-        // Task is still running - mark first pending item as processing
+        // Task is still running - mark first pending item as processing (current page only)
         var hasProcessing = false;
-        eachAllRecords(store, function (rec) {
+        store.each(function (rec) {
           var rs = rec.get('status');
           if (!hasProcessing && rs !== 'success' && rs !== 'failed' && rs !== 'skipped') {
             rec.set('status', 'processing');
@@ -2119,7 +2100,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         var processedCount = 0;
         for (var k in statusMap) {
           var sv = statusMap[k];
-          if (sv === 'success' || sv === 'failed' || sv === 'skipped') { processedCount++; }
+          if (sv === 'success' || sv === 'failed' || sv === 'skipped' || sv === 'cancelled') { processedCount++; }
         }
 
         var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
@@ -2260,6 +2241,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       targetOptions.push({ text: repo.name + ' (' + repo.format + ' - ' + repo.type + ')', value: repo.name });
     });
 
+    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    var dockerStatusMap = {};
+    if (dockerFiles) {
+      Ext.each(dockerFiles, function (f) {
+        var key = f.originalPath || f.path;
+        if (key) { dockerStatusMap[key] = 'pending'; }
+      });
+    }
+
     var fileStore = Ext.create('Ext.data.Store', {
       fields: ['path', 'originalPath', 'type', 'size', 'status'],
       pageSize: 10,
@@ -2270,57 +2260,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       data: dockerFiles || []
     });
 
-    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
-    var dockerStatusMap = {};
-    if (dockerFiles) {
-      Ext.each(dockerFiles, function (f) {
-        var key = f.originalPath || f.path;
-        if (key) { dockerStatusMap[key] = 'pending'; }
+    // Sync dockerStatusMap to current page records whenever store loads (handles page navigation)
+    fileStore.on('load', function (store) {
+      store.each(function (rec) {
+        var key = rec.get('originalPath') || rec.get('path');
+        if (dockerStatusMap[key] && dockerStatusMap[key] !== rec.get('status')) {
+          rec.set('status', dockerStatusMap[key]);
+        }
       });
-    }
-
-    // Helper: iterate ALL records in store (not just current page)
-    // In ExtJS 6 with memory proxy + enablePaging, getData().items only has current page.
-    // Use getData().getSource() to get all Model instances across pages.
-    function eachAllRecords(s, fn) {
-      var allItems = [];
-      // Try getSource() first (ExtJS 6 paging collection - returns Model instances)
-      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
-        var source = s.getData().getSource();
-        allItems = source.items || source;
-      }
-      // Fallback to getData().items (current page only, but they are Model instances)
-      else if (s.getData && s.getData().items) {
-        allItems = s.getData().items;
-      }
-      else if (s.data && s.data.items) {
-        allItems = s.data.items;
-      }
-      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
-      for (var i = 0; i < allItems.length; i++) {
-        if (fn(allItems[i], i) === false) break;
-      }
-    }
-
-    // Helper: find record index across ALL pages
-    function findAllIndex(s, prop, val) {
-      var allItems = [];
-      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
-        var source = s.getData().getSource();
-        allItems = source.items || source;
-      }
-      else if (s.getData && s.getData().items) {
-        allItems = s.getData().items;
-      }
-      else if (s.data && s.data.items) {
-        allItems = s.data.items;
-      }
-      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
-      for (var i = 0; i < allItems.length; i++) {
-        if (allItems[i].get(prop) === val) return i;
-      }
-      return -1;
-    }
+    });
 
     var totalFiles = Object.keys(dockerStatusMap).length || fileStore.getTotalCount() || fileStore.getCount();
 
@@ -2332,6 +2280,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         case 'failed':
           return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'cancelled':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
         default:
@@ -2436,11 +2386,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             promoteBtn.disable();
             cancelBtn.disable();
 
-            // Collect original file paths from preview for promotion (ALL pages, not just current)
+            // Collect original file paths from preview for promotion (use dockerFiles array directly)
             var promoFiles = [];
-            eachAllRecords(fileStore, function (rec) {
-              var origPath = rec.get('originalPath');
-              if (origPath) { promoFiles.push(origPath); }
+            Ext.each(dockerFiles, function (f) {
+              if (f.originalPath) { promoFiles.push(f.originalPath); }
             });
 
             apiRequest('POST', '/promotion/execute', {
@@ -2475,7 +2424,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               });
 
               // Start polling
-              me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles, dockerStatusMap, eachAllRecords, findAllIndex);
+              me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles, dockerStatusMap);
             })
             .catch(function (err) {
               promoteBtn.setText(_t('promotion.modal.promote'));

@@ -58,9 +58,6 @@ public class PromotionService {
 
   private static final Logger log = LoggerFactory.getLogger(PromotionService.class);
 
-  /** Maximum time (ms) to keep completed task results before cleanup (30 minutes) */
-  private static final long TASK_RESULT_TTL_MS = 30 * 60 * 1000L;
-
   /** Connection/read timeout in milliseconds */
   private static final int TIMEOUT_MS = 300_000; // 5 minutes
 
@@ -274,8 +271,12 @@ public class PromotionService {
         }
         catch (Exception e) {
           log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
-          result.setStatus(TaskStatus.FAILED.getValue());
-          result.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          // If the thread was interrupted (manual cancellation), use CANCELLED status
+          boolean isCancelled = Thread.currentThread().isInterrupted()
+              || (e instanceof InterruptedException)
+              || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
+          result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
         }
 
@@ -374,6 +375,16 @@ public class PromotionService {
       try { conn.disconnect(); } catch (Exception ignored) {}
       activeConnections.remove(taskId);
     }
+
+    // Update task result status to CANCELLED if it exists in taskResults
+    PromotionTaskResult result = taskResults.get(taskId);
+    if (result != null && !TaskStatus.CANCELLED.getValue().equals(result.getStatus())) {
+      log.info("Updating task {} result status from {} to CANCELLED", taskId, result.getStatus());
+      result.setStatus(TaskStatus.CANCELLED.getValue());
+      result.setErrorMessage("Task cancelled");
+      result.setEndTime(System.currentTimeMillis());
+      taskResults.put(taskId, copyResult(result));
+    }
   }
 
   /**
@@ -384,19 +395,20 @@ public class PromotionService {
   }
 
   /**
-   * Clean up task results that have been completed for longer than TASK_RESULT_TTL_MS.
+   * Clean up task results that have been completed for longer than the configured TTL.
    * This prevents memory leaks from accumulated completed task data.
    */
   private void cleanupExpiredTaskResults() {
+    long ttlMs = taskExecutor.getTaskLogTtlMs();
     long now = System.currentTimeMillis();
     List<String> expiredTaskIds = new ArrayList<>();
 
     for (Map.Entry<String, PromotionTaskResult> entry : taskResults.entrySet()) {
       PromotionTaskResult result = entry.getValue();
       String statusStr = result.getStatus();
-      if (("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr))
+      if (("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr) || "CANCELLED".equals(statusStr))
           && result.getEndTime() > 0
-          && (now - result.getEndTime()) > TASK_RESULT_TTL_MS) {
+          && (now - result.getEndTime()) > ttlMs) {
         expiredTaskIds.add(entry.getKey());
       }
     }
