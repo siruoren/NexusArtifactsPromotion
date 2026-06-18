@@ -644,3 +644,6 @@ src/main/java/com/nexus/artifacts/promotion/
 | 5xx        | 可重试：服务端临时错误     |
 
 ---
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=siruoren/NexusArtifactsPromotion&type=date&legend=top-left)](https://www.star-history.com/?repos=siruoren%2FNexusArtifactsPromotion&type=date&legend=top-left)
