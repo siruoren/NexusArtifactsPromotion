@@ -206,7 +206,7 @@ public class SyncService {
         int manifestsIdx = path.indexOf("/manifests/");
         int blobsIdx = path.indexOf("/blobs/");
         if (manifestsIdx > 0) {
-          // Path like v2/cnp/manifests/8.3.2.891 -> image=cnp, tag=8.3.2.891
+          // Path like v2/projectmanifests/8.3.2.891 -> image=project, tag=8.3.2.891
           String image = path.substring(0, manifestsIdx);
           String tag = path.substring(manifestsIdx + "/manifests/".length());
           dockerRequest.setImage(image);
@@ -219,31 +219,61 @@ public class SyncService {
           dockerRequest.setAllImages(false);
         }
         else {
-          // No /manifests/ or /blobs/ - determine if path is a directory (image name)
-          // or a specific image:tag by probing the remote API
+          // No /manifests/ or /blobs/ - determine if path is:
+          //   a) a directory prefix with multiple sub-images (e.g. project8.3.2.891 -> project8.3.2.891/app1, project8.3.2.891/app2)
+          //   b) an image name with tags (e.g. project8.3.2.891 has tags directly)
+          //   c) a specific image:tag (e.g. image=project, tag=8.3.2.891)
           int lastSlash = path.lastIndexOf('/');
           if (lastSlash > 0) {
-            // Path like "cnp/8.3.2.925" - could be image=cnp tag=8.3.2.925,
-            // or image=cnp/8.3.2.925 with all tags
-            // Probe remote: first try treating full path as image name (directory)
-            List<String> remoteTags = dockerService.listDockerTags(request.getRepositoryName(), path);
-            if (!remoteTags.isEmpty()) {
-              // Remote has tags for this image name -> it's a directory/image
-              dockerRequest.setImage(path);
+            String imageCandidate = path;
+            String tagCandidate = path.substring(lastSlash + 1);
+            String parentImage = path.substring(0, lastSlash);
+
+            // Step 1: Check if full path is an image with tags
+            List<String> fullPathTags = dockerService.listDockerTags(request.getRepositoryName(), imageCandidate);
+            if (!fullPathTags.isEmpty()) {
+              dockerRequest.setImage(imageCandidate);
               dockerRequest.setTags(null);
               dockerRequest.setAllImages(false);
               log.info("Parsed Docker path '{}' as image='{}' (remote has {} tags), will sync all tags from remote",
-                  path, path, remoteTags.size());
+                  path, imageCandidate, fullPathTags.size());
             }
             else {
-              // Remote doesn't have tags for full path -> treat last segment as tag
-              String image = path.substring(0, lastSlash);
-              String tag = path.substring(lastSlash + 1);
-              dockerRequest.setImage(image);
-              dockerRequest.setTags(Collections.singletonList(tag));
-              dockerRequest.setAllImages(false);
-              log.info("Parsed Docker path '{}' as image='{}', tag='{}' (remote has no tags for full path)",
-                  path, image, tag);
+              // Step 2: Check if path is a directory prefix with sub-images
+              Map<String, List<String>> prefixImages = dockerService.listDockerImagesByPrefix(request.getRepositoryName(), imageCandidate);
+              if (!prefixImages.isEmpty()) {
+                dockerRequest.setImagePrefix(imageCandidate);
+                dockerRequest.setAllImages(false);
+                log.info("Parsed Docker path '{}' as directory prefix (found {} sub-images), will sync all sub-images from remote",
+                    path, prefixImages.size());
+              }
+              else {
+                // Step 3: Check if parent image has the tag
+                List<String> parentTags = dockerService.listDockerTags(request.getRepositoryName(), parentImage);
+                if (parentTags.contains(tagCandidate)) {
+                  dockerRequest.setImage(parentImage);
+                  dockerRequest.setTags(Collections.singletonList(tagCandidate));
+                  dockerRequest.setAllImages(false);
+                  log.info("Parsed Docker path '{}' as image='{}', tag='{}' (verified tag exists in remote)",
+                      path, parentImage, tagCandidate);
+                }
+                else {
+                  // Step 4: Remote can't verify - use isDirectory flag
+                  if (request.isDirectory()) {
+                    dockerRequest.setImagePrefix(imageCandidate);
+                    dockerRequest.setAllImages(false);
+                    log.info("Parsed Docker path '{}' as directory prefix (isDirectory=true, remote unverified)",
+                        path);
+                  }
+                  else {
+                    dockerRequest.setImage(parentImage);
+                    dockerRequest.setTags(Collections.singletonList(tagCandidate));
+                    dockerRequest.setAllImages(false);
+                    log.info("Parsed Docker path '{}' as image='{}', tag='{}' (isDirectory=false, remote unverified)",
+                        path, parentImage, tagCandidate);
+                  }
+                }
+              }
             }
           }
           else {

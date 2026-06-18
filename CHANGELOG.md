@@ -6,11 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **Docker Sync Path Resolution (Remote-First)**: Docker sync path parsing now probes the remote API to determine whether a path like `cnp/8.3.2.925` is a directory (image name with tags) or a specific image:tag
-  - First tries treating the full path as an image name and listing tags from remote
-  - If remote returns tags → sync all tags for that image (directory mode)
-  - If remote returns 0 tags → treat last segment as a tag and sync that specific image:tag
-  - No longer relies on the `isDirectory` flag from UI, which was unreliable for Docker paths
+- **Docker Sync Path Resolution (Remote-First + Directory Prefix)**: Docker sync path parsing now uses a four-step strategy to determine the nature of projectth like `project/8.3.2.891`
+  - Step 1: Try full path as image name → if remote has tags, sync all tags (image mode)
+  - Step 2: Try full path as directory prefix → if remote has sub-images (e.g. `project/8.3.2.891/app1`, `project/8.3.2.891/app2`), sync all sub-images with their tags (directory prefix mode)
+  - Step 3: Try splitting as parent image + tag → if remote confirms tag exists, sync that specific tag
+  - Step 4: If remote can't verify → fall back to `isDirectory` flag from UI (directory prefix vs image:tag)
+  - Added `imagePrefix` field to `DockerImageRequest` for directory prefix mode
+  - Added `listDockerImagesByPrefixRemote()` method to discover sub-images under a prefix via Nexus Search API
 - **Docker Sync Remote-First Tag Listing**: `listDockerTags()` now prioritizes remote APIs (Docker Registry V2 → Remote Nexus API) for proxy repositories, instead of local cache
   - `listDockerTagsRemote()` no longer falls back to local cache — only returns tags actually available on remote
   - Prevents syncing stale or incomplete tag lists from local proxy cache

@@ -4,9 +4,10 @@ import java.util.List;
 
 /**
  * Request model for Docker image promotion or sync operations.
- * Supports two modes:
+ * Supports three modes:
  * 1. Promote/sync all tags of an image (tags = null or empty)
  * 2. Promote/sync specific tags of an image (tags = ["latest", "v1.0", ...])
+ * 3. Promote/sync all images under a directory prefix (imagePrefix = "project/8.3.2.891")
  */
 public class DockerImageRequest {
 
@@ -28,6 +29,14 @@ public class DockerImageRequest {
   /** If true, promote/sync all images in the repository (directory level). image field is ignored. */
   private boolean allImages;
 
+  /**
+   * Directory prefix for syncing multiple images under a path.
+   * For example, "project/8.3.2.891" will find and sync all images like
+   * project/8.3.2.891/app1, project/8.3.2.891/app2, etc.
+   * When set, takes precedence over image field for sync operations.
+   */
+  private String imagePrefix;
+
   public DockerImageRequest() {}
 
   public void validate() {
@@ -37,13 +46,17 @@ public class DockerImageRequest {
     if (format == null || format.trim().isEmpty()) {
       throw new IllegalArgumentException("format is required");
     }
-    // image is required only when not doing all-images mode
-    if (!allImages && (image == null || image.trim().isEmpty())) {
+    // image is required only when not doing all-images or prefix mode
+    if (!allImages && (imagePrefix == null || imagePrefix.trim().isEmpty())
+        && (image == null || image.trim().isEmpty())) {
       throw new IllegalArgumentException("image is required");
     }
     // Path traversal check
     if (image != null && image.contains("..")) {
       throw new IllegalArgumentException("Invalid image name");
+    }
+    if (imagePrefix != null && imagePrefix.contains("..")) {
+      throw new IllegalArgumentException("Invalid image prefix");
     }
   }
 
@@ -72,5 +85,12 @@ public class DockerImageRequest {
 
   public void setAllImages(boolean allImages) {
     this.allImages = allImages;
+  }
+
+  public String getImagePrefix() { return imagePrefix; }
+  public void setImagePrefix(String imagePrefix) { this.imagePrefix = imagePrefix; }
+
+  public boolean isPrefixMode() {
+    return imagePrefix != null && !imagePrefix.trim().isEmpty();
   }
 }
