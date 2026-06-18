@@ -10,6 +10,7 @@ import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.capability.CapabilitySupport;
 
 import com.nexus.artifacts.promotion.service.DockerService;
+import com.nexus.artifacts.promotion.service.RetryableOperation;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 
 import static com.nexus.artifacts.promotion.config.PromotionCapabilityDescriptor.*;
@@ -52,6 +53,46 @@ public class PromotionCapability extends CapabilitySupport<Map<String, String>> 
         log.warn("Invalid promotion pool size value: {}", poolSizeStr);
       }
     }
+
+    String maxQueueStr = props.get(PROP_MAX_PROMOTION_QUEUE_SIZE);
+    if (maxQueueStr != null) {
+      try {
+        int maxQueue = Integer.parseInt(maxQueueStr);
+        taskExecutor.updateMaxPromotionQueueSize(maxQueue);
+        log.info("Max promotion queue size set to {} from capability configuration", maxQueue);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid max promotion queue size value: {}", maxQueueStr);
+      }
+    }
+
+    // Configure retry strategy
+    long retryBaseDelay = 1000;
+    long retryMaxDelay = 30000;
+
+    String retryBaseDelayStr = props.get(PROP_RETRY_BASE_DELAY_MS);
+    if (retryBaseDelayStr != null) {
+      try {
+        retryBaseDelay = Long.parseLong(retryBaseDelayStr);
+        log.info("Retry base delay set to {}ms from capability configuration", retryBaseDelay);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid retry base delay value: {}", retryBaseDelayStr);
+      }
+    }
+
+    String retryMaxDelayStr = props.get(PROP_RETRY_MAX_DELAY_MS);
+    if (retryMaxDelayStr != null) {
+      try {
+        retryMaxDelay = Long.parseLong(retryMaxDelayStr);
+        log.info("Retry max delay set to {}ms from capability configuration", retryMaxDelay);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid retry max delay value: {}", retryMaxDelayStr);
+      }
+    }
+
+    RetryableOperation.configure(retryBaseDelay, retryMaxDelay, 500);
 
     // Update Docker release repositories configuration
     String dockerReleaseRepos = props.get(PROP_DOCKER_RELEASE_REPOS);

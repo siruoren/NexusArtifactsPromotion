@@ -27,12 +27,34 @@ public class PromotionCapabilityDescriptor extends CapabilityDescriptorSupport<O
   public static final CapabilityType CAPABILITY_TYPE = CapabilityType.capabilityType(TYPE_ID);
 
   public static final String PROP_PROMOTION_POOL_SIZE = "promotionPoolSize";
+  public static final String PROP_MAX_PROMOTION_QUEUE_SIZE = "maxPromotionQueueSize";
+  public static final String PROP_RETRY_BASE_DELAY_MS = "retryBaseDelayMs";
+  public static final String PROP_RETRY_MAX_DELAY_MS = "retryMaxDelayMs";
   public static final String PROP_DOCKER_RELEASE_REPOS = "dockerReleaseRepos";
 
   private static final NumberTextFormField POOL_SIZE_FIELD = new NumberTextFormField(
       PROP_PROMOTION_POOL_SIZE,
       "Promotion Thread Pool Size",
       "Number of threads for concurrent artifact promotion tasks (1-50, default: 4)",
+      false);
+
+  private static final NumberTextFormField MAX_QUEUE_FIELD = new NumberTextFormField(
+      PROP_MAX_PROMOTION_QUEUE_SIZE,
+      "Max Promotion Queue Size",
+      "Maximum number of concurrent promotion queue tasks (1-500, default: 50). "
+          + "Prevents OOM from too many concurrent promotions.",
+      false);
+
+  private static final NumberTextFormField RETRY_BASE_DELAY_FIELD = new NumberTextFormField(
+      PROP_RETRY_BASE_DELAY_MS,
+      "Retry Base Delay (ms)",
+      "Base delay in milliseconds for exponential backoff (100-10000, default: 1000)",
+      false);
+
+  private static final NumberTextFormField RETRY_MAX_DELAY_FIELD = new NumberTextFormField(
+      PROP_RETRY_MAX_DELAY_MS,
+      "Retry Max Delay (ms)",
+      "Maximum delay cap in milliseconds for exponential backoff (1000-300000, default: 30000)",
       false);
 
   private static final StringTextFormField DOCKER_RELEASE_REPOS_FIELD = new StringTextFormField(
@@ -63,7 +85,7 @@ public class PromotionCapabilityDescriptor extends CapabilityDescriptorSupport<O
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, DOCKER_RELEASE_REPOS_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, RETRY_BASE_DELAY_FIELD, RETRY_MAX_DELAY_FIELD, DOCKER_RELEASE_REPOS_FIELD);
   }
 
   public Set<Tag> getTags() {

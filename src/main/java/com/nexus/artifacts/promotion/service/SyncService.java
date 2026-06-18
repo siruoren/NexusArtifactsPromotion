@@ -8,6 +8,7 @@ import java.net.URL;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -107,6 +108,8 @@ public class SyncService {
   private final TaskCacheManager cacheManager;
   private final PermissionChecker permissionChecker;
   private final SecurityHelper securityHelper;
+  private final FileWriteLockManager writeLockManager;
+  private final DockerService dockerService;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -115,13 +118,17 @@ public class SyncService {
                       final TaskExecutorService taskExecutor,
                       final TaskCacheManager cacheManager,
                       final PermissionChecker permissionChecker,
-                      final SecurityHelper securityHelper)
+                      final SecurityHelper securityHelper,
+                      final FileWriteLockManager writeLockManager,
+                      final DockerService dockerService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
     this.cacheManager = cacheManager;
     this.permissionChecker = permissionChecker;
     this.securityHelper = securityHelper;
+    this.writeLockManager = writeLockManager;
+    this.dockerService = dockerService;
   }
 
   /**
@@ -179,6 +186,92 @@ public class SyncService {
    */
   public String sync(final SyncRequest request) {
     request.validate();
+
+    // Delegate Docker format syncs to DockerService
+    if ("docker".equalsIgnoreCase(request.getFormat())) {
+      log.info("Delegating Docker format sync to DockerService for repository: {}", request.getRepositoryName());
+      com.nexus.artifacts.promotion.model.DockerImageRequest dockerRequest =
+          new com.nexus.artifacts.promotion.model.DockerImageRequest();
+      dockerRequest.setSourceRepository(request.getRepositoryName());
+      dockerRequest.setFormat(request.getFormat());
+      // tags=null means all tags (isAllTags() returns true)
+      dockerRequest.setTags(null);
+      // Extract image name from path if provided
+      if (request.getPath() != null && !request.getPath().trim().isEmpty()) {
+        String path = request.getPath();
+        if (path.startsWith("v2/")) {
+          path = path.substring(3);
+        }
+        // Remove trailing /manifests/* or /blobs/*
+        int manifestsIdx = path.indexOf("/manifests/");
+        int blobsIdx = path.indexOf("/blobs/");
+        if (manifestsIdx > 0) {
+          // Path like v2/projectmanifests/8.3.2.891 -> image=project, tag=8.3.2.891
+          String image = path.substring(0, manifestsIdx);
+          String tag = path.substring(manifestsIdx + "/manifests/".length());
+          dockerRequest.setImage(image);
+          dockerRequest.setTags(Collections.singletonList(tag));
+          dockerRequest.setAllImages(false);
+        }
+        else if (blobsIdx > 0) {
+          path = path.substring(0, blobsIdx);
+          dockerRequest.setImage(path);
+          dockerRequest.setAllImages(false);
+        }
+        else {
+          // No /manifests/ or /blobs/ - use the same image discovery logic as promotion
+          // (listDockerImages + prefix filtering) to resolve the path.
+          // This handles all cases:
+          //   a) directory prefix with sub-images (e.g. project/8.3.2.891 -> project/8.3.2.891/app1, project/8.3.2.891/app2)
+          //   b) image name with tags (e.g. project/8.3.2.891 has tags directly)
+          //   c) specific image:tag (e.g. image=project, tag=8.3.2.891)
+          int lastSlash = path.lastIndexOf('/');
+          if (lastSlash > 0) {
+            // Use listDockerImagesByPrefix to find matching images (same strategy chain as promotion)
+            Map<String, List<String>> prefixImages = dockerService.listDockerImagesByPrefix(request.getRepositoryName(), path);
+            if (!prefixImages.isEmpty()) {
+              // Found images matching the path prefix
+              if (prefixImages.size() == 1 && prefixImages.containsKey(path)) {
+                // Only one match and it's the exact path -> single image with tags
+                dockerRequest.setImage(path);
+                dockerRequest.setTags(null);
+                dockerRequest.setAllImages(false);
+                log.info("Parsed Docker path '{}' as image='{}' (found {} tags), will sync all tags from remote",
+                    path, path, prefixImages.get(path).size());
+              }
+              else {
+                // Multiple sub-images or the path is a directory prefix
+                dockerRequest.setImagePrefix(path);
+                dockerRequest.setAllImages(false);
+                log.info("Parsed Docker path '{}' as directory prefix (found {} images), will sync all from remote",
+                    path, prefixImages.size());
+              }
+            }
+            else {
+              // No images found for the full path - try splitting as image:tag
+              String parentImage = path.substring(0, lastSlash);
+              String tagCandidate = path.substring(lastSlash + 1);
+              dockerRequest.setImage(parentImage);
+              dockerRequest.setTags(Collections.singletonList(tagCandidate));
+              dockerRequest.setAllImages(false);
+              log.info("Parsed Docker path '{}' as image='{}', tag='{}' (no images found for full path)",
+                  path, parentImage, tagCandidate);
+            }
+          }
+          else {
+            // No slash - just an image name, sync all tags
+            dockerRequest.setImage(path);
+            dockerRequest.setTags(null);
+            dockerRequest.setAllImages(false);
+            log.info("Parsed Docker path '{}' as image name, will sync all tags from remote", path);
+          }
+        }
+      }
+      else {
+        dockerRequest.setAllImages(true);
+      }
+      return dockerService.syncDockerImage(dockerRequest);
+    }
 
     // Check sync permission (also verifies it's a proxy repo)
     permissionChecker.checkSyncPermission(request.getRepositoryName(), request.getFormat());
@@ -314,6 +407,12 @@ public class SyncService {
   public SyncTaskInfo syncScheduled(final SyncRequest request) {
     request.validate();
 
+    // Delegate Docker format syncs to DockerService (synchronous, asset-based approach)
+    if ("docker".equalsIgnoreCase(request.getFormat())) {
+      log.info("Delegating Docker scheduled sync to DockerService for repository: {}", request.getRepositoryName());
+      return dockerService.syncDockerImageScheduled(request);
+    }
+
     // No permission check for scheduled tasks — tasks are created by administrators
 
     Repository repo = repositoryManager.get(request.getRepositoryName());
@@ -395,15 +494,33 @@ public class SyncService {
     cleanupExpiredTaskInfos();
     SyncTaskInfo info = taskInfos.get(taskId);
     if (info != null) {
-      TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
-      if (status != null) {
-        info.setStatus(status);
+      // Only override status from TaskExecutor if info is not already in a terminal state
+      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED) {
+        TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
+        if (status != null) {
+          info.setStatus(status);
+        }
       }
-      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED) {
+      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED || info.getStatus() == TaskStatus.MIGRATED) {
         taskExecutor.cleanupSyncTaskHandle(taskId);
       }
+      return info;
     }
-    return info;
+
+    // Also check Docker sync tasks
+    if (taskId != null && taskId.startsWith("docker-sync-")) {
+      try {
+        info = dockerService.getSyncTaskInfo(taskId);
+        if (info != null) {
+          return info;
+        }
+      }
+      catch (Exception e) {
+        log.warn("Failed to retrieve Docker sync task info for {}: {}", taskId, e.getMessage());
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -424,12 +541,64 @@ public class SyncService {
       }
       tasks.add(info);
     }
+
+    // Merge Docker sync tasks into the unified queue view
+    try {
+      List<SyncTaskInfo> dockerTasks = dockerService.getAllSyncTaskInfos();
+      tasks.addAll(dockerTasks);
+    }
+    catch (Exception e) {
+      log.warn("Failed to retrieve Docker sync task infos: {}", e.getMessage());
+    }
+
     tasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
     int maxRecords = taskExecutor.getMaxSyncRecords();
     if (tasks.size() > maxRecords) {
       tasks = tasks.subList(0, maxRecords);
     }
     return tasks;
+  }
+
+  /**
+   * Resubmit a recovered sync task after Nexus restart.
+   * Called by {@link SyncQueuePersistenceManager} during startup recovery.
+   */
+  public void resubmitRecoveredTask(final SyncTaskInfo recoveredTask) {
+    if (recoveredTask == null || recoveredTask.getTaskId() == null) {
+      log.warn("Cannot resubmit null or invalid recovered task");
+      return;
+    }
+
+    String taskId = recoveredTask.getTaskId();
+    String repoName = recoveredTask.getSourceRepository();
+    String path = recoveredTask.getPath();
+
+    log.info("Resubmitting recovered sync task: {} for {}:{}", taskId, repoName, path);
+
+    // Store the task info in memory
+    taskInfos.put(taskId, recoveredTask);
+
+    // Create a new sync request and submit it
+    SyncRequest request = new SyncRequest();
+    request.setRepositoryName(repoName);
+    request.setPath(path);
+    request.setIsDirectory(recoveredTask.isDirectory());
+    request.setFormat(recoveredTask.getFormat());
+
+    // Submit via normal sync flow (which handles permission, queue capacity, etc.)
+    try {
+      String newTaskId = sync(request);
+      log.info("Recovered task {} resubmitted as new task {}", taskId, newTaskId);
+      // Mark the old task as migrated
+      recoveredTask.setStatus(TaskStatus.MIGRATED);
+      recoveredTask.setEndTime(System.currentTimeMillis());
+    }
+    catch (Exception e) {
+      log.error("Failed to resubmit recovered task {}: {}", taskId, e.getMessage());
+      recoveredTask.setStatus(TaskStatus.FAILED);
+      recoveredTask.setErrorMessage("Recovery failed: " + sanitizeErrorMessage(e.getMessage()));
+      recoveredTask.setEndTime(System.currentTimeMillis());
+    }
   }
 
   /**
@@ -586,40 +755,42 @@ public class SyncService {
       final String[] repoAuth) throws Exception {
     log.info("Syncing asset {} via ViewFacet.dispatch()", assetPath);
 
-    try {
-      // Step 1: Delete cached asset if it exists, using internal StorageTx API
-      deleteCachedAssetInternal(repo, assetPath);
+    // Use file write lock to prevent concurrent sync of the same asset in the same repo
+    writeLockManager.executeWithFileLockVoid(repo.getName(), assetPath, () -> {
+      try {
+        // Step 1: Delete cached asset if it exists, using internal StorageTx API
+        deleteCachedAssetInternal(repo, assetPath);
 
-      // Step 2: Invalidate negative cache so previously 404'd assets can be retried
-      invalidateNegativeCache(repo, assetPath);
+        // Step 2: Invalidate negative cache so previously 404'd assets can be retried
+        invalidateNegativeCache(repo, assetPath);
 
-      // Step 3: Use ViewFacet.dispatch() - routes through full Nexus pipeline
-      // This properly sets up TokenMatcher.State and other context attributes
-      ViewFacet viewFacet = repo.facet(ViewFacet.class);
-      if (viewFacet != null) {
-        Request request = new Request.Builder()
-            .action("GET")
-            .path("/" + assetPath)
-            .build();
+        // Step 3: Use ViewFacet.dispatch() - routes through full Nexus pipeline
+        ViewFacet viewFacet = repo.facet(ViewFacet.class);
+        if (viewFacet != null) {
+          Request request = new Request.Builder()
+              .action("GET")
+              .path("/" + assetPath)
+              .build();
 
-        Response response = viewFacet.dispatch(request);
+          Response response = viewFacet.dispatch(request);
 
-        if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-          log.info("Successfully synced asset {} from remote (HTTP {})",
-              assetPath, response.getStatus().getCode());
+          if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
+            log.info("Successfully synced asset {} from remote (HTTP {})",
+                assetPath, response.getStatus().getCode());
+          }
+          else {
+            log.warn("Failed to sync asset {}: HTTP {}", assetPath, response.getStatus().getCode());
+          }
         }
         else {
-          log.warn("Failed to sync asset {}: HTTP {}", assetPath, response.getStatus().getCode());
+          log.warn("Repository {} does not have ViewFacet, skipping sync", repo.getName());
         }
       }
-      else {
-        log.warn("Repository {} does not have ViewFacet, skipping sync", repo.getName());
+      catch (Exception e) {
+        log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
+        throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
       }
-    }
-    catch (Exception e) {
-      log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
-      throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
-    }
+    });
   }
 
   // ========================================================================

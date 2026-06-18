@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.2] - 2026-06-17
+
+### Fixed
+
+- **Docker Sync Path Resolution (Unified with Promotion Logic)**: Docker sync path parsing now reuses the same image discovery logic as Docker promotion (`listDockerImages` + prefix filtering), ensuring consistent and reliable path resolution for any directory structure
+  - For paths like `project/8.3.2.891`, uses `listDockerImagesByPrefix()` which calls `listDockerImages()` (Internal API → Local REST API → Remote API) then filters by prefix
+  - Handles all cases: directory prefix with sub-images (e.g. `project/8.3.2.891/app1`, `project/8.3.2.891/app2`), image with tags, and specific image:tag
+  - Added `imagePrefix` field to `DockerImageRequest` for directory prefix mode
+  - Removed standalone `listDockerImagesByPrefixRemote()` method — now uses the same strategy chain as promotion
+- **Docker Sync Remote-First Tag Listing**: `listDockerTags()` now prioritizes remote APIs (Docker Registry V2 → Remote Nexus API) for proxy repositories, instead of local cache
+  - `listDockerTagsRemote()` no longer falls back to local cache — only returns tags actually available on remote
+  - Prevents syncing stale or incomplete tag lists from local proxy cache
+- **Docker Sync Task Error on Empty Remote Tags**: when remote returns 0 tags for an image, the sync task now correctly reports FAILED instead of silently completing
+  - `syncDockerImage()`: throws IOException when remote has 0 tags
+  - `syncDockerImageScheduled()`: sets task status to FAILED with error message when no images/tags found
+- **Docker Sync Task Status Display**: fixed task status being incorrectly shown as COMPLETED when the sync actually failed
+  - Root cause: `TaskExecutorService.wrapTask()` finally block overwrote FAILED status with COMPLETED
+  - `DockerService.getSyncTaskInfo()` and `SyncService.getTaskInfo()` now preserve terminal states (FAILED/COMPLETED) set by the service layer, preventing override by TaskExecutor
+- **Thread Pool Bounded Queue (OOM Prevention)**: replaced `LinkedBlockingQueue` (unbounded) with `ArrayBlockingQueue` (capacity: promotion=100, sync=50) in `TaskExecutorService`
+  - Uses `AbortPolicy` instead of `CallerRunsPolicy` to avoid blocking HTTP request threads
+  - `RejectedExecutionException` caught and converted to `IllegalStateException` with clear error message
+  - Prevents heap exhaustion when target repositories are unreachable and tasks accumulate
+- **HTTP Connection Leak Prevention**: fixed `HttpClientPool` to properly close `InputStream` in `finally` block before `conn.disconnect()`
+  - All HTTP methods (GET/PUT/PUTStream/HEAD/DELETE) now close response streams atomically with connection release
+  - Prevents Jetty connection pool exhaustion from unclosed streams during IOException
+- **Maven Metadata Merge Atomicity**: wrapped `promoteMavenMetadata` in `FileWriteLockManager.executeWithFileLock` to prevent concurrent merge corruption
+  - Per-file `ReentrantLock` ensures read-merge-write is atomic per target repo + path
+  - Prevents version entry loss when two promotion tasks write to the same Group/Artifact simultaneously
+- **Sync Queue Zombie Task Detection**: added zombie task detection in `SyncQueuePersistenceManager.recoverQueueState()`
+  - Tasks in RUNNING state for over 30 minutes are automatically marked as FAILED on recovery
+  - Prevents permanently stuck "in-progress" tasks after JVM crash
+  - Limited persisted tasks to 100 max to prevent large JSON files on startup
+
+### Verified
+
+- **Shiro Security Context Propagation**: confirmed all three services (PromotionService, DockerService, SyncService) correctly capture `SubjectThreadState` before thread pool submission, `bind()` in async thread, and `clear()` in `finally` block
+
 ## [1.0.1] - 2026-06-16
 
 ### Added
@@ -12,6 +49,56 @@ All notable changes to this project will be documented in this file.
 - **Docker Release Proxy Repository Configuration (Sync)**: added `dockerReleaseProxyRepos` parameter to Sync Capability
   - When syncing images from a configured release proxy repository, only non-snapshot tags are synced
   - Non-release tags are marked as "skipped" in sync results
+- **Docker Manifest OCI and Multi-Architecture Support**: added `DockerManifestParser` for comprehensive manifest format handling
+  - Support Docker Manifest V2 Schema 2 (`application/vnd.docker.distribution.manifest.v2+json`)
+  - Support OCI Image Manifest V1 (`application/vnd.oci.image.manifest.v1+json`)
+  - Support Docker Fat Manifest / Manifest List V2 (`application/vnd.docker.distribution.manifest.list.v2+json`)
+  - Support OCI Image Index V1 (`application/vnd.oci.image.index.v1+json`)
+  - Auto-detect manifest type when Content-Type header is missing
+  - Multi-architecture (arm64/arm32v6/etc.) image promotion and sync support
+  - Recursive sub-manifest processing for fat manifests
+- **Docker and Generic Sync Flow Separation**: Docker format sync requests are now delegated to `DockerService`
+  - `SyncService.sync()` detects Docker format and delegates to `DockerService.syncDockerImage()`
+  - Docker sync leverages manifest-aware blob dependency resolution
+  - Non-Docker formats continue to use ContentFacet-based sync
+- **Promotion Queue Capacity Control**: added `maxPromotionQueueSize` configuration to prevent OOM
+  - Promotion Capability UI now includes "Max Promotion Queue Size" field (default: 50)
+  - `TaskExecutorService` rejects new promotion tasks when queue is full
+  - Prevents memory exhaustion from excessive concurrent promotion tasks
+- **Configurable Retry Strategy**: retry parameters are now configurable via Promotion Capability UI
+  - Added "Retry Base Delay (ms)" field (100-10000, default: 1000)
+  - Added "Retry Max Delay (ms)" field (1000-300000, default: 30000)
+  - Exponential backoff with jitter: `min(maxDelay, baseDelay * 2^attempt) + random(0, jitter)`
+  - Retryable error classification: only retries on IOException, HTTP 429/5xx; never retries on IllegalArgumentException, SecurityException, HTTP 4xx
+- **Global Exception Handling**: added `PromotionExceptionMapper` for standardized REST API error responses
+  - SecurityException → 403 Forbidden
+  - IllegalArgumentException → 400 Bad Request
+  - IllegalStateException → 503 Service Unavailable
+  - IOException → 502 Bad Gateway
+  - All errors return consistent JSON format: `{"error":"category","message":"detail","status":code}`
+- **Structured Logging Enhancement**: improved promotion and sync completion logs with task metadata
+  - Promotion completion log includes: taskId, source, target, totalFiles, success count, skipped count, duration
+  - Sync completion log includes: taskId, repository, path, synced count, skipped count
+- **Sync Queue Persistence and Recovery**: added `SyncQueuePersistenceManager` for active task recovery after Nexus restart
+  - Active (PENDING/RUNNING) sync tasks are periodically persisted to disk (every 30 seconds)
+  - On Nexus startup, persisted active tasks are automatically recovered and resubmitted
+  - Only the latest snapshot is kept; old state files are cleaned up
+  - Recovered tasks are resubmitted through the normal sync flow with permission checks
+- **HTTP Connection Pool Reuse**: added `HttpClientPool` for connection pooling across promotion and sync operations
+  - Leverages JDK built-in HTTP Keep-Alive connection pooling (increased `http.maxConnections` to 20)
+  - Centralized timeout configuration (connect timeout, read timeout, chunk size)
+  - Core promotion and Docker blob transfer paths now use connection pool
+  - Maven metadata merge operations use connection pool
+  - Docker manifest download and sub-manifest processing use connection pool
+  - Chunked streaming mode for large uploads avoids buffering entire files in memory
+  - Connection reuse significantly reduces TLS handshake overhead in batch scenarios
+- **Unit Tests**: added `DockerManifestParserTest` with 21 test cases covering all manifest formats
+  - Docker V2 Schema 2 parsing and blob digest extraction
+  - OCI Image Manifest V1 parsing
+  - Docker Fat Manifest (Manifest List) with multi-architecture platform references
+  - OCI Image Index V1 parsing
+  - Auto-detection when Content-Type header is missing
+  - Edge cases: empty manifest, null manifest, missing config/layers, missing platform info
 
 ### Changed
 
@@ -20,6 +107,16 @@ All notable changes to this project will be documented in this file.
   - Removed MD5 checksum comparison logic from DockerService
   - Every sync operation re-downloads all assets from remote
 - **Removed Last-Modified Checksum Comparison**: non-Docker proxy sync no longer uses Last-Modified header for comparison (was incorrect)
+
+### Fixed
+
+- **Concurrent Write Lock (HIGH)**: added `FileWriteLockManager` to prevent file corruption from concurrent writes to the same target repository path
+  - PromotionService: MD5 check and file transfer are now atomic under file lock (fixes TOCTOU race condition)
+  - SyncService: asset sync operations are protected by per-file write lock
+  - DockerService: Docker tag sync/promotion uses image:tag level lock for Manifest+Blob atomicity
+  - Maven metadata merge is protected by the same file lock as the promotion operation
+- **Sync Task Deduplication (MEDIUM)**: `cancelDuplicateSyncTask` now checks target repository in addition to source, preventing incorrect cancellation of tasks with different targets
+- **TaskCacheManager Concurrency (MEDIUM)**: added per-file locks in `storeFile` to prevent concurrent write conflicts in cache directory
 
 ### Removed
 

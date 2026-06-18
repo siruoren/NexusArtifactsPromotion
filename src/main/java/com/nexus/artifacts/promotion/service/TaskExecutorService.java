@@ -2,11 +2,13 @@ package com.nexus.artifacts.promotion.service;
 
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -41,13 +43,19 @@ public class TaskExecutorService {
   private static final int DEFAULT_PROMOTION_POOL_SIZE = 4;
   private static final int DEFAULT_SYNC_POOL_SIZE = 4;
   private static final int DEFAULT_MAX_SYNC_QUEUE_SIZE = 20;
+  private static final int DEFAULT_MAX_PROMOTION_QUEUE_SIZE = 50;
   private static final int DEFAULT_MAX_SYNC_RECORDS = 200;
   private static final long TASK_TIMEOUT_MINUTES = 60;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
+  // Bounded queue capacity for thread pool (prevents OOM from unbounded task accumulation)
+  private static final int PROMOTION_QUEUE_CAPACITY = 100;
+  private static final int SYNC_QUEUE_CAPACITY = 50;
+
   private volatile int promotionPoolSize = DEFAULT_PROMOTION_POOL_SIZE;
   private volatile int syncPoolSize = DEFAULT_SYNC_POOL_SIZE;
   private volatile int maxSyncQueueSize = DEFAULT_MAX_SYNC_QUEUE_SIZE;
+  private volatile int maxPromotionQueueSize = DEFAULT_MAX_PROMOTION_QUEUE_SIZE;
   private volatile int maxSyncRecords = DEFAULT_MAX_SYNC_RECORDS;
 
   private ExecutorService promotionExecutor;
@@ -65,21 +73,22 @@ public class TaskExecutorService {
   }
 
   private void initExecutors() {
-    this.promotionExecutor = createThreadPool("promotion", promotionPoolSize);
-    this.syncExecutor = createThreadPool("sync", syncPoolSize);
-    log.info("TaskExecutorService initialized - promotion pool: {}, sync pool: {}, max sync queue: {}",
-        promotionPoolSize, syncPoolSize, maxSyncQueueSize);
+    this.promotionExecutor = createThreadPool("promotion", promotionPoolSize, PROMOTION_QUEUE_CAPACITY);
+    this.syncExecutor = createThreadPool("sync", syncPoolSize, SYNC_QUEUE_CAPACITY);
+    log.info("TaskExecutorService initialized - promotion pool: {} (queue: {}), sync pool: {} (queue: {}), max sync queue: {}",
+        promotionPoolSize, PROMOTION_QUEUE_CAPACITY, syncPoolSize, SYNC_QUEUE_CAPACITY, maxSyncQueueSize);
   }
 
-  private ExecutorService createThreadPool(final String type, final int poolSize) {
+  private ExecutorService createThreadPool(final String type, final int poolSize, final int queueCapacity) {
+    BlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>(queueCapacity);
     return new ThreadPoolExecutor(
         poolSize,
         poolSize,
         0L,
         TimeUnit.MILLISECONDS,
-        new LinkedBlockingQueue<>(),
+        workQueue,
         new TaskThreadFactory("nexus-" + type + "-task-"),
-        new ThreadPoolExecutor.CallerRunsPolicy()
+        new ThreadPoolExecutor.AbortPolicy()
     );
   }
 
@@ -101,13 +110,26 @@ public class TaskExecutorService {
   {
     log.info("Submitting promotion task {}: {}", taskId, taskDescription);
 
+    // Check promotion queue capacity to prevent OOM
+    if (!hasPromotionQueueCapacity()) {
+      throw new IllegalStateException(
+          "Promotion queue is full (" + maxPromotionQueueSize
+              + "). Please wait for existing tasks to complete.");
+    }
+
     // Wrap task with timeout and error handling
     Callable<PromotionTaskCallback> wrappedTask = wrapTask(task, taskId, "promotion");
 
-    Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
-    promotionTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis()));
-
-    return taskId;
+    try {
+      Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
+      promotionTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis()));
+      return taskId;
+    }
+    catch (RejectedExecutionException e) {
+      log.warn("Promotion task {} rejected - thread pool queue full", taskId);
+      throw new IllegalStateException(
+          "Promotion thread pool queue is full. Please wait for existing tasks to complete.", e);
+    }
   }
 
   /**
@@ -140,16 +162,23 @@ public class TaskExecutorService {
 
     Callable<SyncTaskCallback> wrappedTask = wrapTask(task, taskId, "sync");
 
-    Future<SyncTaskCallback> future = syncExecutor.submit(wrappedTask);
-    syncTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
-        sourceRepository, sourcePath));
-
-    return taskId;
+    try {
+      Future<SyncTaskCallback> future = syncExecutor.submit(wrappedTask);
+      syncTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
+          sourceRepository, sourcePath));
+      return taskId;
+    }
+    catch (RejectedExecutionException e) {
+      log.warn("Sync task {} rejected - thread pool queue full", taskId);
+      throw new IllegalStateException(
+          "Sync thread pool queue is full. Please wait for existing tasks to complete.", e);
+    }
   }
 
   /**
-   * Cancel duplicate sync task for the same source directory.
-   * Only keeps the latest sync task, old tasks are terminated and marked as migrated.
+   * Cancel duplicate sync task for the same source directory and target repository.
+   * Only keeps the latest sync task when both source and target match.
+   * Tasks with different targets are allowed to run in parallel.
    */
   private void cancelDuplicateSyncTask(final String sourceRepository,
                                         final String sourcePath,
@@ -163,19 +192,26 @@ public class TaskExecutorService {
           && handle.sourcePath.equals(sourcePath)
           && (handle.status == TaskStatus.PENDING || handle.status == TaskStatus.RUNNING))
       {
-        String oldTaskId = handle.taskId;
-        log.info("Cancelling duplicate sync task {} for source {}:{}, migrating to {}",
-            oldTaskId, sourceRepository, sourcePath, newTaskId);
+        // Only cancel if target repository also matches (or both are null/default)
+        boolean sameTarget = (handle.targetRepository == null && sourceRepository == null)
+            || (handle.targetRepository != null && handle.targetRepository.equals(sourceRepository))
+            || (handle.targetRepository != null && handle.targetRepository.equals(handle.sourceRepository));
 
-        handle.future.cancel(true);
-        handle.status = TaskStatus.MIGRATED;
-        handle.migratedToTaskId = newTaskId;
-        handle.endTime = System.currentTimeMillis();
+        if (sameTarget) {
+          String oldTaskId = handle.taskId;
+          log.info("Cancelling duplicate sync task {} for source {}:{}, migrating to {}",
+              oldTaskId, sourceRepository, sourcePath, newTaskId);
 
-        // Cleanup old task cache
-        cacheManager.cleanupTask(oldTaskId);
+          handle.future.cancel(true);
+          handle.status = TaskStatus.MIGRATED;
+          handle.migratedToTaskId = newTaskId;
+          handle.endTime = System.currentTimeMillis();
 
-        log.info("Sync task {} migrated to {}", oldTaskId, newTaskId);
+          // Cleanup old task cache
+          cacheManager.cleanupTask(oldTaskId);
+
+          log.info("Sync task {} migrated to {}", oldTaskId, newTaskId);
+        }
       }
     }
   }
@@ -391,7 +427,16 @@ public class TaskExecutorService {
   public int getPromotionPoolSize() { return promotionPoolSize; }
   public int getSyncPoolSize() { return syncPoolSize; }
   public int getMaxSyncQueueSize() { return maxSyncQueueSize; }
+  public int getMaxPromotionQueueSize() { return maxPromotionQueueSize; }
   public int getMaxSyncRecords() { return maxSyncRecords; }
+
+  /**
+   * Update max promotion queue size.
+   */
+  public void updateMaxPromotionQueueSize(final int newSize) {
+    this.maxPromotionQueueSize = Math.max(1, newSize);
+    log.info("Max promotion queue size updated to {}", maxPromotionQueueSize);
+  }
 
   /**
    * Check if sync queue has capacity.
@@ -404,6 +449,19 @@ public class TaskExecutorService {
       }
     }
     return activeCount < maxSyncQueueSize;
+  }
+
+  /**
+   * Check if promotion queue has capacity.
+   */
+  public boolean hasPromotionQueueCapacity() {
+    int activeCount = 0;
+    for (TaskHandle handle : promotionTasks.values()) {
+      if (handle.status == TaskStatus.PENDING || handle.status == TaskStatus.RUNNING) {
+        activeCount++;
+      }
+    }
+    return activeCount < maxPromotionQueueSize;
   }
 
   /**
@@ -465,20 +523,27 @@ public class TaskExecutorService {
     public volatile long endTime;
     public final String sourceRepository;
     public final String sourcePath;
+    public final String targetRepository;
     public volatile String migratedToTaskId;
 
     public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime) {
-      this(taskId, future, status, startTime, null, null);
+      this(taskId, future, status, startTime, null, null, null);
     }
 
     public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime,
                        String sourceRepository, String sourcePath) {
+      this(taskId, future, status, startTime, sourceRepository, sourcePath, sourceRepository);
+    }
+
+    public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime,
+                       String sourceRepository, String sourcePath, String targetRepository) {
       this.taskId = taskId;
       this.future = future;
       this.status = status;
       this.startTime = startTime;
       this.sourceRepository = sourceRepository;
       this.sourcePath = sourcePath;
+      this.targetRepository = targetRepository;
     }
   }
 

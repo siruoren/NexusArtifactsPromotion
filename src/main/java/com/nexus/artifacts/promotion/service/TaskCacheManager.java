@@ -10,6 +10,7 @@ import java.nio.file.StandardCopyOption;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 
 import javax.annotation.PreDestroy;
 import javax.inject.Inject;
@@ -38,6 +39,7 @@ public class TaskCacheManager {
 
   private final Path cacheBasePath;
   private final Map<String, Path> taskCacheDirs = new ConcurrentHashMap<>();
+  private final Map<String, ReentrantLock> fileLocks = new ConcurrentHashMap<>();
 
   @Inject
   public TaskCacheManager() {
@@ -100,10 +102,14 @@ public class TaskCacheManager {
     validateTaskId(taskId);
     validateRelativePath(relativePath);
 
-    Path taskDir = getOrCreateTaskCache(taskId);
-    Path filePath = taskDir.resolve(relativePath);
+    String lockKey = taskId + ":" + relativePath;
+    ReentrantLock lock = fileLocks.computeIfAbsent(lockKey, k -> new ReentrantLock());
 
+    lock.lock();
     try {
+      Path taskDir = getOrCreateTaskCache(taskId);
+      Path filePath = taskDir.resolve(relativePath);
+
       Files.createDirectories(filePath.getParent());
       Files.copy(data, filePath, StandardCopyOption.REPLACE_EXISTING);
       log.debug("Stored file in cache for task {}: {}", taskId, relativePath);
@@ -112,6 +118,12 @@ public class TaskCacheManager {
     catch (IOException e) {
       log.error("Failed to store file in cache for task {}: {}", taskId, e.getMessage());
       throw new RuntimeException("Failed to store file in task cache", e);
+    }
+    finally {
+      lock.unlock();
+      if (!lock.hasQueuedThreads()) {
+        fileLocks.remove(lockKey, lock);
+      }
     }
   }
 
@@ -157,6 +169,9 @@ public class TaskCacheManager {
       deleteRecursively(taskDir);
       log.info("Cleaned up cache for task {}: {}", taskId, taskDir);
     }
+
+    // Cleanup file locks for this task
+    fileLocks.keySet().removeIf(key -> key.startsWith(taskId + ":"));
   }
 
   /**
