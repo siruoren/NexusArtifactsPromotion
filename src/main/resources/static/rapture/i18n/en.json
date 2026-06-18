@@ -35,6 +35,10 @@
   "sync.queue.created.message": "Sync task has been submitted to the queue.",
   "sync.queue.created.viewQueue": "View Queue",
   "sync.queue.created.close": "Close",
+  "sync.progress.processing": "Syncing",
+  "sync.progress.success": "Synced",
+  "sync.progress.failed": "Sync Failed",
+  "sync.progress.pending": "Pending",
 
   "sync.queue.page.title": "Sync Queue",
   "sync.queue.page.loginRequired": "Please log in to view sync queue.",

@@ -87,6 +87,10 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.created.message": "Sync task has been submitted to the queue.",
     "sync.queue.created.viewQueue": "View Queue",
     "sync.queue.created.close": "Close",
+    "sync.progress.processing": "Syncing",
+    "sync.progress.success": "Synced",
+    "sync.progress.failed": "Sync Failed",
+    "sync.progress.pending": "Pending",
 
     "sync.queue.page.title": "Sync Queue",
     "sync.queue.page.loginRequired": "Please log in to view sync queue.",
@@ -164,6 +168,10 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.created.message": "\u540c\u6b65\u4efb\u52a1\u5df2\u63d0\u4ea4\u5230\u961f\u5217\u3002",
     "sync.queue.created.viewQueue": "\u67e5\u770b\u961f\u5217",
     "sync.queue.created.close": "\u5173\u95ed",
+    "sync.progress.processing": "\u540c\u6b65\u4e2d",
+    "sync.progress.success": "\u540c\u6b65\u6210\u529f",
+    "sync.progress.failed": "\u540c\u6b65\u5931\u8d25",
+    "sync.progress.pending": "\u7b49\u5f85\u4e2d",
 
     "sync.queue.page.title": "\u540c\u6b65\u961f\u5217",
     "sync.queue.page.loginRequired": "\u8bf7\u767b\u5f55\u540e\u67e5\u770b\u540c\u6b65\u961f\u5217\u3002",
@@ -1080,8 +1088,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     var win = Ext.create('Ext.window.Window', {
       title: isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text'),
-      width: 450,
-      height: 220,
+      minWidth: 400,
+      maxWidth: 700,
+      autoScroll: true,
       modal: true,
       closable: true,
       layout: 'fit',
@@ -1089,22 +1098,23 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         xtype: 'panel',
         layout: { type: 'vbox', align: 'stretch' },
         bodyPadding: 15,
+        autoScroll: true,
         items: [
           {
             xtype: 'displayfield',
             fieldLabel: _t('sync.queue.created.repository'),
-            value: '<b>' + sanitize(fullPath) + '</b>'
+            value: '<b style="word-break:break-all;">' + sanitize(fullPath) + '</b>'
           },
           {
             xtype: 'displayfield',
             fieldLabel: _t('sync.queue.created.queueId'),
-            value: '<b>' + sanitize(taskId) + '</b>'
+            value: '<b style="word-break:break-all;">' + sanitize(taskId) + '</b>'
           },
           {
             xtype: 'displayfield',
             fieldLabel: _t('promotion.result.status'),
             itemId: 'syncStatusField',
-            value: '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>'
+            value: '<span style="color:#337ab7;font-weight:bold;">' + _t('sync.progress.processing') + '</span>'
           }
         ]
       }],
@@ -1188,13 +1198,13 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         // Update status display
         if (statusField) {
           if (statusStr === 'running') {
-            statusField.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>');
+            statusField.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('sync.progress.processing') + '</span>');
           } else if (statusStr === 'completed') {
-            statusField.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>');
+            statusField.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('sync.progress.success') + '</span>');
           } else if (statusStr === 'failed') {
-            statusField.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>');
+            statusField.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('sync.progress.failed') + '</span>');
           } else if (statusStr === 'pending') {
-            statusField.setValue('<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>');
+            statusField.setValue('<span style="color:#999;">' + _t('sync.progress.pending') + '</span>');
           }
         }
 
@@ -1205,9 +1215,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
           // Update window title
           if (statusStr === 'failed') {
-            win.setTitle(_t('promotion.progress.failed'));
+            win.setTitle(_t('sync.progress.failed'));
           } else {
-            win.setTitle(_t('promotion.progress.success'));
+            win.setTitle(_t('sync.progress.success'));
           }
         }
       };
@@ -1701,16 +1711,19 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 function showSyncQueueCreatedDialog(result) {
   var win = Ext.create('Ext.window.Window', {
     title: _t('sync.queue.created.title'),
-    width: 400,
+    minWidth: 400,
+    maxWidth: 700,
+    autoScroll: true,
     modal: true,
     layout: 'fit',
     items: [{
       xtype: 'panel',
       bodyPadding: 15,
+      autoScroll: true,
       items: [
-        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.queueId'), value: sanitize(result.taskId || result.queueId || '') },
-        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.repository'), value: sanitize(result.repository || '') },
-        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.path'), value: sanitize(result.path || '') },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.queueId'), value: '<span style="word-break:break-all;">' + sanitize(result.taskId || result.queueId || '') + '</span>' },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.repository'), value: '<span style="word-break:break-all;">' + sanitize(result.repository || '') + '</span>' },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.path'), value: '<span style="word-break:break-all;">' + sanitize(result.path || '') + '</span>' },
         { xtype: 'displayfield', value: _t('sync.queue.created.message') }
       ]
     }],
