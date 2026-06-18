@@ -7,8 +7,8 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - **Docker Sync Path Resolution (Unified with Promotion Logic)**: Docker sync path parsing now reuses the same image discovery logic as Docker promotion (`listDockerImages` + prefix filtering), ensuring consistent and reliable path resolution for any directory structure
-  - For paths like `cnp/8.3.2.891`, uses `listDockerImagesByPrefix()` which calls `listDockerImages()` (Internal API → Local REST API → Remote API) then filters by prefix
-  - Handles all cases: directory prefix with sub-images (e.g. `cnp/8.3.2.891/app1`, `cnp/8.3.2.891/app2`), image with tags, and specific image:tag
+  - For paths like `project/8.3.2.891`, uses `listDockerImagesByPrefix()` which calls `listDockerImages()` (Internal API → Local REST API → Remote API) then filters by prefix
+  - Handles all cases: directory prefix with sub-images (e.g. `project/8.3.2.891/app1`, `project/8.3.2.891/app2`), image with tags, and specific image:tag
   - Added `imagePrefix` field to `DockerImageRequest` for directory prefix mode
   - Removed standalone `listDockerImagesByPrefixRemote()` method — now uses the same strategy chain as promotion
 - **Docker Sync Remote-First Tag Listing**: `listDockerTags()` now prioritizes remote APIs (Docker Registry V2 → Remote Nexus API) for proxy repositories, instead of local cache

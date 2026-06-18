@@ -580,10 +580,10 @@ public class DockerService {
    * remote-only images (not yet cached locally) are also discovered.
    * For hosted repositories, uses Internal API only.
    *
-   * For prefix "cnp/8.3.2.891", this will find:
-   *   - cnp/8.3.2.891 (if it has tags directly)
-   *   - cnp/8.3.2.891/app1, cnp/8.3.2.891/app2 (sub-images under the prefix)
-   *   - cnp/8.3.2.891/deep/nested/img (deeply nested images)
+   * For prefix "project/8.3.2.891", this will find:
+   *   - project/8.3.2.891 (if it has tags directly)
+   *   - project/8.3.2.891/app1, project/8.3.2.891/app2 (sub-images under the prefix)
+   *   - project/8.3.2.891/deep/nested/img (deeply nested images)
    *
    * Returns a map of imageName -> list of tags.
    */
