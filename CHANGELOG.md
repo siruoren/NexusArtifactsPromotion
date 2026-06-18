@@ -6,13 +6,11 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **Docker Sync Path Resolution (Remote-First + Directory Prefix)**: Docker sync path parsing now uses a four-step strategy to determine the nature of projectth like `project/8.3.2.891`
-  - Step 1: Try full path as image name → if remote has tags, sync all tags (image mode)
-  - Step 2: Try full path as directory prefix → if remote has sub-images (e.g. `project/8.3.2.891/app1`, `project/8.3.2.891/app2`), sync all sub-images with their tags (directory prefix mode)
-  - Step 3: Try splitting as parent image + tag → if remote confirms tag exists, sync that specific tag
-  - Step 4: If remote can't verify → fall back to `isDirectory` flag from UI (directory prefix vs image:tag)
+- **Docker Sync Path Resolution (Unified with Promotion Logic)**: Docker sync path parsing now reuses the same image discovery logic as Docker promotion (`listDockerImages` + prefix filtering), ensuring consistent and reliable path resolution for any directory structure
+  - For paths like `cnp/8.3.2.891`, uses `listDockerImagesByPrefix()` which calls `listDockerImages()` (Internal API → Local REST API → Remote API) then filters by prefix
+  - Handles all cases: directory prefix with sub-images (e.g. `cnp/8.3.2.891/app1`, `cnp/8.3.2.891/app2`), image with tags, and specific image:tag
   - Added `imagePrefix` field to `DockerImageRequest` for directory prefix mode
-  - Added `listDockerImagesByPrefixRemote()` method to discover sub-images under a prefix via Nexus Search API
+  - Removed standalone `listDockerImagesByPrefixRemote()` method — now uses the same strategy chain as promotion
 - **Docker Sync Remote-First Tag Listing**: `listDockerTags()` now prioritizes remote APIs (Docker Registry V2 → Remote Nexus API) for proxy repositories, instead of local cache
   - `listDockerTagsRemote()` no longer falls back to local cache — only returns tags actually available on remote
   - Prevents syncing stale or incomplete tag lists from local proxy cache

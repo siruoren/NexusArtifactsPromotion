@@ -575,22 +575,90 @@ public class DockerService {
   }
 
   /**
-   * List Docker images from remote that start with the given prefix.
-   * For example, prefix "project8.3.2.891" might find images like:
-   *   project8.3.2.891/app1, project8.3.2.891/app2, etc.
+   * List Docker images that match a given path prefix.
+   * For proxy repositories, merges results from Internal API AND Remote API to ensure
+   * remote-only images (not yet cached locally) are also discovered.
+   * For hosted repositories, uses Internal API only.
+   *
+   * For prefix "cnp/8.3.2.891", this will find:
+   *   - cnp/8.3.2.891 (if it has tags directly)
+   *   - cnp/8.3.2.891/app1, cnp/8.3.2.891/app2 (sub-images under the prefix)
+   *   - cnp/8.3.2.891/deep/nested/img (deeply nested images)
+   *
    * Returns a map of imageName -> list of tags.
    */
   public Map<String, List<String>> listDockerImagesByPrefix(final String repositoryName, final String prefix) {
+    Map<String, List<String>> result = new LinkedHashMap<>();
     try {
       Repository repo = repositoryManager.get(repositoryName);
-      if (repo != null) {
-        return listDockerImagesByPrefixRemote(repo, prefix);
+      if (repo == null) {
+        return result;
       }
+
+      // Collect images from all available sources (merge, don't short-circuit)
+      Map<String, DockerImageInfo> allImages = new LinkedHashMap<>();
+
+      // Source 1: Internal API (local cache)
+      try {
+        Map<String, DockerImageInfo> internalImages = listDockerImagesInternal(repo);
+        allImages.putAll(internalImages);
+      }
+      catch (Exception e) {
+        log.debug("Internal API listing failed for prefix search in {}: {}", repositoryName, e.getMessage());
+      }
+
+      // Source 2: For proxy repos, also query remote API (may find images not yet cached locally)
+      if ("proxy".equals(repo.getType().getValue())) {
+        try {
+          Map<String, DockerImageInfo> remoteImages = listDockerImagesViaRemoteApi(repo);
+          // Merge remote results into allImages (remote may have images not in local cache)
+          for (Map.Entry<String, DockerImageInfo> entry : remoteImages.entrySet()) {
+            if (!allImages.containsKey(entry.getKey())) {
+              allImages.put(entry.getKey(), entry.getValue());
+            }
+            else {
+              // Merge tags: add any remote tags not already present
+              DockerImageInfo existing = allImages.get(entry.getKey());
+              DockerImageInfo remote = entry.getValue();
+              if (remote.getTags() != null) {
+                for (String tag : remote.getTags()) {
+                  if (existing.getTags() == null || !existing.getTags().contains(tag)) {
+                    if (existing.getTags() == null) {
+                      existing.setTags(new ArrayList<>());
+                    }
+                    existing.getTags().add(tag);
+                  }
+                }
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          log.info("Remote API listing failed for prefix search in {}: {}", repositoryName, e.getMessage());
+        }
+      }
+
+      // Filter by prefix
+      for (Map.Entry<String, DockerImageInfo> entry : allImages.entrySet()) {
+        String imageName = entry.getKey();
+        // Match: image name equals prefix, or image name starts with prefix + "/"
+        if (imageName.equals(prefix) || imageName.startsWith(prefix + "/")) {
+          List<String> tags = entry.getValue().getTags();
+          if (tags == null || tags.isEmpty()) {
+            tags = listDockerTags(repositoryName, imageName);
+          }
+          if (!tags.isEmpty()) {
+            result.put(imageName, tags);
+          }
+        }
+      }
+      log.info("listDockerImagesByPrefix: found {} images matching prefix '{}' in {}",
+          result.size(), prefix, repositoryName);
     }
     catch (Exception e) {
       log.debug("Failed to list Docker images by prefix {}/{}: {}", repositoryName, prefix, e.getMessage());
     }
-    return new LinkedHashMap<>();
+    return result;
   }
 
   /**
@@ -1456,52 +1524,31 @@ public class DockerService {
             imageFilter = normalizedPath.substring(0, blobsIdx);
           }
           else {
-            // Determine if path is a directory prefix, an image name, or a specific image:tag
+            // Use the same image discovery logic as promotion (listDockerImagesByPrefix)
+            // to resolve the path. This handles directory prefix, image with tags, and image:tag.
             int lastSlash = normalizedPath.lastIndexOf('/');
             if (lastSlash > 0) {
-              String imageCandidate = normalizedPath;
-              String tagCandidate = normalizedPath.substring(lastSlash + 1);
-              String parentImage = normalizedPath.substring(0, lastSlash);
-
-              // Step 1a: Check if full path is an image with tags
-              List<String> fullPathTags = listDockerTagsRemote(repo, imageCandidate);
-              if (!fullPathTags.isEmpty()) {
-                imageFilter = imageCandidate;
-                log.info("Parsed Docker scheduled path '{}' as image='{}' (remote has {} tags), will sync all tags from remote",
-                    normalizedPath, imageFilter, fullPathTags.size());
-              }
-              else {
-                // Step 1b: Check if path is a directory prefix with sub-images
-                Map<String, List<String>> prefixImages = listDockerImagesByPrefixRemote(repo, imageCandidate);
-                if (!prefixImages.isEmpty()) {
-                  prefixFilter = imageCandidate;
-                  log.info("Parsed Docker scheduled path '{}' as directory prefix (found {} sub-images), will sync all sub-images from remote",
-                      normalizedPath, prefixImages.size());
+              Map<String, List<String>> prefixImages = listDockerImagesByPrefix(repoName, normalizedPath);
+              if (!prefixImages.isEmpty()) {
+                if (prefixImages.size() == 1 && prefixImages.containsKey(normalizedPath)) {
+                  // Only one match and it's the exact path -> single image with tags
+                  imageFilter = normalizedPath;
+                  log.info("Parsed Docker scheduled path '{}' as image='{}' (found {} tags), will sync all tags from remote",
+                      normalizedPath, imageFilter, prefixImages.get(normalizedPath).size());
                 }
                 else {
-                  // Step 1c: Check if parent image has the tag
-                  List<String> parentTags = listDockerTagsRemote(repo, parentImage);
-                  if (parentTags.contains(tagCandidate)) {
-                    imageFilter = parentImage;
-                    tagFilter = tagCandidate;
-                    log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}' (verified tag exists in remote)",
-                        normalizedPath, imageFilter, tagFilter);
-                  }
-                  else {
-                    // Step 1d: Remote can't verify - use isDirectory flag
-                    if (request.isDirectory()) {
-                      prefixFilter = imageCandidate;
-                      log.info("Parsed Docker scheduled path '{}' as directory prefix (isDirectory=true, remote unverified)",
-                          normalizedPath);
-                    }
-                    else {
-                      imageFilter = parentImage;
-                      tagFilter = tagCandidate;
-                      log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}' (isDirectory=false, remote unverified)",
-                          normalizedPath, imageFilter, tagFilter);
-                    }
-                  }
+                  // Multiple sub-images or the path is a directory prefix
+                  prefixFilter = normalizedPath;
+                  log.info("Parsed Docker scheduled path '{}' as directory prefix (found {} images), will sync all from remote",
+                      normalizedPath, prefixImages.size());
                 }
+              }
+              else {
+                // No images found for the full path - try splitting as image:tag
+                imageFilter = normalizedPath.substring(0, lastSlash);
+                tagFilter = normalizedPath.substring(lastSlash + 1);
+                log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}' (no images found for full path)",
+                    normalizedPath, imageFilter, tagFilter);
               }
             }
             else {
@@ -1525,19 +1572,9 @@ public class DockerService {
       }
       else if (prefixFilter != null) {
         // Directory prefix mode: list all images under the prefix
-        Map<String, List<String>> prefixImages = listDockerImagesByPrefixRemote(repo, prefixFilter);
-        for (Map.Entry<String, List<String>> entry : prefixImages.entrySet()) {
-          if (!entry.getValue().isEmpty()) {
-            imageTagsMap.put(entry.getKey(), entry.getValue());
-          }
-          else {
-            // Try to get tags from remote for each sub-image
-            List<String> tags = listDockerTagsRemote(repo, entry.getKey());
-            if (!tags.isEmpty()) {
-              imageTagsMap.put(entry.getKey(), tags);
-            }
-          }
-        }
+        // Uses the same image discovery logic as promotion (listDockerImages + prefix filtering)
+        Map<String, List<String>> prefixImages = listDockerImagesByPrefix(repoName, prefixFilter);
+        imageTagsMap.putAll(prefixImages);
         log.info("Docker scheduled sync: found {} images under prefix '{}' in {}", imageTagsMap.size(), prefixFilter, repoName);
       }
       else if (imageFilter != null) {
@@ -1740,7 +1777,8 @@ public class DockerService {
             }
           } else if (request.isPrefixMode()) {
             // Directory prefix mode: sync all images under the given prefix
-            Map<String, List<String>> prefixImages = listDockerImagesByPrefixRemote(repo, request.getImagePrefix());
+            // Uses the same image discovery logic as promotion (listDockerImages + prefix filtering)
+            Map<String, List<String>> prefixImages = listDockerImagesByPrefix(request.getSourceRepository(), request.getImagePrefix());
             log.info("Docker sync (prefix mode): found {} images under prefix '{}' in {}",
                 prefixImages.size(), request.getImagePrefix(), request.getSourceRepository());
 
@@ -2068,112 +2106,6 @@ public class DockerService {
       log.debug("Failed to read manifest from cache for {}/{}: {}", repo.getName(), manifestPath, e.getMessage());
     }
     return null;
-  }
-
-  /**
-   * List Docker images from remote repository that start with the given prefix.
-   * For example, prefix "project8.3.2.891" might find images like:
-   *   project8.3.2.891/app1, project8.3.2.891/app2, etc.
-   * Returns a map of imageName -> list of tags.
-   */
-  private Map<String, List<String>> listDockerImagesByPrefixRemote(final Repository repo, final String prefix) {
-    Map<String, List<String>> result = new LinkedHashMap<>();
-    try {
-      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
-      if (config == null || config.getAttributes() == null || !config.getAttributes().containsKey("proxy")) {
-        return result;
-      }
-
-      @SuppressWarnings("unchecked")
-      Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
-      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
-      if (remoteUrl == null || remoteUrl.isEmpty()) return result;
-
-      int repoIdx = remoteUrl.indexOf("/repository/");
-      if (repoIdx <= 0) return result;
-
-      String remoteBaseUrl = remoteUrl.substring(0, repoIdx);
-      String repoPart = remoteUrl.substring(repoIdx + "/repository/".length());
-      if (repoPart.endsWith("/")) repoPart = repoPart.substring(0, repoPart.length() - 1);
-      int slashIdx = repoPart.indexOf('/');
-      String remoteRepoName = (slashIdx > 0) ? repoPart.substring(0, slashIdx) : repoPart;
-
-      String[] repoAuth = extractAuthFromRepo(repo);
-      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
-          ? repoAuth[0] + ":" + repoAuth[1] : null;
-
-      // Use Nexus Search API with group prefix filter
-      String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName
-          + "&format=docker&group=" + java.net.URLEncoder.encode("v2/" + prefix, "UTF-8");
-      String continuationToken = null;
-
-      do {
-        String searchUrl = searchUrlBase;
-        if (continuationToken != null) {
-          searchUrl += "&continuationToken=" + continuationToken;
-        }
-
-        HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
-        conn.setRequestMethod("GET");
-        conn.setConnectTimeout(15_000);
-        conn.setReadTimeout(60_000);
-        conn.setRequestProperty("Accept", "application/json");
-
-        if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
-        }
-
-        int code = conn.getResponseCode();
-        if (code != 200) {
-          conn.disconnect();
-          break;
-        }
-
-        String json = readResponse(conn);
-        // Parse manifests from search results to find images with the prefix
-        String itemsSection = extractJsonArray(json, "items");
-        if (itemsSection != null) {
-          int pos = 0;
-          while (pos < itemsSection.length()) {
-            int objStart = itemsSection.indexOf('{', pos);
-            if (objStart < 0) break;
-            int objEnd = findMatchingBrace(itemsSection, objStart);
-            if (objEnd < 0) break;
-
-            String item = itemsSection.substring(objStart, objEnd + 1);
-            String path = extractJsonValue(item, "path");
-
-            if (path != null) {
-              String normalizedPath = path.startsWith("/") ? path.substring(1) : path;
-              if (normalizedPath.startsWith("v2/") && normalizedPath.contains("/manifests/")) {
-                int manifestsIdx = normalizedPath.indexOf("/manifests/");
-                String imagePart = normalizedPath.substring(3, manifestsIdx);
-                String tag = normalizedPath.substring(manifestsIdx + "/manifests/".length());
-
-                // Only include images that start with the prefix
-                if (imagePart.startsWith(prefix + "/") && !tag.isEmpty() && !tag.endsWith("/")) {
-                  result.computeIfAbsent(imagePart, k -> new ArrayList<>());
-                  if (!result.get(imagePart).contains(tag)) {
-                    result.get(imagePart).add(tag);
-                  }
-                }
-              }
-            }
-
-            pos = objEnd + 1;
-          }
-        }
-
-        continuationToken = extractJsonValue(json, "continuationToken");
-      }
-      while (continuationToken != null && !continuationToken.isEmpty());
-
-      log.info("Found {} images under prefix '{}' via remote Nexus Search API", result.size(), prefix);
-    }
-    catch (Exception e) {
-      log.info("Remote prefix search failed for '{}': {}", prefix, e.getMessage());
-    }
-    return result;
   }
 
   /**
