@@ -43,6 +43,7 @@ import com.google.common.collect.ImmutableList;
 import com.nexus.artifacts.promotion.model.FilePreviewResponse;
 import com.nexus.artifacts.promotion.model.PromotionRequest;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
+import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TargetRepositoryList;
 import com.nexus.artifacts.promotion.model.TaskStatus;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
@@ -289,7 +290,57 @@ public class PromotionService {
         }
       }
     }, String.format("Promote %s from %s to %s", request.getPath(),
-        request.getSourceRepository(), request.getTargetRepository()), taskId);
+        request.getSourceRepository(), request.getTargetRepository()), taskId, username);
+  }
+
+  /**
+   * Get all promotion tasks as SyncTaskInfo for unified task queue display.
+   */
+  public List<SyncTaskInfo> getAllPromotionTasksAsSyncTaskInfo() {
+    cleanupExpiredTaskResults();
+    List<SyncTaskInfo> tasks = new ArrayList<>();
+
+    // Get tasks from taskResults map (completed/failed)
+    for (Map.Entry<String, PromotionTaskResult> entry : taskResults.entrySet()) {
+      PromotionTaskResult result = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(result.getTaskId());
+      info.setTaskType("promotion");
+      info.setSourceRepository(result.getSourceRepository());
+      info.setTargetRepository(result.getTargetRepository());
+      info.setStatus(TaskStatus.fromValue(result.getStatus()));
+      info.setStartTime(result.getStartTime());
+      info.setEndTime(result.getEndTime());
+      info.setUsername(result.getUsername());
+      info.setErrorMessage(result.getErrorMessage());
+      if (result.getItems() != null) {
+        info.setResult(result.getItems().size() + " items");
+      }
+      tasks.add(info);
+    }
+
+    // Get running tasks from TaskExecutorService
+    Map<String, TaskExecutorService.TaskHandle> promoTasks = taskExecutor.getPromotionTasks();
+    for (Map.Entry<String, TaskExecutorService.TaskHandle> entry : promoTasks.entrySet()) {
+      String taskId = entry.getKey();
+      // Skip if already in taskResults
+      if (taskResults.containsKey(taskId)) continue;
+
+      TaskExecutorService.TaskHandle handle = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(handle.taskId);
+      info.setTaskType("promotion");
+      info.setSourceRepository(handle.sourceRepository);
+      info.setTargetRepository(handle.targetRepository);
+      info.setPath(handle.sourcePath);
+      info.setStatus(handle.status);
+      info.setStartTime(handle.startTime);
+      info.setEndTime(handle.endTime);
+      info.setUsername(handle.username);
+      tasks.add(info);
+    }
+
+    return tasks;
   }
 
   /**
@@ -907,31 +958,53 @@ public class PromotionService {
       String encodedPrefix = pathPrefix.replace("%", "%25").replace("+", "%2B")
           .replace(" ", "%20").replace("/", "%2F");
 
-      String searchUrlStr = nexusBaseUrl + "/service/rest/v1/search?repository=" +
-          repository + "&name=" + encodedPrefix + "*";
+      // Paginate through all results using continuationToken
+      String continuationToken = null;
+      int maxPages = 100; // Safety limit
+      int pageCount = 0;
 
-      URL url = new URL(searchUrlStr);
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(30_000);
-      conn.setReadTimeout(60_000);
-      conn.setRequestProperty("Accept", "application/json");
+      while (pageCount < maxPages) {
+        pageCount++;
+        String searchUrlStr = nexusBaseUrl + "/service/rest/v1/search?repository=" +
+            repository + "&name=" + encodedPrefix + "*";
+        if (continuationToken != null) {
+          searchUrlStr += "&continuationToken=" + continuationToken;
+        }
 
-      int code = conn.getResponseCode();
-      if (code == 403 || code == 401) {
-        log.debug("Search API returned {} for {}/{}, may need authentication", code, repository, pathPrefix);
+        URL url = new URL(searchUrlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        int code = conn.getResponseCode();
+        if (code == 403 || code == 401) {
+          log.debug("Search API returned {} for {}/{}, may need authentication", code, repository, pathPrefix);
+          conn.disconnect();
+          break;
+        }
+        if (code == 200) {
+          String json = readStream(conn.getInputStream());
+          List<String> pageResults = parseSearchItems(json, pathPrefix);
+          results.addAll(pageResults);
+
+          // Check for continuationToken in the response
+          continuationToken = parseContinuationToken(json);
+          if (continuationToken == null || continuationToken.isEmpty()) {
+            // No more pages
+            break;
+          }
+        } else {
+          break;
+        }
         conn.disconnect();
-        return results;
       }
-      if (code == 200) {
-        String json = readStream(conn.getInputStream());
-        results = parseSearchItems(json, pathPrefix);
-        log.debug("Search API found {} items for {}/{}", results.size(), repository, pathPrefix);
-      }
-      conn.disconnect();
+
+      log.debug("Search API found {} total items for {}/{} ({} pages)", results.size(), repository, pathPrefix, pageCount);
     }
     catch (Exception e) {
-      log.warn("Search API call failed for {}/{}, returning empty: {}", repository, pathPrefix, e.getMessage());
+      log.warn("Search API call failed for {}/{}, returning partial results: {}", repository, pathPrefix, e.getMessage());
     }
     return results;
   }
@@ -943,26 +1016,81 @@ public class PromotionService {
                                          final String nexusBaseUrl) throws IOException {
     List<String> results = new ArrayList<>();
     try {
-      String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository;
-      URL url = new URL(urlStr);
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(30_000);
-      conn.setReadTimeout(120_000);
-      conn.setRequestProperty("Accept", "application/json");
+      // Paginate through all results using continuationToken
+      String continuationToken = null;
+      int maxPages = 100;
+      int pageCount = 0;
 
-      int code = conn.getResponseCode();
-      if (code == 200) {
-        String json = readStream(conn.getInputStream());
-        results = parseComponentAssets(json, pathPrefix);
-        log.debug("Components API found {} items for {}/{}", results.size(), repository, pathPrefix);
+      while (pageCount < maxPages) {
+        pageCount++;
+        String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository;
+        if (continuationToken != null) {
+          urlStr += "&continuationToken=" + continuationToken;
+        }
+
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(120_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        int code = conn.getResponseCode();
+        if (code == 200) {
+          String json = readStream(conn.getInputStream());
+          List<String> pageResults = parseComponentAssets(json, pathPrefix);
+          results.addAll(pageResults);
+
+          continuationToken = parseContinuationToken(json);
+          if (continuationToken == null || continuationToken.isEmpty()) {
+            break;
+          }
+        } else {
+          break;
+        }
+        conn.disconnect();
       }
-      conn.disconnect();
+
+      log.debug("Components API found {} total items for {}/{} ({} pages)", results.size(), repository, pathPrefix, pageCount);
     }
     catch (Exception e) {
       log.warn("Components API call failed for {}/{}: {}", repository, pathPrefix, e.getMessage());
     }
     return results;
+  }
+
+  /**
+   * Parse continuationToken from Nexus API JSON response.
+   * Nexus REST API uses continuationToken for pagination.
+   */
+  private String parseContinuationToken(final String json) {
+    if (json == null || json.isEmpty()) return null;
+    try {
+      // Find "continuationToken" field in JSON
+      String key = "\"continuationToken\"";
+      int idx = json.indexOf(key);
+      if (idx < 0) return null;
+      // Find the colon after the key
+      int colonIdx = json.indexOf(':', idx + key.length());
+      if (colonIdx < 0) return null;
+      // Find the value (could be null or a string)
+      int valueStart = colonIdx + 1;
+      // Skip whitespace
+      while (valueStart < json.length() && json.charAt(valueStart) == ' ') valueStart++;
+      if (valueStart >= json.length()) return null;
+      // Check for null
+      if (json.startsWith("null", valueStart)) return null;
+      // Parse string value
+      if (json.charAt(valueStart) != '"') return null;
+      valueStart++;
+      int valueEnd = json.indexOf('"', valueStart);
+      if (valueEnd < 0) return null;
+      String token = json.substring(valueStart, valueEnd);
+      return token.isEmpty() ? null : token;
+    }
+    catch (Exception e) {
+      return null;
+    }
   }
 
   /**

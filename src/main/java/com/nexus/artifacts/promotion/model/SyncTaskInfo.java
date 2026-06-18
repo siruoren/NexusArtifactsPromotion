@@ -12,6 +12,7 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 public class SyncTaskInfo {
 
   private String taskId;
+  private String taskType; // "sync" or "promotion"
   private String sourceRepository;
   private String targetRepository;
   private String path;
@@ -32,6 +33,9 @@ public class SyncTaskInfo {
 
   public String getTaskId() { return taskId; }
   public void setTaskId(String taskId) { this.taskId = taskId; }
+
+  public String getTaskType() { return taskType; }
+  public void setTaskType(String taskType) { this.taskType = taskType; }
 
   public String getSourceRepository() { return sourceRepository; }
   public void setSourceRepository(String sourceRepository) { this.sourceRepository = sourceRepository; }

@@ -375,7 +375,7 @@ public class SyncService {
         }
       }
     }, String.format("Sync %s from %s", request.getPath(), request.getRepositoryName()),
-        request.getRepositoryName(), request.getPath(), preTaskId);
+        request.getRepositoryName(), request.getPath(), preTaskId, username);
 
     // Create initial task info record
     SyncTaskInfo initialInfo = new SyncTaskInfo();
@@ -532,6 +532,9 @@ public class SyncService {
     List<SyncTaskInfo> tasks = new ArrayList<>();
     for (Map.Entry<String, SyncTaskInfo> entry : taskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
+      if (info.getTaskType() == null) {
+        info.setTaskType("sync");
+      }
       TaskStatus status = taskExecutor.getSyncTaskStatus(entry.getKey());
       if (status != null) {
         info.setStatus(status);

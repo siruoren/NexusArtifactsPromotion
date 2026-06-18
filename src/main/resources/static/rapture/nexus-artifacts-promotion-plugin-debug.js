@@ -92,11 +92,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.progress.failed": "Sync Failed",
     "sync.progress.pending": "Pending",
 
-    "sync.queue.page.title": "Sync Queue",
-    "sync.queue.page.loginRequired": "Please log in to view sync queue.",
-    "sync.queue.page.loading": "Loading sync tasks...",
-    "sync.queue.page.noTasks": "No sync tasks found.",
-    "sync.queue.page.loadFailed": "Failed to load sync tasks:",
+    "sync.queue.page.title": "Task Queue",
+    "sync.queue.page.loginRequired": "Please log in to view task queue.",
+    "sync.queue.page.loading": "Loading tasks...",
+    "sync.queue.page.noTasks": "No tasks found.",
+    "sync.queue.page.loadFailed": "Failed to load tasks:",
     "sync.queue.table.queueId": "Queue ID",
     "sync.queue.table.sourceRepository": "Source Repository",
     "sync.queue.table.targetRepository": "Target Repository",
@@ -122,6 +122,15 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.status.cancelled": "Cancelled",
     "sync.queue.status.completed": "Completed",
     "sync.queue.table.duration": "Duration (min)",
+    "sync.queue.table.taskType": "Type",
+    "sync.queue.table.terminate": "Terminate",
+    "sync.queue.table.terminateConfirm": "Are you sure you want to terminate this task?",
+    "sync.queue.table.terminateSuccess": "Task terminated successfully",
+    "sync.queue.table.terminateFailed": "Failed to terminate task",
+    "sync.queue.table.terminateNoPermission": "No permission to terminate this task",
+    "sync.queue.taskType.sync": "Sync",
+    "sync.queue.taskType.promotion": "Promotion",
+    "sync.queue.filter.taskType": "Type",
     "sync.queue.config.title": "Queue Configuration",
     "sync.queue.config.maxSyncQueueSize": "Max Sync Queue Size",
     "sync.queue.config.syncPoolSize": "Sync Pool Size",
@@ -217,11 +226,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.progress.failed": "\u540c\u6b65\u5931\u8d25",
     "sync.progress.pending": "\u7b49\u5f85\u4e2d",
 
-    "sync.queue.page.title": "\u540c\u6b65\u961f\u5217",
-    "sync.queue.page.loginRequired": "\u8bf7\u767b\u5f55\u540e\u67e5\u770b\u540c\u6b65\u961f\u5217\u3002",
-    "sync.queue.page.loading": "\u52a0\u8f7d\u540c\u6b65\u4efb\u52a1\u4e2d...",
-    "sync.queue.page.noTasks": "\u6682\u65e0\u540c\u6b65\u4efb\u52a1\u3002",
-    "sync.queue.page.loadFailed": "\u52a0\u8f7d\u540c\u6b65\u4efb\u52a1\u5931\u8d25\uff1a",
+    "sync.queue.page.title": "\u4efb\u52a1\u961f\u5217",
+    "sync.queue.page.loginRequired": "\u8bf7\u767b\u5f55\u540e\u67e5\u770b\u4efb\u52a1\u961f\u5217\u3002",
+    "sync.queue.page.loading": "\u52a0\u8f7d\u4efb\u52a1\u4e2d...",
+    "sync.queue.page.noTasks": "\u6682\u65e0\u4efb\u52a1\u3002",
+    "sync.queue.page.loadFailed": "\u52a0\u8f7d\u4efb\u52a1\u5931\u8d25\uff1a",
     "sync.queue.table.queueId": "\u961f\u5217ID",
     "sync.queue.table.sourceRepository": "\u6e90\u4ed3\u5e93",
     "sync.queue.table.targetRepository": "\u76ee\u6807\u4ed3\u5e93",
@@ -247,6 +256,15 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.status.cancelled": "\u53d6\u6d88",
     "sync.queue.status.completed": "\u5b8c\u6210",
     "sync.queue.table.duration": "\u8017\u65f6\uff08\u5206\u949f\uff09",
+    "sync.queue.table.taskType": "\u7c7b\u578b",
+    "sync.queue.table.terminate": "\u7ec8\u6b62",
+    "sync.queue.table.terminateConfirm": "\u786e\u5b9a\u8981\u7ec8\u6b62\u8be5\u4efb\u52a1\u5417\uff1f",
+    "sync.queue.table.terminateSuccess": "\u4efb\u52a1\u5df2\u7ec8\u6b62",
+    "sync.queue.table.terminateFailed": "\u7ec8\u6b62\u4efb\u52a1\u5931\u8d25",
+    "sync.queue.table.terminateNoPermission": "\u65e0\u6743\u7ec8\u6b62\u8be5\u4efb\u52a1",
+    "sync.queue.taskType.sync": "\u540c\u6b65",
+    "sync.queue.taskType.promotion": "\u664b\u7ea7",
+    "sync.queue.filter.taskType": "\u7c7b\u578b",
     "sync.queue.config.title": "\u961f\u5217\u914d\u7f6e",
     "sync.queue.config.maxSyncQueueSize": "\u6700\u5927\u540c\u6b65\u961f\u5217\u6570",
     "sync.queue.config.syncPoolSize": "\u540c\u6b65\u7ebf\u7a0b\u6c60\u5927\u5c0f",
@@ -530,7 +548,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     var me = this;
 
     me.allDataStore = Ext.create('Ext.data.Store', {
-      fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+      fields: ['taskId', 'taskType', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
         'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
       proxy: {
         type: 'ajax',
@@ -547,7 +565,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     });
 
     me.store = Ext.create('Ext.data.Store', {
-      fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+      fields: ['taskId', 'taskType', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
         'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
       pageSize: 20,
       proxy: {
@@ -617,13 +635,42 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
           store: me.store,
           columns: [
             { text: _t('sync.queue.table.queueId'), dataIndex: 'taskId', width: 180, renderer: tipRenderer },
+            { text: _t('sync.queue.table.taskType'), dataIndex: 'taskType', width: 80, renderer: function(v) {
+              if (v === 'promotion') return '<span style="color:#e67e22;font-weight:bold;">' + _t('sync.queue.taskType.promotion') + '</span>';
+              if (v === 'sync') return '<span style="color:#3498db;font-weight:bold;">' + _t('sync.queue.taskType.sync') + '</span>';
+              return v || '-';
+            }},
             { text: _t('sync.queue.table.sourceRepository'), dataIndex: 'sourceRepository', flex: 1, renderer: tipRenderer },
             { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1, renderer: tipRenderer },
             { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100, renderer: tipStatusRenderer },
             { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150, renderer: tipTimeRenderer },
             { text: _t('sync.queue.table.duration'), dataIndex: 'endTime', width: 100, renderer: durationRenderer },
             { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100, renderer: tipRenderer },
-            { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1, renderer: tipRenderer }
+            { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1, renderer: tipRenderer },
+            {
+              text: _t('sync.queue.table.terminate'),
+              width: 80,
+              align: 'center',
+              sortable: false,
+              renderer: function(value, metaData, record) {
+                var status = record.get('status');
+                var taskId = record.get('taskId');
+                var taskUsername = record.get('username');
+                var canTerminate = (status === 'running' || status === 'RUNNING' || status === 'pending' || status === 'PENDING');
+                var isOwner = (me.currentUser && me.currentUser.username === taskUsername);
+                var isAdmin = (me.currentUser && me.currentUser.isAdmin);
+                var hasPermission = isOwner || isAdmin;
+
+                if (canTerminate && hasPermission) {
+                  return '<button class="terminate-btn" data-taskid="' + Ext.htmlEncode(taskId) +
+                    '" style="background:#e74c3c;color:white;border:none;border-radius:3px;padding:3px 10px;cursor:pointer;font-size:12px;">' +
+                    _t('sync.queue.table.terminate') + '</button>';
+                } else {
+                  return '<button disabled style="background:#ccc;color:#999;border:none;border-radius:3px;padding:3px 10px;cursor:not-allowed;font-size:12px;">' +
+                    _t('sync.queue.table.terminate') + '</button>';
+                }
+              }
+            }
           ],
           tbar: [
             {
@@ -635,6 +682,21 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
                 specialkey: function (field, e) {
                   if (e.getKey() === e.ENTER) me.applyFilters();
                 }
+              }
+            },
+            {
+              xtype: 'combobox',
+              itemId: 'filterTaskType',
+              emptyText: _t('sync.queue.filter.taskType'),
+              width: 100,
+              editable: false,
+              store: [
+                ['', _t('sync.queue.filter.all')],
+                ['sync', _t('sync.queue.taskType.sync')],
+                ['promotion', _t('sync.queue.taskType.promotion')]
+              ],
+              listeners: {
+                select: function () { me.applyFilters(); }
               }
             },
             {
@@ -739,6 +801,58 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
 
     me.callParent(arguments);
 
+    // Load current user info for permission checks
+    me.currentUser = null;
+    Ext.Ajax.request({
+      url: '/service/rest/v1/sync/queue/currentUser',
+      method: 'GET',
+      success: function(response) {
+        try {
+          me.currentUser = Ext.decode(response.responseText);
+        } catch(e) {}
+      }
+    });
+  },
+
+  afterRender: function() {
+    this.callParent(arguments);
+    var me = this;
+
+    // Handle terminate button clicks via event delegation
+    // Must be in afterRender because getEl() is only available after rendering
+    me.getEl().on('click', function(e, t) {
+      var btn = Ext.fly(t).down('.terminate-btn');
+      if (!btn) btn = Ext.fly(t);
+      if (!btn || !btn.dom) return;
+      var taskId = btn.getAttribute('data-taskid');
+      if (!taskId) return;
+
+      Ext.Msg.confirm(_t('sync.queue.table.terminate'), _t('sync.queue.table.terminateConfirm'), function(btnId) {
+        if (btnId === 'yes') {
+          Ext.Ajax.request({
+            url: '/service/rest/v1/sync/queue/terminate/' + encodeURIComponent(taskId),
+            method: 'POST',
+            success: function(response) {
+              Ext.Msg.alert(_t('sync.queue.table.terminate'), _t('sync.queue.table.terminateSuccess'));
+              me.allDataStore.reload();
+            },
+            failure: function(response) {
+              var msg = _t('sync.queue.table.terminateFailed');
+              try {
+                var result = Ext.decode(response.responseText);
+                if (result.error === 'Permission denied') {
+                  msg = _t('sync.queue.table.terminateNoPermission');
+                } else if (result.message) {
+                  msg = result.message;
+                }
+              } catch(e) {}
+              Ext.Msg.alert(_t('sync.queue.table.terminate'), msg);
+            }
+          });
+        }
+      });
+    }, null, { delegate: '.terminate-btn' });
+
     me._queuePollInterval = setInterval(function () {
       if (!me.destroyed) {
         me.allDataStore.reload();
@@ -751,6 +865,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
   applyFilters: function () {
     var me = this;
     var taskIdFilter = (me.down('#filterTaskId') || {}).value || '';
+    var taskTypeFilter = (me.down('#filterTaskType') || {}).value || '';
     var repoFilter = (me.down('#filterRepository') || {}).value || '';
     var pathFilter = (me.down('#filterPath') || {}).value || '';
     var statusFilter = (me.down('#filterStatus') || {}).value || '';
@@ -765,6 +880,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     var filtered = [];
     me.allDataStore.each(function (rec) {
       if (taskIdFilter && (rec.get('taskId') || '').toLowerCase().indexOf(taskIdFilter) === -1) return;
+      if (taskTypeFilter && (rec.get('taskType') || '').toLowerCase() !== taskTypeFilter.toLowerCase()) return;
       if (repoFilter && (rec.get('sourceRepository') || '').toLowerCase().indexOf(repoFilter) === -1 &&
           (rec.get('targetRepository') || '').toLowerCase().indexOf(repoFilter) === -1) return;
       if (pathFilter && (rec.get('path') || '').toLowerCase().indexOf(pathFilter) === -1) return;
@@ -1560,7 +1676,58 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       })() : []
     });
 
-    var totalFiles = fileStore.getCount();
+    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    var statusMap = {};
+    if (preview && preview.files) {
+      Ext.each(preview.files, function (f) {
+        if (f.path) { statusMap[f.path] = 'pending'; }
+      });
+    }
+
+    // Helper: iterate ALL records in store (not just current page)
+    // In ExtJS 6 with memory proxy + enablePaging, getData().items only has current page.
+    // Use getData().getSource() to get all Model instances across pages.
+    function eachAllRecords(s, fn) {
+      var allItems = [];
+      // Try getSource() first (ExtJS 6 paging collection - returns Model instances)
+      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
+        var source = s.getData().getSource();
+        allItems = source.items || source;
+      }
+      // Fallback to getData().items (current page only, but they are Model instances)
+      else if (s.getData && s.getData().items) {
+        allItems = s.getData().items;
+      }
+      else if (s.data && s.data.items) {
+        allItems = s.data.items;
+      }
+      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
+      for (var i = 0; i < allItems.length; i++) {
+        if (fn(allItems[i], i) === false) break;
+      }
+    }
+
+    // Helper: find record index across ALL pages
+    function findAllIndex(s, prop, val) {
+      var allItems = [];
+      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
+        var source = s.getData().getSource();
+        allItems = source.items || source;
+      }
+      else if (s.getData && s.getData().items) {
+        allItems = s.getData().items;
+      }
+      else if (s.data && s.data.items) {
+        allItems = s.data.items;
+      }
+      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
+      for (var i = 0; i < allItems.length; i++) {
+        if (allItems[i].get(prop) === val) return i;
+      }
+      return -1;
+    }
+
+    var totalFiles = Object.keys(statusMap).length || fileStore.getTotalCount() || fileStore.getCount();
 
     var statusRenderer = function (val) {
       switch (val) {
@@ -1722,7 +1889,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               });
 
               // Start polling for task status
-              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles);
+              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles, statusMap, eachAllRecords, findAllIndex);
             })
             .catch(function (err) {
               promoteBtn.setText(_t('promotion.modal.promote'));
@@ -1745,7 +1912,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     win.show();
   },
 
-  startPollingInWindow: function (win, taskId, fileList, totalFiles) {
+  startPollingInWindow: function (win, taskId, fileList, totalFiles, statusMap, eachAllRecords, findAllIndex) {
     var isFinished = false;
     var pollCount = 0;
     var MAX_POLLS = 400; // ~10 minutes at 1.5s interval
@@ -1769,10 +1936,29 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (grid && !grid.destroyed) {
         var store = grid.getStore();
         var taskFailed = (result.status === 'FAILED');
-        store.each(function (rec) {
+        // Check if all items were processed by backend
+        var backendProcessedCount = 0;
+        if (statusMap) {
+          for (var bk in statusMap) {
+            if (statusMap[bk] === 'success' || statusMap[bk] === 'failed' || statusMap[bk] === 'skipped') {
+              backendProcessedCount++;
+            }
+          }
+        }
+        var hasUnprocessed = (backendProcessedCount < totalFiles);
+        // Update statusMap for all remaining pending items
+        if (statusMap) {
+          for (var p in statusMap) {
+            if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped') {
+              statusMap[p] = (taskFailed || hasUnprocessed) ? 'failed' : 'success';
+            }
+          }
+        }
+        // Update ALL store records (not just current page)
+        eachAllRecords(store, function (rec) {
           var st = rec.get('status');
           if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
-            rec.set('status', taskFailed ? 'failed' : 'success');
+            rec.set('status', (taskFailed || hasUnprocessed) ? 'failed' : 'success');
           }
         });
       }
@@ -1782,16 +1968,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         progressBar.setValue(1);
         var total = backendTotalCount || totalFiles;
         var done = backendDoneCount;
-        // Fallback: if no backend counts, count from store
-        if (!done) {
-          var gridStore = grid ? grid.getStore() : null;
-          total = gridStore ? gridStore.getCount() : totalFiles;
-          if (gridStore) {
-            gridStore.each(function (rec) {
-              var s = rec.get('status');
-              if (s === 'success' || s === 'failed' || s === 'skipped') done++;
-            });
+        // Fallback: if no backend counts, count from statusMap
+        if (!done && statusMap) {
+          done = 0;
+          for (var k in statusMap) {
+            var sv = statusMap[k];
+            if (sv === 'success' || sv === 'failed' || sv === 'skipped') done++;
           }
+          total = total || Object.keys(statusMap).length;
         }
         progressBar.updateText(_t('promotion.progress.completed', done, total));
       }
@@ -1851,41 +2035,60 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         var statusStr = (result.status || '').toLowerCase();
         var backendItems = result.items || [];
         var backendItemCount = backendItems.length;
-        var currentTotal = Math.max(store.getCount(), totalFiles);
+        var currentTotal = totalFiles;
+
+        // Update statusMap from backend results first (works across all pages)
+        for (var i = 0; i < backendItems.length; i++) {
+          var item = backendItems[i];
+          if (!item.path) continue;
+          var itemStatus = item.status;
+          if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
+            itemStatus = 'success';
+          }
+          statusMap[item.path] = itemStatus;
+        }
+
+        // Sync ALL store records from statusMap
+        eachAllRecords(store, function (rec) {
+          var recPath = rec.get('path');
+          if (statusMap[recPath] && statusMap[recPath] !== rec.get('status')) {
+            rec.set('status', statusMap[recPath]);
+          }
+        });
 
         if (statusStr === 'completed' || statusStr === 'failed') {
             var taskFailed = (statusStr === 'failed');
 
-            // Update store items from backend results
-            for (var i = 0; i < backendItems.length; i++) {
-              var item = backendItems[i];
-              if (!item.path) continue;
-              var idx = store.findExact('path', item.path);
-              // Fallback: try matching Docker image:tag format
-              if (idx < 0) {
-                idx = findDockerPathIndex(store, item.path);
+            // Mark any remaining pending/processing items in statusMap
+            // If backend processed fewer items than total, remaining items were NOT promoted
+            var backendProcessedCount = 0;
+            for (var bk in statusMap) {
+              if (statusMap[bk] === 'success' || statusMap[bk] === 'failed' || statusMap[bk] === 'skipped') {
+                backendProcessedCount++;
               }
-              if (idx >= 0) {
-                var itemStatus = item.status;
-                if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
-                  itemStatus = 'success';
-                }
-                store.getAt(idx).set('status', itemStatus);
+            }
+            var hasUnprocessed = (backendProcessedCount < currentTotal);
+
+            for (var p in statusMap) {
+              if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped') {
+                // If task failed or there are unprocessed items, mark remaining as failed
+                // Only mark as success if task completed AND all items were processed
+                statusMap[p] = (taskFailed || hasUnprocessed) ? 'failed' : 'success';
               }
             }
 
-            // Mark any remaining pending/processing items
-            store.each(function (rec) {
+            // Sync ALL store records from statusMap
+            eachAllRecords(store, function (rec) {
               var st = rec.get('status');
               if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
-                rec.set('status', taskFailed ? 'failed' : 'success');
+                rec.set('status', (taskFailed || hasUnprocessed) ? 'failed' : 'success');
               }
             });
 
-            // Set progress bar directly here - use backend count
-            var doneCount = backendItemCount > 0 ? backendItemCount : store.getCount();
+            // Set progress bar - use backend count
+            var doneCount = backendItemCount > 0 ? backendItemCount : Object.keys(statusMap).length;
             progressBar.setValue(1);
-            progressBar.updateText('已完成:' + doneCount + '/' + currentTotal);
+            progressBar.updateText(_t('promotion.progress.completed', doneCount, currentTotal));
 
             // Update window title
             if (taskFailed) {
@@ -1902,27 +2105,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             return;
           }
 
-        // Task is still running - update progress from backend items
-        for (var j = 0; j < backendItems.length; j++) {
-          var bi = backendItems[j];
-          if (!bi.path) continue;
-          var bidx = store.findExact('path', bi.path);
-          // Fallback: try matching Docker image:tag format
-          if (bidx < 0) {
-            bidx = findDockerPathIndex(store, bi.path);
-          }
-          if (bidx >= 0) {
-            var biStatus = bi.status;
-            if (biStatus !== 'failed' && biStatus !== 'skipped' && biStatus !== 'success') {
-              biStatus = 'success';
-            }
-            store.getAt(bidx).set('status', biStatus);
-          }
-        }
-
-        // Mark first pending item as processing
+        // Task is still running - mark first pending item as processing
         var hasProcessing = false;
-        store.each(function (rec) {
+        eachAllRecords(store, function (rec) {
           var rs = rec.get('status');
           if (!hasProcessing && rs !== 'success' && rs !== 'failed' && rs !== 'skipped') {
             rec.set('status', 'processing');
@@ -1930,12 +2115,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           }
         });
 
-        // Count and update progress bar
+        // Count and update progress bar from statusMap (all pages)
         var processedCount = 0;
-        store.each(function (rec) {
-          var st = rec.get('status');
-          if (st === 'success' || st === 'failed' || st === 'skipped') { processedCount++; }
-        });
+        for (var k in statusMap) {
+          var sv = statusMap[k];
+          if (sv === 'success' || sv === 'failed' || sv === 'skipped') { processedCount++; }
+        }
 
         var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
         progressBar.setValue(pct);
@@ -2085,7 +2270,59 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       data: dockerFiles || []
     });
 
-    var totalFiles = fileStore.getCount();
+    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    var dockerStatusMap = {};
+    if (dockerFiles) {
+      Ext.each(dockerFiles, function (f) {
+        var key = f.originalPath || f.path;
+        if (key) { dockerStatusMap[key] = 'pending'; }
+      });
+    }
+
+    // Helper: iterate ALL records in store (not just current page)
+    // In ExtJS 6 with memory proxy + enablePaging, getData().items only has current page.
+    // Use getData().getSource() to get all Model instances across pages.
+    function eachAllRecords(s, fn) {
+      var allItems = [];
+      // Try getSource() first (ExtJS 6 paging collection - returns Model instances)
+      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
+        var source = s.getData().getSource();
+        allItems = source.items || source;
+      }
+      // Fallback to getData().items (current page only, but they are Model instances)
+      else if (s.getData && s.getData().items) {
+        allItems = s.getData().items;
+      }
+      else if (s.data && s.data.items) {
+        allItems = s.data.items;
+      }
+      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
+      for (var i = 0; i < allItems.length; i++) {
+        if (fn(allItems[i], i) === false) break;
+      }
+    }
+
+    // Helper: find record index across ALL pages
+    function findAllIndex(s, prop, val) {
+      var allItems = [];
+      if (s.getData && s.getData() && s.getData().getSource && s.getData().getSource()) {
+        var source = s.getData().getSource();
+        allItems = source.items || source;
+      }
+      else if (s.getData && s.getData().items) {
+        allItems = s.getData().items;
+      }
+      else if (s.data && s.data.items) {
+        allItems = s.data.items;
+      }
+      if (!Ext.isArray(allItems)) allItems = allItems.items || [];
+      for (var i = 0; i < allItems.length; i++) {
+        if (allItems[i].get(prop) === val) return i;
+      }
+      return -1;
+    }
+
+    var totalFiles = Object.keys(dockerStatusMap).length || fileStore.getTotalCount() || fileStore.getCount();
 
     var statusRenderer = function (val) {
       switch (val) {
@@ -2199,9 +2436,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             promoteBtn.disable();
             cancelBtn.disable();
 
-            // Collect original file paths from preview for promotion
+            // Collect original file paths from preview for promotion (ALL pages, not just current)
             var promoFiles = [];
-            fileStore.each(function (rec) {
+            eachAllRecords(fileStore, function (rec) {
               var origPath = rec.get('originalPath');
               if (origPath) { promoFiles.push(origPath); }
             });
@@ -2238,7 +2475,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               });
 
               // Start polling
-              me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles);
+              me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles, dockerStatusMap, eachAllRecords, findAllIndex);
             })
             .catch(function (err) {
               promoteBtn.setText(_t('promotion.modal.promote'));

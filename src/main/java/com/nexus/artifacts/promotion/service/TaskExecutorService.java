@@ -108,6 +108,17 @@ public class TaskExecutorService {
                                      final String taskDescription,
                                      final String taskId)
   {
+    return submitPromotionTask(task, taskDescription, taskId, null);
+  }
+
+  /**
+   * Submit a promotion task with a pre-defined taskId and username.
+   */
+  public String submitPromotionTask(final Callable<PromotionTaskCallback> task,
+                                     final String taskDescription,
+                                     final String taskId,
+                                     final String username)
+  {
     log.info("Submitting promotion task {}: {}", taskId, taskDescription);
 
     // Check promotion queue capacity to prevent OOM
@@ -122,7 +133,9 @@ public class TaskExecutorService {
 
     try {
       Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
-      promotionTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis()));
+      TaskHandle handle = new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis());
+      handle.username = username;
+      promotionTasks.put(taskId, handle);
       return taskId;
     }
     catch (RejectedExecutionException e) {
@@ -142,8 +155,7 @@ public class TaskExecutorService {
                                 final String sourceRepository,
                                 final String sourcePath)
   {
-    final String taskId = generateTaskId("sync");
-    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, taskId);
+    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, null);
   }
 
   /**
@@ -155,6 +167,19 @@ public class TaskExecutorService {
                                 final String sourcePath,
                                 final String taskId)
   {
+    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, taskId, null);
+  }
+
+  /**
+   * Submit a sync task with a pre-defined taskId and username.
+   */
+  public String submitSyncTask(final Callable<SyncTaskCallback> task,
+                                final String taskDescription,
+                                final String sourceRepository,
+                                final String sourcePath,
+                                final String taskId,
+                                final String username)
+  {
     log.info("Submitting sync task {}: {}", taskId, taskDescription);
 
     // Check for duplicate source directory sync - cancel old task
@@ -164,8 +189,10 @@ public class TaskExecutorService {
 
     try {
       Future<SyncTaskCallback> future = syncExecutor.submit(wrappedTask);
-      syncTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
-          sourceRepository, sourcePath));
+      TaskHandle handle = new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
+          sourceRepository, sourcePath);
+      handle.username = username;
+      syncTasks.put(taskId, handle);
       return taskId;
     }
     catch (RejectedExecutionException e) {
@@ -465,6 +492,85 @@ public class TaskExecutorService {
   }
 
   /**
+   * Cancel a running or pending task by taskId.
+   * Works for both promotion and sync tasks.
+   * @return true if the task was found and cancelled, false otherwise
+   */
+  public boolean cancelTask(final String taskId) {
+    if (taskId == null) return false;
+
+    // Check promotion tasks
+    TaskHandle promoHandle = promotionTasks.get(taskId);
+    if (promoHandle != null) {
+      if (promoHandle.status == TaskStatus.PENDING || promoHandle.status == TaskStatus.RUNNING) {
+        promoHandle.future.cancel(true);
+        promoHandle.status = TaskStatus.CANCELLED;
+        promoHandle.endTime = System.currentTimeMillis();
+        cacheManager.cleanupTask(taskId);
+        log.info("Promotion task {} cancelled", taskId);
+        return true;
+      }
+      return false;
+    }
+
+    // Check sync tasks
+    TaskHandle syncHandle = syncTasks.get(taskId);
+    if (syncHandle != null) {
+      if (syncHandle.status == TaskStatus.PENDING || syncHandle.status == TaskStatus.RUNNING) {
+        syncHandle.future.cancel(true);
+        syncHandle.status = TaskStatus.CANCELLED;
+        syncHandle.endTime = System.currentTimeMillis();
+        cacheManager.cleanupTask(taskId);
+        log.info("Sync task {} cancelled", taskId);
+        return true;
+      }
+      return false;
+    }
+
+    log.warn("Task {} not found for cancellation", taskId);
+    return false;
+  }
+
+  /**
+   * Get the username of the task creator.
+   * Returns null if task not found.
+   */
+  public String getTaskUsername(final String taskId) {
+    if (taskId == null) return null;
+
+    TaskHandle promoHandle = promotionTasks.get(taskId);
+    if (promoHandle != null) {
+      return promoHandle.username;
+    }
+
+    TaskHandle syncHandle = syncTasks.get(taskId);
+    if (syncHandle != null) {
+      return syncHandle.username;
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if a task exists and is cancellable (pending or running).
+   */
+  public boolean isTaskCancellable(final String taskId) {
+    if (taskId == null) return false;
+
+    TaskHandle promoHandle = promotionTasks.get(taskId);
+    if (promoHandle != null) {
+      return promoHandle.status == TaskStatus.PENDING || promoHandle.status == TaskStatus.RUNNING;
+    }
+
+    TaskHandle syncHandle = syncTasks.get(taskId);
+    if (syncHandle != null) {
+      return syncHandle.status == TaskStatus.PENDING || syncHandle.status == TaskStatus.RUNNING;
+    }
+
+    return false;
+  }
+
+  /**
    * Graceful shutdown on plugin destroy.
    */
   @PreDestroy
@@ -525,6 +631,7 @@ public class TaskExecutorService {
     public final String sourcePath;
     public final String targetRepository;
     public volatile String migratedToTaskId;
+    public volatile String username;
 
     public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime) {
       this(taskId, future, status, startTime, null, null, null);
