@@ -288,6 +288,8 @@ public class SyncQueueResource implements Resource {
       }
 
       boolean cancelled = taskExecutor.cancelTask(safeTaskId);
+      // Also disconnect any active HTTP connections for this task
+      promotionService.cancelPromotionTask(safeTaskId);
       if (cancelled) {
         log.info("Task {} terminated by user {}", safeTaskId, permissionChecker.getCurrentUsername());
 

@@ -105,6 +105,9 @@ public class PromotionService {
 
   private final Map<String, PromotionTaskResult> taskResults = new ConcurrentHashMap<>();
 
+  /** Track active HTTP connections per task so they can be disconnected on cancellation */
+  private final Map<String, HttpURLConnection> activeConnections = new ConcurrentHashMap<>();
+
   @Inject
   public PromotionService(final RepositoryManager repositoryManager,
                            final TaskExecutorService taskExecutor,
@@ -353,11 +356,24 @@ public class PromotionService {
     if (result != null) {
       // Clean up executor handle for terminal tasks
       String statusStr = result.getStatus();
-      if ("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr)) {
+      if ("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr) || "CANCELLED".equals(statusStr)) {
         taskExecutor.cleanupPromotionTaskHandle(taskId);
       }
     }
     return result;
+  }
+
+  /**
+   * Cancel a running promotion task by disconnecting its active HTTP connections.
+   * This is needed because HttpURLConnection blocking I/O does not respond to Thread.interrupt().
+   */
+  public void cancelPromotionTask(final String taskId) {
+    HttpURLConnection conn = activeConnections.get(taskId);
+    if (conn != null) {
+      log.info("Disconnecting active HTTP connection for cancelled task {}", taskId);
+      try { conn.disconnect(); } catch (Exception ignored) {}
+      activeConnections.remove(taskId);
+    }
   }
 
   /**
@@ -484,13 +500,29 @@ public class PromotionService {
       log.info("Directory promotion: {} files to promote from {}", total, directoryPath);
 
       for (int i = 0; i < total; i++) {
+        // Check for thread interruption (task cancellation)
+        if (Thread.currentThread().isInterrupted()) {
+          log.info("Promotion task interrupted after {}/{} files, marking remaining as failed", i, total);
+          // Mark remaining files as failed
+          for (int j = i; j < total; j++) {
+            PromotionTaskResult.FileItem cancelledItem = new PromotionTaskResult.FileItem(
+                assetNames.get(j), determineType(assetNames.get(j)));
+            cancelledItem.setStatus("failed");
+            cancelledItem.setErrorMessage("Task cancelled");
+            items.add(cancelledItem);
+          }
+          updateTaskProgress(taskResult, items);
+          throw new RuntimeException("Promotion task cancelled");
+        }
+
         String assetName = assetNames.get(i);
         log.info("[PROMO-PROGRESS] [{}/{}] Promoting: {}", i + 1, total,
             sourceRepo + "/" + assetName);
 
         try {
           PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
-              sourceRepo, targetRepo, assetName, cookieHeader, csrfToken, nexusBaseUrl);
+              sourceRepo, targetRepo, assetName, cookieHeader, csrfToken, nexusBaseUrl,
+              taskResult != null ? taskResult.getTaskId() : null);
           items.add(item);
         }
         catch (Exception e) {
@@ -527,7 +559,7 @@ public class PromotionService {
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
     try {
-      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl);
+      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, null);
       items.add(item);
     }
     catch (Exception e) {
@@ -548,7 +580,8 @@ public class PromotionService {
       final String filePath,
       final String cookieHeader,
       final String csrfToken,
-      final String nexusBaseUrl) throws IOException
+      final String nexusBaseUrl,
+      final String taskId) throws IOException
   {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.debug("Promoting via HTTP: {} -> {}/{}", fullSourcePath, targetRepo, filePath);
@@ -577,7 +610,7 @@ public class PromotionService {
 
             // Perform the actual file transfer (still inside the lock)
             try {
-              return doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+              return doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5, taskId);
             }
             catch (IOException e) {
               throw new RuntimeException(e);
@@ -609,7 +642,8 @@ public class PromotionService {
       final String csrfToken,
       final String nexusBaseUrl,
       final String sourceMd5,
-      final String targetMd5) throws IOException
+      final String targetMd5,
+      final String taskId) throws IOException
   {
     String fullSourcePath = sourceRepo + "/" + filePath;
 
@@ -624,26 +658,40 @@ public class PromotionService {
       return promoteDockerAsset(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
     }
 
-    // Download from source and upload to target using connection pool
+    // Download from source and upload to target using streaming (avoids OOM and binary corruption)
     Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
 
-    // Download from source
+    // Download from source using streaming
     String downloadUrl = nexusBaseUrl + "/repository/" + fullSourcePath;
-    HttpClientPool.HttpResponse downloadResponse = httpClientPool.get(downloadUrl, authHeaders);
+    HttpClientPool.HttpResponse downloadResponse = httpClientPool.getStream(downloadUrl, authHeaders);
+
+    // Track active connection for task cancellation support
+    if (taskId != null && downloadResponse.getConnection() != null) {
+      activeConnections.put(taskId, downloadResponse.getConnection());
+    }
 
     if (!downloadResponse.isSuccess()) {
+      activeConnections.remove(taskId);
       throw new IOException("Download from " + fullSourcePath + " failed: HTTP " + downloadResponse.getStatusCode() + " - " + downloadResponse.getBody());
     }
 
-    // Upload to target using connection pool with chunked streaming
-    String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
-    byte[] fileData = downloadResponse.getBody().getBytes("UTF-8");
-    HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
-        uploadUrl, fileData, "application/octet-stream", authHeaders);
+    try {
+      // Upload to target using streaming (avoids loading entire file into memory)
+      String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+      InputStream downloadStream = downloadResponse.getStream();
+      long contentLength = downloadResponse.getContentLength();
+      HttpClientPool.HttpResponse uploadResponse = httpClientPool.putStream(
+          uploadUrl, downloadStream, contentLength, "application/octet-stream", authHeaders);
 
-    if (!uploadResponse.isSuccess()) {
-      throw new IOException("Upload to " + targetRepo + "/" + filePath +
-          " failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
+      if (!uploadResponse.isSuccess()) {
+        throw new IOException("Upload to " + targetRepo + "/" + filePath +
+            " failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
+      }
+    }
+    finally {
+      // Disconnect the download connection (also closes the stream if not yet closed)
+      downloadResponse.disconnect();
+      activeConnections.remove(taskId);
     }
 
     log.info("Successfully promoted: {} -> {}/{}",
