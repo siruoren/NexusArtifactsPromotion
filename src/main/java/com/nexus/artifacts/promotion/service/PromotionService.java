@@ -43,6 +43,7 @@ import com.google.common.collect.ImmutableList;
 import com.nexus.artifacts.promotion.model.FilePreviewResponse;
 import com.nexus.artifacts.promotion.model.PromotionRequest;
 import com.nexus.artifacts.promotion.model.PromotionTaskResult;
+import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TargetRepositoryList;
 import com.nexus.artifacts.promotion.model.TaskStatus;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
@@ -56,9 +57,6 @@ import com.nexus.artifacts.promotion.security.PermissionChecker;
 public class PromotionService {
 
   private static final Logger log = LoggerFactory.getLogger(PromotionService.class);
-
-  /** Maximum time (ms) to keep completed task results before cleanup (30 minutes) */
-  private static final long TASK_RESULT_TTL_MS = 30 * 60 * 1000L;
 
   /** Connection/read timeout in milliseconds */
   private static final int TIMEOUT_MS = 300_000; // 5 minutes
@@ -103,6 +101,9 @@ public class PromotionService {
   private final HttpClientPool httpClientPool;
 
   private final Map<String, PromotionTaskResult> taskResults = new ConcurrentHashMap<>();
+
+  /** Track active HTTP connections per task so they can be disconnected on cancellation */
+  private final Map<String, HttpURLConnection> activeConnections = new ConcurrentHashMap<>();
 
   @Inject
   public PromotionService(final RepositoryManager repositoryManager,
@@ -270,8 +271,12 @@ public class PromotionService {
         }
         catch (Exception e) {
           log.error("Promotion task {} failed: {}", taskId, e.getMessage(), e);
-          result.setStatus(TaskStatus.FAILED.getValue());
-          result.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          // If the thread was interrupted (manual cancellation), use CANCELLED status
+          boolean isCancelled = Thread.currentThread().isInterrupted()
+              || (e instanceof InterruptedException)
+              || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
+          result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
         }
 
@@ -289,7 +294,57 @@ public class PromotionService {
         }
       }
     }, String.format("Promote %s from %s to %s", request.getPath(),
-        request.getSourceRepository(), request.getTargetRepository()), taskId);
+        request.getSourceRepository(), request.getTargetRepository()), taskId, username);
+  }
+
+  /**
+   * Get all promotion tasks as SyncTaskInfo for unified task queue display.
+   */
+  public List<SyncTaskInfo> getAllPromotionTasksAsSyncTaskInfo() {
+    cleanupExpiredTaskResults();
+    List<SyncTaskInfo> tasks = new ArrayList<>();
+
+    // Get tasks from taskResults map (completed/failed)
+    for (Map.Entry<String, PromotionTaskResult> entry : taskResults.entrySet()) {
+      PromotionTaskResult result = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(result.getTaskId());
+      info.setTaskType("promotion");
+      info.setSourceRepository(result.getSourceRepository());
+      info.setTargetRepository(result.getTargetRepository());
+      info.setStatus(TaskStatus.fromValue(result.getStatus()));
+      info.setStartTime(result.getStartTime());
+      info.setEndTime(result.getEndTime());
+      info.setUsername(result.getUsername());
+      info.setErrorMessage(result.getErrorMessage());
+      if (result.getItems() != null) {
+        info.setResult(result.getItems().size() + " items");
+      }
+      tasks.add(info);
+    }
+
+    // Get running tasks from TaskExecutorService
+    Map<String, TaskExecutorService.TaskHandle> promoTasks = taskExecutor.getPromotionTasks();
+    for (Map.Entry<String, TaskExecutorService.TaskHandle> entry : promoTasks.entrySet()) {
+      String taskId = entry.getKey();
+      // Skip if already in taskResults
+      if (taskResults.containsKey(taskId)) continue;
+
+      TaskExecutorService.TaskHandle handle = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(handle.taskId);
+      info.setTaskType("promotion");
+      info.setSourceRepository(handle.sourceRepository);
+      info.setTargetRepository(handle.targetRepository);
+      info.setPath(handle.sourcePath);
+      info.setStatus(handle.status);
+      info.setStartTime(handle.startTime);
+      info.setEndTime(handle.endTime);
+      info.setUsername(handle.username);
+      tasks.add(info);
+    }
+
+    return tasks;
   }
 
   /**
@@ -302,11 +357,34 @@ public class PromotionService {
     if (result != null) {
       // Clean up executor handle for terminal tasks
       String statusStr = result.getStatus();
-      if ("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr)) {
+      if ("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr) || "CANCELLED".equals(statusStr)) {
         taskExecutor.cleanupPromotionTaskHandle(taskId);
       }
     }
     return result;
+  }
+
+  /**
+   * Cancel a running promotion task by disconnecting its active HTTP connections.
+   * This is needed because HttpURLConnection blocking I/O does not respond to Thread.interrupt().
+   */
+  public void cancelPromotionTask(final String taskId) {
+    HttpURLConnection conn = activeConnections.get(taskId);
+    if (conn != null) {
+      log.info("Disconnecting active HTTP connection for cancelled task {}", taskId);
+      try { conn.disconnect(); } catch (Exception ignored) {}
+      activeConnections.remove(taskId);
+    }
+
+    // Update task result status to CANCELLED if it exists in taskResults
+    PromotionTaskResult result = taskResults.get(taskId);
+    if (result != null && !TaskStatus.CANCELLED.getValue().equals(result.getStatus())) {
+      log.info("Updating task {} result status from {} to CANCELLED", taskId, result.getStatus());
+      result.setStatus(TaskStatus.CANCELLED.getValue());
+      result.setErrorMessage("Task cancelled");
+      result.setEndTime(System.currentTimeMillis());
+      taskResults.put(taskId, copyResult(result));
+    }
   }
 
   /**
@@ -317,19 +395,20 @@ public class PromotionService {
   }
 
   /**
-   * Clean up task results that have been completed for longer than TASK_RESULT_TTL_MS.
+   * Clean up task results that have been completed for longer than the configured TTL.
    * This prevents memory leaks from accumulated completed task data.
    */
   private void cleanupExpiredTaskResults() {
+    long ttlMs = taskExecutor.getTaskLogTtlMs();
     long now = System.currentTimeMillis();
     List<String> expiredTaskIds = new ArrayList<>();
 
     for (Map.Entry<String, PromotionTaskResult> entry : taskResults.entrySet()) {
       PromotionTaskResult result = entry.getValue();
       String statusStr = result.getStatus();
-      if (("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr))
+      if (("COMPLETED".equals(statusStr) || "FAILED".equals(statusStr) || "CANCELLED".equals(statusStr))
           && result.getEndTime() > 0
-          && (now - result.getEndTime()) > TASK_RESULT_TTL_MS) {
+          && (now - result.getEndTime()) > ttlMs) {
         expiredTaskIds.add(entry.getKey());
       }
     }
@@ -433,13 +512,29 @@ public class PromotionService {
       log.info("Directory promotion: {} files to promote from {}", total, directoryPath);
 
       for (int i = 0; i < total; i++) {
+        // Check for thread interruption (task cancellation)
+        if (Thread.currentThread().isInterrupted()) {
+          log.info("Promotion task interrupted after {}/{} files, marking remaining as failed", i, total);
+          // Mark remaining files as failed
+          for (int j = i; j < total; j++) {
+            PromotionTaskResult.FileItem cancelledItem = new PromotionTaskResult.FileItem(
+                assetNames.get(j), determineType(assetNames.get(j)));
+            cancelledItem.setStatus("failed");
+            cancelledItem.setErrorMessage("Task cancelled");
+            items.add(cancelledItem);
+          }
+          updateTaskProgress(taskResult, items);
+          throw new RuntimeException("Promotion task cancelled");
+        }
+
         String assetName = assetNames.get(i);
         log.info("[PROMO-PROGRESS] [{}/{}] Promoting: {}", i + 1, total,
             sourceRepo + "/" + assetName);
 
         try {
           PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(
-              sourceRepo, targetRepo, assetName, cookieHeader, csrfToken, nexusBaseUrl);
+              sourceRepo, targetRepo, assetName, cookieHeader, csrfToken, nexusBaseUrl,
+              taskResult != null ? taskResult.getTaskId() : null);
           items.add(item);
         }
         catch (Exception e) {
@@ -476,7 +571,7 @@ public class PromotionService {
   {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
     try {
-      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl);
+      PromotionTaskResult.FileItem item = promoteSingleFileViaHttp(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, null);
       items.add(item);
     }
     catch (Exception e) {
@@ -497,7 +592,8 @@ public class PromotionService {
       final String filePath,
       final String cookieHeader,
       final String csrfToken,
-      final String nexusBaseUrl) throws IOException
+      final String nexusBaseUrl,
+      final String taskId) throws IOException
   {
     String fullSourcePath = sourceRepo + "/" + filePath;
     log.debug("Promoting via HTTP: {} -> {}/{}", fullSourcePath, targetRepo, filePath);
@@ -526,7 +622,7 @@ public class PromotionService {
 
             // Perform the actual file transfer (still inside the lock)
             try {
-              return doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
+              return doPromoteFileTransfer(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5, taskId);
             }
             catch (IOException e) {
               throw new RuntimeException(e);
@@ -558,7 +654,8 @@ public class PromotionService {
       final String csrfToken,
       final String nexusBaseUrl,
       final String sourceMd5,
-      final String targetMd5) throws IOException
+      final String targetMd5,
+      final String taskId) throws IOException
   {
     String fullSourcePath = sourceRepo + "/" + filePath;
 
@@ -573,26 +670,40 @@ public class PromotionService {
       return promoteDockerAsset(sourceRepo, targetRepo, filePath, cookieHeader, csrfToken, nexusBaseUrl, sourceMd5, targetMd5);
     }
 
-    // Download from source and upload to target using connection pool
+    // Download from source and upload to target using streaming (avoids OOM and binary corruption)
     Map<String, String> authHeaders = buildAuthHeaders(cookieHeader, csrfToken);
 
-    // Download from source
+    // Download from source using streaming
     String downloadUrl = nexusBaseUrl + "/repository/" + fullSourcePath;
-    HttpClientPool.HttpResponse downloadResponse = httpClientPool.get(downloadUrl, authHeaders);
+    HttpClientPool.HttpResponse downloadResponse = httpClientPool.getStream(downloadUrl, authHeaders);
+
+    // Track active connection for task cancellation support
+    if (taskId != null && downloadResponse.getConnection() != null) {
+      activeConnections.put(taskId, downloadResponse.getConnection());
+    }
 
     if (!downloadResponse.isSuccess()) {
+      activeConnections.remove(taskId);
       throw new IOException("Download from " + fullSourcePath + " failed: HTTP " + downloadResponse.getStatusCode() + " - " + downloadResponse.getBody());
     }
 
-    // Upload to target using connection pool with chunked streaming
-    String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
-    byte[] fileData = downloadResponse.getBody().getBytes("UTF-8");
-    HttpClientPool.HttpResponse uploadResponse = httpClientPool.put(
-        uploadUrl, fileData, "application/octet-stream", authHeaders);
+    try {
+      // Upload to target using streaming (avoids loading entire file into memory)
+      String uploadUrl = nexusBaseUrl + "/repository/" + targetRepo + "/" + filePath;
+      InputStream downloadStream = downloadResponse.getStream();
+      long contentLength = downloadResponse.getContentLength();
+      HttpClientPool.HttpResponse uploadResponse = httpClientPool.putStream(
+          uploadUrl, downloadStream, contentLength, "application/octet-stream", authHeaders);
 
-    if (!uploadResponse.isSuccess()) {
-      throw new IOException("Upload to " + targetRepo + "/" + filePath +
-          " failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
+      if (!uploadResponse.isSuccess()) {
+        throw new IOException("Upload to " + targetRepo + "/" + filePath +
+            " failed: HTTP " + uploadResponse.getStatusCode() + " - " + uploadResponse.getBody());
+      }
+    }
+    finally {
+      // Disconnect the download connection (also closes the stream if not yet closed)
+      downloadResponse.disconnect();
+      activeConnections.remove(taskId);
     }
 
     log.info("Successfully promoted: {} -> {}/{}",
@@ -907,31 +1018,53 @@ public class PromotionService {
       String encodedPrefix = pathPrefix.replace("%", "%25").replace("+", "%2B")
           .replace(" ", "%20").replace("/", "%2F");
 
-      String searchUrlStr = nexusBaseUrl + "/service/rest/v1/search?repository=" +
-          repository + "&name=" + encodedPrefix + "*";
+      // Paginate through all results using continuationToken
+      String continuationToken = null;
+      int maxPages = 100; // Safety limit
+      int pageCount = 0;
 
-      URL url = new URL(searchUrlStr);
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(30_000);
-      conn.setReadTimeout(60_000);
-      conn.setRequestProperty("Accept", "application/json");
+      while (pageCount < maxPages) {
+        pageCount++;
+        String searchUrlStr = nexusBaseUrl + "/service/rest/v1/search?repository=" +
+            repository + "&name=" + encodedPrefix + "*";
+        if (continuationToken != null) {
+          searchUrlStr += "&continuationToken=" + continuationToken;
+        }
 
-      int code = conn.getResponseCode();
-      if (code == 403 || code == 401) {
-        log.debug("Search API returned {} for {}/{}, may need authentication", code, repository, pathPrefix);
+        URL url = new URL(searchUrlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        int code = conn.getResponseCode();
+        if (code == 403 || code == 401) {
+          log.debug("Search API returned {} for {}/{}, may need authentication", code, repository, pathPrefix);
+          conn.disconnect();
+          break;
+        }
+        if (code == 200) {
+          String json = readStream(conn.getInputStream());
+          List<String> pageResults = parseSearchItems(json, pathPrefix);
+          results.addAll(pageResults);
+
+          // Check for continuationToken in the response
+          continuationToken = parseContinuationToken(json);
+          if (continuationToken == null || continuationToken.isEmpty()) {
+            // No more pages
+            break;
+          }
+        } else {
+          break;
+        }
         conn.disconnect();
-        return results;
       }
-      if (code == 200) {
-        String json = readStream(conn.getInputStream());
-        results = parseSearchItems(json, pathPrefix);
-        log.debug("Search API found {} items for {}/{}", results.size(), repository, pathPrefix);
-      }
-      conn.disconnect();
+
+      log.debug("Search API found {} total items for {}/{} ({} pages)", results.size(), repository, pathPrefix, pageCount);
     }
     catch (Exception e) {
-      log.warn("Search API call failed for {}/{}, returning empty: {}", repository, pathPrefix, e.getMessage());
+      log.warn("Search API call failed for {}/{}, returning partial results: {}", repository, pathPrefix, e.getMessage());
     }
     return results;
   }
@@ -943,26 +1076,81 @@ public class PromotionService {
                                          final String nexusBaseUrl) throws IOException {
     List<String> results = new ArrayList<>();
     try {
-      String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository;
-      URL url = new URL(urlStr);
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(30_000);
-      conn.setReadTimeout(120_000);
-      conn.setRequestProperty("Accept", "application/json");
+      // Paginate through all results using continuationToken
+      String continuationToken = null;
+      int maxPages = 100;
+      int pageCount = 0;
 
-      int code = conn.getResponseCode();
-      if (code == 200) {
-        String json = readStream(conn.getInputStream());
-        results = parseComponentAssets(json, pathPrefix);
-        log.debug("Components API found {} items for {}/{}", results.size(), repository, pathPrefix);
+      while (pageCount < maxPages) {
+        pageCount++;
+        String urlStr = nexusBaseUrl + "/service/rest/v1/components?repository=" + repository;
+        if (continuationToken != null) {
+          urlStr += "&continuationToken=" + continuationToken;
+        }
+
+        URL url = new URL(urlStr);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(30_000);
+        conn.setReadTimeout(120_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        int code = conn.getResponseCode();
+        if (code == 200) {
+          String json = readStream(conn.getInputStream());
+          List<String> pageResults = parseComponentAssets(json, pathPrefix);
+          results.addAll(pageResults);
+
+          continuationToken = parseContinuationToken(json);
+          if (continuationToken == null || continuationToken.isEmpty()) {
+            break;
+          }
+        } else {
+          break;
+        }
+        conn.disconnect();
       }
-      conn.disconnect();
+
+      log.debug("Components API found {} total items for {}/{} ({} pages)", results.size(), repository, pathPrefix, pageCount);
     }
     catch (Exception e) {
       log.warn("Components API call failed for {}/{}: {}", repository, pathPrefix, e.getMessage());
     }
     return results;
+  }
+
+  /**
+   * Parse continuationToken from Nexus API JSON response.
+   * Nexus REST API uses continuationToken for pagination.
+   */
+  private String parseContinuationToken(final String json) {
+    if (json == null || json.isEmpty()) return null;
+    try {
+      // Find "continuationToken" field in JSON
+      String key = "\"continuationToken\"";
+      int idx = json.indexOf(key);
+      if (idx < 0) return null;
+      // Find the colon after the key
+      int colonIdx = json.indexOf(':', idx + key.length());
+      if (colonIdx < 0) return null;
+      // Find the value (could be null or a string)
+      int valueStart = colonIdx + 1;
+      // Skip whitespace
+      while (valueStart < json.length() && json.charAt(valueStart) == ' ') valueStart++;
+      if (valueStart >= json.length()) return null;
+      // Check for null
+      if (json.startsWith("null", valueStart)) return null;
+      // Parse string value
+      if (json.charAt(valueStart) != '"') return null;
+      valueStart++;
+      int valueEnd = json.indexOf('"', valueStart);
+      if (valueEnd < 0) return null;
+      String token = json.substring(valueStart, valueEnd);
+      return token.isEmpty() ? null : token;
+    }
+    catch (Exception e) {
+      return null;
+    }
   }
 
   /**

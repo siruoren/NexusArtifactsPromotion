@@ -58,9 +58,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.pending": "Pending",
     "promotion.progress.success": "Success",
     "promotion.progress.failed": "Failed",
+    "promotion.progress.cancelled": "Cancelled",
     "promotion.progress.skipped": "Skipped",
     "promotion.result.title.success": "Promotion Success",
     "promotion.result.title.failed": "Promotion Failed",
+    "promotion.result.title.cancelled": "Promotion Cancelled",
     "promotion.result.targetRepository": "Target Repository:",
     "promotion.result.status": "Status:",
     "promotion.result.error": "Error:",
@@ -87,12 +89,16 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.created.message": "Sync task has been submitted to the queue.",
     "sync.queue.created.viewQueue": "View Queue",
     "sync.queue.created.close": "Close",
+    "sync.progress.processing": "Syncing",
+    "sync.progress.success": "Synced",
+    "sync.progress.failed": "Sync Failed",
+    "sync.progress.pending": "Pending",
 
-    "sync.queue.page.title": "Sync Queue",
-    "sync.queue.page.loginRequired": "Please log in to view sync queue.",
-    "sync.queue.page.loading": "Loading sync tasks...",
-    "sync.queue.page.noTasks": "No sync tasks found.",
-    "sync.queue.page.loadFailed": "Failed to load sync tasks:",
+    "sync.queue.page.title": "Task Queue",
+    "sync.queue.page.loginRequired": "Please log in to view task queue.",
+    "sync.queue.page.loading": "Loading tasks...",
+    "sync.queue.page.noTasks": "No tasks found.",
+    "sync.queue.page.loadFailed": "Failed to load tasks:",
     "sync.queue.table.queueId": "Queue ID",
     "sync.queue.table.sourceRepository": "Source Repository",
     "sync.queue.table.targetRepository": "Target Repository",
@@ -115,9 +121,18 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.filter.reset": "Reset",
     "sync.queue.status.failed": "Failed",
     "sync.queue.status.running": "Running",
-    "sync.queue.status.cancelled": "Cancelled",
+    "sync.queue.status.cancelled": "Terminated",
     "sync.queue.status.completed": "Completed",
     "sync.queue.table.duration": "Duration (min)",
+    "sync.queue.table.taskType": "Type",
+    "sync.queue.table.terminate": "Terminate",
+    "sync.queue.table.terminateConfirm": "Are you sure you want to terminate this task?",
+    "sync.queue.table.terminateSuccess": "Task terminated successfully",
+    "sync.queue.table.terminateFailed": "Failed to terminate task",
+    "sync.queue.table.terminateNoPermission": "No permission to terminate this task",
+    "sync.queue.taskType.sync": "Sync",
+    "sync.queue.taskType.promotion": "Promotion",
+    "sync.queue.filter.taskType": "Type",
     "sync.queue.config.title": "Queue Configuration",
     "sync.queue.config.maxSyncQueueSize": "Max Sync Queue Size",
     "sync.queue.config.syncPoolSize": "Sync Pool Size",
@@ -179,9 +194,11 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.pending": "\u7b49\u5f85\u4e2d",
     "promotion.progress.success": "\u6210\u529f",
     "promotion.progress.failed": "\u5931\u8d25",
+    "promotion.progress.cancelled": "\u7ec8\u6b62",
     "promotion.progress.skipped": "\u672a\u66f4\u65b0",
     "promotion.result.title.success": "\u664b\u7ea7\u6210\u529f",
     "promotion.result.title.failed": "\u664b\u7ea7\u5931\u8d25",
+    "promotion.result.title.cancelled": "\u664b\u7ea7\u7ec8\u6b62",
     "promotion.result.targetRepository": "\u76ee\u6807\u4ed3\u5e93\uff1a",
     "promotion.result.status": "\u72b6\u6001\uff1a",
     "promotion.result.error": "\u9519\u8bef\uff1a",
@@ -208,12 +225,16 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.created.message": "\u540c\u6b65\u4efb\u52a1\u5df2\u63d0\u4ea4\u5230\u961f\u5217\u3002",
     "sync.queue.created.viewQueue": "\u67e5\u770b\u961f\u5217",
     "sync.queue.created.close": "\u5173\u95ed",
+    "sync.progress.processing": "\u540c\u6b65\u4e2d",
+    "sync.progress.success": "\u540c\u6b65\u6210\u529f",
+    "sync.progress.failed": "\u540c\u6b65\u5931\u8d25",
+    "sync.progress.pending": "\u7b49\u5f85\u4e2d",
 
-    "sync.queue.page.title": "\u540c\u6b65\u961f\u5217",
-    "sync.queue.page.loginRequired": "\u8bf7\u767b\u5f55\u540e\u67e5\u770b\u540c\u6b65\u961f\u5217\u3002",
-    "sync.queue.page.loading": "\u52a0\u8f7d\u540c\u6b65\u4efb\u52a1\u4e2d...",
-    "sync.queue.page.noTasks": "\u6682\u65e0\u540c\u6b65\u4efb\u52a1\u3002",
-    "sync.queue.page.loadFailed": "\u52a0\u8f7d\u540c\u6b65\u4efb\u52a1\u5931\u8d25\uff1a",
+    "sync.queue.page.title": "\u4efb\u52a1\u961f\u5217",
+    "sync.queue.page.loginRequired": "\u8bf7\u767b\u5f55\u540e\u67e5\u770b\u4efb\u52a1\u961f\u5217\u3002",
+    "sync.queue.page.loading": "\u52a0\u8f7d\u4efb\u52a1\u4e2d...",
+    "sync.queue.page.noTasks": "\u6682\u65e0\u4efb\u52a1\u3002",
+    "sync.queue.page.loadFailed": "\u52a0\u8f7d\u4efb\u52a1\u5931\u8d25\uff1a",
     "sync.queue.table.queueId": "\u961f\u5217ID",
     "sync.queue.table.sourceRepository": "\u6e90\u4ed3\u5e93",
     "sync.queue.table.targetRepository": "\u76ee\u6807\u4ed3\u5e93",
@@ -236,9 +257,18 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "sync.queue.filter.reset": "\u91cd\u7f6e",
     "sync.queue.status.failed": "\u5931\u8d25",
     "sync.queue.status.running": "\u8fdb\u884c\u4e2d",
-    "sync.queue.status.cancelled": "\u53d6\u6d88",
+    "sync.queue.status.cancelled": "\u7ec8\u6b62",
     "sync.queue.status.completed": "\u5b8c\u6210",
     "sync.queue.table.duration": "\u8017\u65f6\uff08\u5206\u949f\uff09",
+    "sync.queue.table.taskType": "\u7c7b\u578b",
+    "sync.queue.table.terminate": "\u7ec8\u6b62",
+    "sync.queue.table.terminateConfirm": "\u786e\u5b9a\u8981\u7ec8\u6b62\u8be5\u4efb\u52a1\u5417\uff1f",
+    "sync.queue.table.terminateSuccess": "\u4efb\u52a1\u5df2\u7ec8\u6b62",
+    "sync.queue.table.terminateFailed": "\u7ec8\u6b62\u4efb\u52a1\u5931\u8d25",
+    "sync.queue.table.terminateNoPermission": "\u65e0\u6743\u7ec8\u6b62\u8be5\u4efb\u52a1",
+    "sync.queue.taskType.sync": "\u540c\u6b65",
+    "sync.queue.taskType.promotion": "\u664b\u7ea7",
+    "sync.queue.filter.taskType": "\u7c7b\u578b",
     "sync.queue.config.title": "\u961f\u5217\u914d\u7f6e",
     "sync.queue.config.maxSyncQueueSize": "\u6700\u5927\u540c\u6b65\u961f\u5217\u6570",
     "sync.queue.config.syncPoolSize": "\u540c\u6b65\u7ebf\u7a0b\u6c60\u5927\u5c0f",
@@ -522,7 +552,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     var me = this;
 
     me.allDataStore = Ext.create('Ext.data.Store', {
-      fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+      fields: ['taskId', 'taskType', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
         'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
       proxy: {
         type: 'ajax',
@@ -539,7 +569,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     });
 
     me.store = Ext.create('Ext.data.Store', {
-      fields: ['taskId', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
+      fields: ['taskId', 'taskType', 'sourceRepository', 'targetRepository', 'path', 'fileDetails',
         'status', 'startTime', 'endTime', 'username', 'result', 'errorMessage'],
       pageSize: 20,
       proxy: {
@@ -609,13 +639,42 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
           store: me.store,
           columns: [
             { text: _t('sync.queue.table.queueId'), dataIndex: 'taskId', width: 180, renderer: tipRenderer },
+            { text: _t('sync.queue.table.taskType'), dataIndex: 'taskType', width: 80, renderer: function(v) {
+              if (v === 'promotion') return '<span style="color:#e67e22;font-weight:bold;">' + _t('sync.queue.taskType.promotion') + '</span>';
+              if (v === 'sync') return '<span style="color:#3498db;font-weight:bold;">' + _t('sync.queue.taskType.sync') + '</span>';
+              return v || '-';
+            }},
             { text: _t('sync.queue.table.sourceRepository'), dataIndex: 'sourceRepository', flex: 1, renderer: tipRenderer },
             { text: _t('sync.queue.table.path'), dataIndex: 'path', flex: 1, renderer: tipRenderer },
             { text: _t('sync.queue.table.status'), dataIndex: 'status', width: 100, renderer: tipStatusRenderer },
             { text: _t('sync.queue.table.startTime'), dataIndex: 'startTime', width: 150, renderer: tipTimeRenderer },
             { text: _t('sync.queue.table.duration'), dataIndex: 'endTime', width: 100, renderer: durationRenderer },
             { text: _t('sync.queue.table.username'), dataIndex: 'username', width: 100, renderer: tipRenderer },
-            { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1, renderer: tipRenderer }
+            { text: _t('sync.queue.table.result'), dataIndex: 'result', flex: 1, renderer: tipRenderer },
+            {
+              text: _t('sync.queue.table.terminate'),
+              width: 80,
+              align: 'center',
+              sortable: false,
+              renderer: function(value, metaData, record) {
+                var status = record.get('status');
+                var taskId = record.get('taskId');
+                var taskUsername = record.get('username');
+                var canTerminate = (status === 'running' || status === 'RUNNING' || status === 'pending' || status === 'PENDING');
+                var isOwner = (me.currentUser && me.currentUser.username === taskUsername);
+                var isAdmin = (me.currentUser && me.currentUser.isAdmin);
+                var hasPermission = isOwner || isAdmin;
+
+                if (canTerminate && hasPermission) {
+                  return '<button class="terminate-btn" data-taskid="' + Ext.htmlEncode(taskId) +
+                    '" style="background:#e74c3c;color:white;border:none;border-radius:3px;padding:3px 10px;cursor:pointer;font-size:12px;">' +
+                    _t('sync.queue.table.terminate') + '</button>';
+                } else {
+                  return '<button disabled style="background:#ccc;color:#999;border:none;border-radius:3px;padding:3px 10px;cursor:not-allowed;font-size:12px;">' +
+                    _t('sync.queue.table.terminate') + '</button>';
+                }
+              }
+            }
           ],
           tbar: [
             {
@@ -627,6 +686,21 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
                 specialkey: function (field, e) {
                   if (e.getKey() === e.ENTER) me.applyFilters();
                 }
+              }
+            },
+            {
+              xtype: 'combobox',
+              itemId: 'filterTaskType',
+              emptyText: _t('sync.queue.filter.taskType'),
+              width: 100,
+              editable: false,
+              store: [
+                ['', _t('sync.queue.filter.all')],
+                ['sync', _t('sync.queue.taskType.sync')],
+                ['promotion', _t('sync.queue.taskType.promotion')]
+              ],
+              listeners: {
+                select: function () { me.applyFilters(); }
               }
             },
             {
@@ -731,6 +805,58 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
 
     me.callParent(arguments);
 
+    // Load current user info for permission checks
+    me.currentUser = null;
+    Ext.Ajax.request({
+      url: '/service/rest/v1/sync/queue/currentUser',
+      method: 'GET',
+      success: function(response) {
+        try {
+          me.currentUser = Ext.decode(response.responseText);
+        } catch(e) {}
+      }
+    });
+  },
+
+  afterRender: function() {
+    this.callParent(arguments);
+    var me = this;
+
+    // Handle terminate button clicks via event delegation
+    // Must be in afterRender because getEl() is only available after rendering
+    me.getEl().on('click', function(e, t) {
+      var btn = Ext.fly(t).down('.terminate-btn');
+      if (!btn) btn = Ext.fly(t);
+      if (!btn || !btn.dom) return;
+      var taskId = btn.getAttribute('data-taskid');
+      if (!taskId) return;
+
+      Ext.Msg.confirm(_t('sync.queue.table.terminate'), _t('sync.queue.table.terminateConfirm'), function(btnId) {
+        if (btnId === 'yes') {
+          Ext.Ajax.request({
+            url: '/service/rest/v1/sync/queue/terminate/' + encodeURIComponent(taskId),
+            method: 'POST',
+            success: function(response) {
+              Ext.Msg.alert(_t('sync.queue.table.terminate'), _t('sync.queue.table.terminateSuccess'));
+              me.allDataStore.reload();
+            },
+            failure: function(response) {
+              var msg = _t('sync.queue.table.terminateFailed');
+              try {
+                var result = Ext.decode(response.responseText);
+                if (result.error === 'Permission denied') {
+                  msg = _t('sync.queue.table.terminateNoPermission');
+                } else if (result.message) {
+                  msg = result.message;
+                }
+              } catch(e) {}
+              Ext.Msg.alert(_t('sync.queue.table.terminate'), msg);
+            }
+          });
+        }
+      });
+    }, null, { delegate: '.terminate-btn' });
+
     me._queuePollInterval = setInterval(function () {
       if (!me.destroyed) {
         me.allDataStore.reload();
@@ -743,6 +869,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
   applyFilters: function () {
     var me = this;
     var taskIdFilter = (me.down('#filterTaskId') || {}).value || '';
+    var taskTypeFilter = (me.down('#filterTaskType') || {}).value || '';
     var repoFilter = (me.down('#filterRepository') || {}).value || '';
     var pathFilter = (me.down('#filterPath') || {}).value || '';
     var statusFilter = (me.down('#filterStatus') || {}).value || '';
@@ -757,6 +884,7 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
     var filtered = [];
     me.allDataStore.each(function (rec) {
       if (taskIdFilter && (rec.get('taskId') || '').toLowerCase().indexOf(taskIdFilter) === -1) return;
+      if (taskTypeFilter && (rec.get('taskType') || '').toLowerCase() !== taskTypeFilter.toLowerCase()) return;
       if (repoFilter && (rec.get('sourceRepository') || '').toLowerCase().indexOf(repoFilter) === -1 &&
           (rec.get('targetRepository') || '').toLowerCase().indexOf(repoFilter) === -1) return;
       if (pathFilter && (rec.get('path') || '').toLowerCase().indexOf(pathFilter) === -1) return;
@@ -1358,8 +1486,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     var win = Ext.create('Ext.window.Window', {
       title: isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text'),
-      width: 450,
-      height: 220,
+      minWidth: 400,
+      maxWidth: 700,
+      autoScroll: true,
       modal: true,
       closable: true,
       layout: 'fit',
@@ -1367,22 +1496,23 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         xtype: 'panel',
         layout: { type: 'vbox', align: 'stretch' },
         bodyPadding: 15,
+        autoScroll: true,
         items: [
           {
             xtype: 'displayfield',
             fieldLabel: _t('sync.queue.created.repository'),
-            value: '<b>' + sanitize(fullPath) + '</b>'
+            value: '<b style="word-break:break-all;">' + sanitize(fullPath) + '</b>'
           },
           {
             xtype: 'displayfield',
             fieldLabel: _t('sync.queue.created.queueId'),
-            value: '<b>' + sanitize(taskId) + '</b>'
+            value: '<b style="word-break:break-all;">' + sanitize(taskId) + '</b>'
           },
           {
             xtype: 'displayfield',
             fieldLabel: _t('promotion.result.status'),
             itemId: 'syncStatusField',
-            value: '<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>'
+            value: '<span style="color:#337ab7;font-weight:bold;">' + _t('sync.progress.processing') + '</span>'
           }
         ]
       }],
@@ -1466,26 +1596,30 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         // Update status display
         if (statusField) {
           if (statusStr === 'running') {
-            statusField.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('promotion.progress.processing') + '</span>');
+            statusField.setValue('<span style="color:#337ab7;font-weight:bold;">' + _t('sync.progress.processing') + '</span>');
           } else if (statusStr === 'completed') {
-            statusField.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>');
+            statusField.setValue('<span style="color:#5cb85c;font-weight:bold;">' + _t('sync.progress.success') + '</span>');
           } else if (statusStr === 'failed') {
-            statusField.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>');
+            statusField.setValue('<span style="color:#d9534f;font-weight:bold;">' + _t('sync.progress.failed') + '</span>');
+          } else if (statusStr === 'cancelled') {
+            statusField.setValue('<span style="color:#f0ad4e;font-weight:bold;">' + _t('sync.queue.status.cancelled') + '</span>');
           } else if (statusStr === 'pending') {
-            statusField.setValue('<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>');
+            statusField.setValue('<span style="color:#999;">' + _t('sync.progress.pending') + '</span>');
           }
         }
 
         // Check if task is finished
-        if (statusStr === 'completed' || statusStr === 'failed') {
+        if (statusStr === 'completed' || statusStr === 'failed' || statusStr === 'cancelled') {
           isFinished = true;
           stopPolling();
 
           // Update window title
-          if (statusStr === 'failed') {
-            win.setTitle(_t('promotion.progress.failed'));
+          if (statusStr === 'cancelled') {
+            win.setTitle(_t('sync.queue.status.cancelled'));
+          } else if (statusStr === 'failed') {
+            win.setTitle(_t('sync.progress.failed'));
           } else {
-            win.setTitle(_t('promotion.progress.success'));
+            win.setTitle(_t('sync.progress.success'));
           }
         }
       };
@@ -1534,6 +1668,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       targetOptions.push({ text: repo.name + ' (' + repo.format + ' - ' + repo.type + ')', value: repo.name });
     });
 
+    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    var statusMap = {};
+    if (preview && preview.files) {
+      Ext.each(preview.files, function (f) {
+        if (f.path) { statusMap[f.path] = 'pending'; }
+      });
+    }
+
     var fileStore = Ext.create('Ext.data.Store', {
       fields: ['path', 'type', 'size', 'status'],
       pageSize: 10,
@@ -1550,7 +1692,17 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       })() : []
     });
 
-    var totalFiles = fileStore.getCount();
+    // Sync statusMap to current page records whenever store loads (handles page navigation)
+    fileStore.on('load', function (store) {
+      store.each(function (rec) {
+        var recPath = rec.get('path');
+        if (statusMap[recPath] && statusMap[recPath] !== rec.get('status')) {
+          rec.set('status', statusMap[recPath]);
+        }
+      });
+    });
+
+    var totalFiles = Object.keys(statusMap).length || fileStore.getTotalCount() || fileStore.getCount();
 
     var statusRenderer = function (val) {
       switch (val) {
@@ -1560,6 +1712,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         case 'failed':
           return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'cancelled':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
         default:
@@ -1712,7 +1866,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               });
 
               // Start polling for task status
-              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles);
+              me.startPollingInWindow(win, result.taskId, promoFiles, totalFiles, statusMap);
             })
             .catch(function (err) {
               promoteBtn.setText(_t('promotion.modal.promote'));
@@ -1735,7 +1889,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     win.show();
   },
 
-  startPollingInWindow: function (win, taskId, fileList, totalFiles) {
+  startPollingInWindow: function (win, taskId, fileList, totalFiles, statusMap) {
     var isFinished = false;
     var pollCount = 0;
     var MAX_POLLS = 400; // ~10 minutes at 1.5s interval
@@ -1759,10 +1913,29 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (grid && !grid.destroyed) {
         var store = grid.getStore();
         var taskFailed = (result.status === 'FAILED');
+        // Check if all items were processed by backend
+        var backendProcessedCount = 0;
+        if (statusMap) {
+          for (var bk in statusMap) {
+            if (statusMap[bk] === 'success' || statusMap[bk] === 'failed' || statusMap[bk] === 'skipped') {
+              backendProcessedCount++;
+            }
+          }
+        }
+        var hasUnprocessed = (backendProcessedCount < totalFiles);
+        // Update statusMap for all remaining pending items
+        if (statusMap) {
+          for (var p in statusMap) {
+            if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped') {
+              statusMap[p] = (taskFailed || hasUnprocessed) ? 'failed' : 'success';
+            }
+          }
+        }
+        // Update current page store records (other pages synced via 'load' event)
         store.each(function (rec) {
           var st = rec.get('status');
           if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
-            rec.set('status', taskFailed ? 'failed' : 'success');
+            rec.set('status', (taskFailed || hasUnprocessed) ? 'failed' : 'success');
           }
         });
       }
@@ -1772,16 +1945,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         progressBar.setValue(1);
         var total = backendTotalCount || totalFiles;
         var done = backendDoneCount;
-        // Fallback: if no backend counts, count from store
-        if (!done) {
-          var gridStore = grid ? grid.getStore() : null;
-          total = gridStore ? gridStore.getCount() : totalFiles;
-          if (gridStore) {
-            gridStore.each(function (rec) {
-              var s = rec.get('status');
-              if (s === 'success' || s === 'failed' || s === 'skipped') done++;
-            });
+        // Fallback: if no backend counts, count from statusMap
+        if (!done && statusMap) {
+          done = 0;
+          for (var k in statusMap) {
+            var sv = statusMap[k];
+          if (sv === 'success' || sv === 'failed' || sv === 'skipped' || sv === 'cancelled') done++;
           }
+          total = total || Object.keys(statusMap).length;
         }
         progressBar.updateText(_t('promotion.progress.completed', done, total));
       }
@@ -1841,44 +2012,67 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         var statusStr = (result.status || '').toLowerCase();
         var backendItems = result.items || [];
         var backendItemCount = backendItems.length;
-        var currentTotal = Math.max(store.getCount(), totalFiles);
+        var currentTotal = totalFiles;
 
-        if (statusStr === 'completed' || statusStr === 'failed') {
-            var taskFailed = (statusStr === 'failed');
+        // Update statusMap from backend results first (works across all pages)
+        for (var i = 0; i < backendItems.length; i++) {
+          var item = backendItems[i];
+          if (!item.path) continue;
+          var itemStatus = item.status;
+          if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
+            itemStatus = 'success';
+          }
+          statusMap[item.path] = itemStatus;
+        }
 
-            // Update store items from backend results
-            for (var i = 0; i < backendItems.length; i++) {
-              var item = backendItems[i];
-              if (!item.path) continue;
-              var idx = store.findExact('path', item.path);
-              // Fallback: try matching Docker image:tag format
-              if (idx < 0) {
-                idx = findDockerPathIndex(store, item.path);
+        // Sync current page store records from statusMap
+        // (other pages will be synced via the 'load' event when user navigates)
+        store.each(function (rec) {
+          var recPath = rec.get('path');
+          if (statusMap[recPath] && statusMap[recPath] !== rec.get('status')) {
+            rec.set('status', statusMap[recPath]);
+          }
+        });
+
+        if (statusStr === 'completed' || statusStr === 'failed' || statusStr === 'cancelled') {
+            var taskFailed = (statusStr === 'failed' || statusStr === 'cancelled');
+
+            // Mark any remaining pending/processing items in statusMap
+            // If backend processed fewer items than total, remaining items were NOT promoted
+            var backendProcessedCount = 0;
+            for (var bk in statusMap) {
+              if (statusMap[bk] === 'success' || statusMap[bk] === 'failed' || statusMap[bk] === 'skipped' || statusMap[bk] === 'cancelled') {
+                backendProcessedCount++;
               }
-              if (idx >= 0) {
-                var itemStatus = item.status;
-                if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
-                  itemStatus = 'success';
-                }
-                store.getAt(idx).set('status', itemStatus);
+            }
+            var hasUnprocessed = (backendProcessedCount < currentTotal);
+
+            for (var p in statusMap) {
+              if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped' && statusMap[p] !== 'cancelled') {
+                // If task failed/cancelled or there are unprocessed items, mark remaining as cancelled
+                // Only mark as success if task completed AND all items were processed
+                statusMap[p] = (taskFailed || hasUnprocessed) ? 'cancelled' : 'success';
               }
             }
 
-            // Mark any remaining pending/processing items
+            // Sync current page store records from statusMap
+            // (other pages will be synced via the 'load' event when user navigates)
             store.each(function (rec) {
               var st = rec.get('status');
-              if (st !== 'success' && st !== 'failed' && st !== 'skipped') {
-                rec.set('status', taskFailed ? 'failed' : 'success');
+              if (st !== 'success' && st !== 'failed' && st !== 'skipped' && st !== 'cancelled') {
+                rec.set('status', (taskFailed || hasUnprocessed) ? 'cancelled' : 'success');
               }
             });
 
-            // Set progress bar directly here - use backend count
-            var doneCount = backendItemCount > 0 ? backendItemCount : store.getCount();
+            // Set progress bar - use backend count
+            var doneCount = backendItemCount > 0 ? backendItemCount : Object.keys(statusMap).length;
             progressBar.setValue(1);
-            progressBar.updateText('已完成:' + doneCount + '/' + currentTotal);
+            progressBar.updateText(_t('promotion.progress.completed', doneCount, currentTotal));
 
             // Update window title
-            if (taskFailed) {
+            if (statusStr === 'cancelled') {
+              win.setTitle(_t('promotion.result.title.cancelled'));
+            } else if (taskFailed) {
               win.setTitle(_t('promotion.progress.failed'));
             } else {
               win.setTitle(_t('promotion.progress.success'));
@@ -1892,25 +2086,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             return;
           }
 
-        // Task is still running - update progress from backend items
-        for (var j = 0; j < backendItems.length; j++) {
-          var bi = backendItems[j];
-          if (!bi.path) continue;
-          var bidx = store.findExact('path', bi.path);
-          // Fallback: try matching Docker image:tag format
-          if (bidx < 0) {
-            bidx = findDockerPathIndex(store, bi.path);
-          }
-          if (bidx >= 0) {
-            var biStatus = bi.status;
-            if (biStatus !== 'failed' && biStatus !== 'skipped' && biStatus !== 'success') {
-              biStatus = 'success';
-            }
-            store.getAt(bidx).set('status', biStatus);
-          }
-        }
-
-        // Mark first pending item as processing
+        // Task is still running - mark first pending item as processing (current page only)
         var hasProcessing = false;
         store.each(function (rec) {
           var rs = rec.get('status');
@@ -1920,12 +2096,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           }
         });
 
-        // Count and update progress bar
+        // Count and update progress bar from statusMap (all pages)
         var processedCount = 0;
-        store.each(function (rec) {
-          var st = rec.get('status');
-          if (st === 'success' || st === 'failed' || st === 'skipped') { processedCount++; }
-        });
+        for (var k in statusMap) {
+          var sv = statusMap[k];
+          if (sv === 'success' || sv === 'failed' || sv === 'skipped' || sv === 'cancelled') { processedCount++; }
+        }
 
         var pct = currentTotal > 0 ? (processedCount / currentTotal) : 0;
         progressBar.setValue(pct);
@@ -2065,6 +2241,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       targetOptions.push({ text: repo.name + ' (' + repo.format + ' - ' + repo.type + ')', value: repo.name });
     });
 
+    // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    var dockerStatusMap = {};
+    if (dockerFiles) {
+      Ext.each(dockerFiles, function (f) {
+        var key = f.originalPath || f.path;
+        if (key) { dockerStatusMap[key] = 'pending'; }
+      });
+    }
+
     var fileStore = Ext.create('Ext.data.Store', {
       fields: ['path', 'originalPath', 'type', 'size', 'status'],
       pageSize: 10,
@@ -2075,7 +2260,17 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       data: dockerFiles || []
     });
 
-    var totalFiles = fileStore.getCount();
+    // Sync dockerStatusMap to current page records whenever store loads (handles page navigation)
+    fileStore.on('load', function (store) {
+      store.each(function (rec) {
+        var key = rec.get('originalPath') || rec.get('path');
+        if (dockerStatusMap[key] && dockerStatusMap[key] !== rec.get('status')) {
+          rec.set('status', dockerStatusMap[key]);
+        }
+      });
+    });
+
+    var totalFiles = Object.keys(dockerStatusMap).length || fileStore.getTotalCount() || fileStore.getCount();
 
     var statusRenderer = function (val) {
       switch (val) {
@@ -2085,6 +2280,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         case 'failed':
           return '<span style="color:#d9534f;font-weight:bold;">' + _t('promotion.progress.failed') + '</span>';
+        case 'cancelled':
+          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
         default:
@@ -2189,11 +2386,10 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             promoteBtn.disable();
             cancelBtn.disable();
 
-            // Collect original file paths from preview for promotion
+            // Collect original file paths from preview for promotion (use dockerFiles array directly)
             var promoFiles = [];
-            fileStore.each(function (rec) {
-              var origPath = rec.get('originalPath');
-              if (origPath) { promoFiles.push(origPath); }
+            Ext.each(dockerFiles, function (f) {
+              if (f.originalPath) { promoFiles.push(f.originalPath); }
             });
 
             apiRequest('POST', '/promotion/execute', {
@@ -2228,7 +2424,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
               });
 
               // Start polling
-              me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles);
+              me.startPollingInWindow(win, result.taskId, dockerFiles.map(function(f) { return f.originalPath || f.path; }), totalFiles, dockerStatusMap);
             })
             .catch(function (err) {
               promoteBtn.setText(_t('promotion.modal.promote'));
@@ -2250,16 +2446,19 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 function showSyncQueueCreatedDialog(result) {
   var win = Ext.create('Ext.window.Window', {
     title: _t('sync.queue.created.title'),
-    width: 400,
+    minWidth: 400,
+    maxWidth: 700,
+    autoScroll: true,
     modal: true,
     layout: 'fit',
     items: [{
       xtype: 'panel',
       bodyPadding: 15,
+      autoScroll: true,
       items: [
-        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.queueId'), value: sanitize(result.taskId || result.queueId || '') },
-        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.repository'), value: sanitize(result.repository || '') },
-        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.path'), value: sanitize(result.path || '') },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.queueId'), value: '<span style="word-break:break-all;">' + sanitize(result.taskId || result.queueId || '') + '</span>' },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.repository'), value: '<span style="word-break:break-all;">' + sanitize(result.repository || '') + '</span>' },
+        { xtype: 'displayfield', fieldLabel: _t('sync.queue.created.path'), value: '<span style="word-break:break-all;">' + sanitize(result.path || '') + '</span>' },
         { xtype: 'displayfield', value: _t('sync.queue.created.message') }
       ]
     }],

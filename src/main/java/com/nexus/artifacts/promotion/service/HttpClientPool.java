@@ -127,6 +127,46 @@ public class HttpClientPool {
   }
 
   /**
+   * Execute an HTTP GET request returning a stream for large binary transfers.
+   * The caller is responsible for closing the stream and calling disconnect() on the response.
+   * Uses extended read timeout for large file downloads from proxy repositories.
+   */
+  public HttpResponse getStream(final String url, final Map<String, String> headers) throws IOException {
+    totalRequests.incrementAndGet();
+    HttpURLConnection conn = null;
+    try {
+      conn = openConnection(url, "GET", headers);
+      // Use extended read timeout for large file downloads
+      conn.setReadTimeout(Math.max(readTimeoutMs, 300_000)); // at least 5 minutes
+
+      int statusCode = conn.getResponseCode();
+      Map<String, String> responseHeaders = extractResponseHeaders(conn);
+
+      if (statusCode >= 200 && statusCode < 300) {
+        InputStream stream = conn.getInputStream();
+        long contentLen = -1;
+        String contentLenStr = responseHeaders.get("Content-Length");
+        if (contentLenStr != null) {
+          try { contentLen = Long.parseLong(contentLenStr); } catch (NumberFormatException ignored) {}
+        }
+        // Return stream-based response; caller must close stream and connection
+        return new HttpResponse(statusCode, "", responseHeaders, stream, contentLen, conn);
+      }
+      else {
+        String body = readErrorResponse(conn);
+        conn.disconnect();
+        return new HttpResponse(statusCode, body, responseHeaders);
+      }
+    }
+    catch (IOException e) {
+      if (conn != null) {
+        conn.disconnect();
+      }
+      throw e;
+    }
+  }
+
+  /**
    * Execute an HTTP GET request with custom Accept header for Docker manifests.
    */
   public HttpResponse getWithAccept(final String url, final String acceptHeader,
@@ -211,6 +251,8 @@ public class HttpClientPool {
       conn = openConnection(url, "PUT", headers);
       conn.setDoOutput(true);
       conn.setRequestProperty("Content-Type", contentType);
+      // Use extended read timeout for large file uploads
+      conn.setReadTimeout(Math.max(readTimeoutMs, 300_000)); // at least 5 minutes
 
       if (contentLength > 0) {
         conn.setFixedLengthStreamingMode(contentLength);
@@ -226,6 +268,9 @@ public class HttpClientPool {
           os.write(buffer, 0, bytesRead);
         }
         os.flush();
+      }
+      finally {
+        try { dataStream.close(); } catch (IOException ignored) {}
       }
 
       int statusCode = conn.getResponseCode();
@@ -374,21 +419,52 @@ public class HttpClientPool {
 
   /**
    * HTTP response data transfer object.
+   * Supports both string body (for small responses) and stream body (for large binary transfers).
    */
   public static class HttpResponse {
     private final int statusCode;
     private final String body;
     private final Map<String, String> headers;
+    // Stream-based fields for large binary transfers
+    private final InputStream stream;
+    private final long contentLength;
+    // The underlying connection to disconnect when stream is consumed
+    private final HttpURLConnection connection;
 
     public HttpResponse(final int statusCode, final String body, final Map<String, String> headers) {
+      this(statusCode, body, headers, null, -1, null);
+    }
+
+    public HttpResponse(final int statusCode, final String body, final Map<String, String> headers,
+                        final InputStream stream, final long contentLength,
+                        final HttpURLConnection connection) {
       this.statusCode = statusCode;
       this.body = body;
       this.headers = headers != null ? headers : new HashMap<>();
+      this.stream = stream;
+      this.contentLength = contentLength;
+      this.connection = connection;
     }
 
     public int getStatusCode() { return statusCode; }
     public String getBody() { return body; }
     public Map<String, String> getHeaders() { return headers; }
+    public InputStream getStream() { return stream; }
+    public long getContentLength() { return contentLength; }
+    public HttpURLConnection getConnection() { return connection; }
+
+    /**
+     * Disconnect the underlying HTTP connection and close the stream.
+     * Must be called after consuming a stream-based response to release resources.
+     */
+    public void disconnect() {
+      if (stream != null) {
+        try { stream.close(); } catch (IOException ignored) {}
+      }
+      if (connection != null) {
+        connection.disconnect();
+      }
+    }
 
     public String getHeader(final String name) {
       return headers.get(name);

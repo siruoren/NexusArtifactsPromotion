@@ -44,8 +44,9 @@ public class TaskExecutorService {
   private static final int DEFAULT_SYNC_POOL_SIZE = 4;
   private static final int DEFAULT_MAX_SYNC_QUEUE_SIZE = 20;
   private static final int DEFAULT_MAX_PROMOTION_QUEUE_SIZE = 50;
-  private static final int DEFAULT_MAX_SYNC_RECORDS = 200;
-  private static final long TASK_TIMEOUT_MINUTES = 60;
+  private static final int DEFAULT_MAX_TASK_QUEUE_RECORDS = 200;
+  private static final int DEFAULT_TASK_LOG_TTL_MINUTES = 30;
+  private static final int DEFAULT_TASK_TIMEOUT_MINUTES = 120;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
   // Bounded queue capacity for thread pool (prevents OOM from unbounded task accumulation)
@@ -56,10 +57,13 @@ public class TaskExecutorService {
   private volatile int syncPoolSize = DEFAULT_SYNC_POOL_SIZE;
   private volatile int maxSyncQueueSize = DEFAULT_MAX_SYNC_QUEUE_SIZE;
   private volatile int maxPromotionQueueSize = DEFAULT_MAX_PROMOTION_QUEUE_SIZE;
-  private volatile int maxSyncRecords = DEFAULT_MAX_SYNC_RECORDS;
+  private volatile int maxTaskQueueRecords = DEFAULT_MAX_TASK_QUEUE_RECORDS;
+  private volatile int taskLogTtlMinutes = DEFAULT_TASK_LOG_TTL_MINUTES;
+  private volatile int taskTimeoutMinutes = DEFAULT_TASK_TIMEOUT_MINUTES;
 
   private ExecutorService promotionExecutor;
   private ExecutorService syncExecutor;
+  private java.util.concurrent.ScheduledExecutorService timeoutDetector;
 
   private final Map<String, TaskHandle> promotionTasks = new ConcurrentHashMap<>();
   private final Map<String, TaskHandle> syncTasks = new ConcurrentHashMap<>();
@@ -75,8 +79,18 @@ public class TaskExecutorService {
   private void initExecutors() {
     this.promotionExecutor = createThreadPool("promotion", promotionPoolSize, PROMOTION_QUEUE_CAPACITY);
     this.syncExecutor = createThreadPool("sync", syncPoolSize, SYNC_QUEUE_CAPACITY);
-    log.info("TaskExecutorService initialized - promotion pool: {} (queue: {}), sync pool: {} (queue: {}), max sync queue: {}",
-        promotionPoolSize, PROMOTION_QUEUE_CAPACITY, syncPoolSize, SYNC_QUEUE_CAPACITY, maxSyncQueueSize);
+    // Start timeout detector - checks every 60 seconds
+    this.timeoutDetector = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+      private final AtomicInteger counter = new AtomicInteger(0);
+      @Override public Thread newThread(Runnable r) {
+        Thread t = new Thread(r, "nexus-task-timeout-detector-" + counter.incrementAndGet());
+        t.setDaemon(true);
+        return t;
+      }
+    });
+    this.timeoutDetector.scheduleAtFixedRate(this::detectTimedOutTasks, 60, 60, TimeUnit.SECONDS);
+    log.info("TaskExecutorService initialized - promotion pool: {} (queue: {}), sync pool: {} (queue: {}), max sync queue: {}, task timeout: {}min",
+        promotionPoolSize, PROMOTION_QUEUE_CAPACITY, syncPoolSize, SYNC_QUEUE_CAPACITY, maxSyncQueueSize, taskTimeoutMinutes);
   }
 
   private ExecutorService createThreadPool(final String type, final int poolSize, final int queueCapacity) {
@@ -108,6 +122,17 @@ public class TaskExecutorService {
                                      final String taskDescription,
                                      final String taskId)
   {
+    return submitPromotionTask(task, taskDescription, taskId, null);
+  }
+
+  /**
+   * Submit a promotion task with a pre-defined taskId and username.
+   */
+  public String submitPromotionTask(final Callable<PromotionTaskCallback> task,
+                                     final String taskDescription,
+                                     final String taskId,
+                                     final String username)
+  {
     log.info("Submitting promotion task {}: {}", taskId, taskDescription);
 
     // Check promotion queue capacity to prevent OOM
@@ -122,7 +147,9 @@ public class TaskExecutorService {
 
     try {
       Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
-      promotionTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis()));
+      TaskHandle handle = new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis());
+      handle.username = username;
+      promotionTasks.put(taskId, handle);
       return taskId;
     }
     catch (RejectedExecutionException e) {
@@ -142,8 +169,7 @@ public class TaskExecutorService {
                                 final String sourceRepository,
                                 final String sourcePath)
   {
-    final String taskId = generateTaskId("sync");
-    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, taskId);
+    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, null);
   }
 
   /**
@@ -155,6 +181,19 @@ public class TaskExecutorService {
                                 final String sourcePath,
                                 final String taskId)
   {
+    return submitSyncTask(task, taskDescription, sourceRepository, sourcePath, taskId, null);
+  }
+
+  /**
+   * Submit a sync task with a pre-defined taskId and username.
+   */
+  public String submitSyncTask(final Callable<SyncTaskCallback> task,
+                                final String taskDescription,
+                                final String sourceRepository,
+                                final String sourcePath,
+                                final String taskId,
+                                final String username)
+  {
     log.info("Submitting sync task {}: {}", taskId, taskDescription);
 
     // Check for duplicate source directory sync - cancel old task
@@ -164,8 +203,10 @@ public class TaskExecutorService {
 
     try {
       Future<SyncTaskCallback> future = syncExecutor.submit(wrappedTask);
-      syncTasks.put(taskId, new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
-          sourceRepository, sourcePath));
+      TaskHandle handle = new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
+          sourceRepository, sourcePath);
+      handle.username = username;
+      syncTasks.put(taskId, handle);
       return taskId;
     }
     catch (RejectedExecutionException e) {
@@ -232,12 +273,13 @@ public class TaskExecutorService {
         log.debug("Task {} ({}) started", taskId, type);
 
         // Set timeout watchdog
+        final long timeoutMinutes = taskTimeoutMinutes;
         Thread timeoutWatchdog = new Thread(() -> {
           try {
-            Thread.sleep(TimeUnit.MINUTES.toMillis(TASK_TIMEOUT_MINUTES));
+            Thread.sleep(TimeUnit.MINUTES.toMillis(timeoutMinutes));
             if (!currentThread.isInterrupted()) {
               log.warn("Task {} ({}) exceeded timeout of {} minutes, interrupting",
-                  taskId, type, TASK_TIMEOUT_MINUTES);
+                  taskId, type, timeoutMinutes);
               currentThread.interrupt();
             }
           }
@@ -300,7 +342,8 @@ public class TaskExecutorService {
         handle.status = TaskStatus.COMPLETED;
       }
       catch (Exception e) {
-        handle.status = TaskStatus.FAILED;
+        // Cancellation means the task was terminated, not failed
+        handle.status = TaskStatus.CANCELLED;
       }
     }
     return handle.status;
@@ -320,7 +363,8 @@ public class TaskExecutorService {
         handle.status = TaskStatus.COMPLETED;
       }
       catch (Exception e) {
-        handle.status = TaskStatus.FAILED;
+        // Cancellation means the task was terminated, not failed
+        handle.status = TaskStatus.CANCELLED;
       }
     }
     return handle.status;
@@ -410,9 +454,19 @@ public class TaskExecutorService {
     log.info("Max sync queue size updated to {}", maxSyncQueueSize);
   }
 
-  public void updateMaxSyncRecords(final int newMax) {
-    this.maxSyncRecords = Math.max(1, newMax);
-    log.info("Max sync records updated to {}", maxSyncRecords);
+  public void updateMaxTaskQueueRecords(final int newMax) {
+    this.maxTaskQueueRecords = Math.max(1, newMax);
+    log.info("Max task queue records updated to {}", maxTaskQueueRecords);
+  }
+
+  public void updateTaskLogTtlMinutes(final int newTtl) {
+    this.taskLogTtlMinutes = Math.max(1, newTtl);
+    log.info("Task log TTL updated to {} minutes", taskLogTtlMinutes);
+  }
+
+  public void updateTaskTimeoutMinutes(final int newTimeout) {
+    this.taskTimeoutMinutes = Math.max(1, newTimeout);
+    log.info("Task timeout updated to {} minutes", taskTimeoutMinutes);
   }
 
   private void reconfigurePool(final ExecutorService executor, final int newSize, final String type) {
@@ -428,7 +482,11 @@ public class TaskExecutorService {
   public int getSyncPoolSize() { return syncPoolSize; }
   public int getMaxSyncQueueSize() { return maxSyncQueueSize; }
   public int getMaxPromotionQueueSize() { return maxPromotionQueueSize; }
-  public int getMaxSyncRecords() { return maxSyncRecords; }
+  public int getMaxTaskQueueRecords() { return maxTaskQueueRecords; }
+  public int getTaskLogTtlMinutes() { return taskLogTtlMinutes; }
+  public long getTaskLogTtlMs() { return taskLogTtlMinutes * 60 * 1000L; }
+  public int getTaskTimeoutMinutes() { return taskTimeoutMinutes; }
+  public long getTaskTimeoutMs() { return taskTimeoutMinutes * 60 * 1000L; }
 
   /**
    * Update max promotion queue size.
@@ -465,11 +523,129 @@ public class TaskExecutorService {
   }
 
   /**
+   * Cancel a running or pending task by taskId.
+   * Works for both promotion and sync tasks.
+   * @return true if the task was found and cancelled, false otherwise
+   */
+  public boolean cancelTask(final String taskId) {
+    if (taskId == null) return false;
+
+    // Check promotion tasks
+    TaskHandle promoHandle = promotionTasks.get(taskId);
+    if (promoHandle != null) {
+      if (promoHandle.status == TaskStatus.PENDING || promoHandle.status == TaskStatus.RUNNING) {
+        promoHandle.future.cancel(true);
+        promoHandle.status = TaskStatus.CANCELLED;
+        promoHandle.endTime = System.currentTimeMillis();
+        cacheManager.cleanupTask(taskId);
+        log.info("Promotion task {} cancelled", taskId);
+        return true;
+      }
+      return false;
+    }
+
+    // Check sync tasks
+    TaskHandle syncHandle = syncTasks.get(taskId);
+    if (syncHandle != null) {
+      if (syncHandle.status == TaskStatus.PENDING || syncHandle.status == TaskStatus.RUNNING) {
+        syncHandle.future.cancel(true);
+        syncHandle.status = TaskStatus.CANCELLED;
+        syncHandle.endTime = System.currentTimeMillis();
+        cacheManager.cleanupTask(taskId);
+        log.info("Sync task {} cancelled", taskId);
+        return true;
+      }
+      return false;
+    }
+
+    log.warn("Task {} not found for cancellation", taskId);
+    return false;
+  }
+
+  /**
+   * Get the username of the task creator.
+   * Returns null if task not found.
+   */
+  public String getTaskUsername(final String taskId) {
+    if (taskId == null) return null;
+
+    TaskHandle promoHandle = promotionTasks.get(taskId);
+    if (promoHandle != null) {
+      return promoHandle.username;
+    }
+
+    TaskHandle syncHandle = syncTasks.get(taskId);
+    if (syncHandle != null) {
+      return syncHandle.username;
+    }
+
+    return null;
+  }
+
+  /**
+   * Check if a task exists and is cancellable (pending or running).
+   */
+  public boolean isTaskCancellable(final String taskId) {
+    if (taskId == null) return false;
+
+    TaskHandle promoHandle = promotionTasks.get(taskId);
+    if (promoHandle != null) {
+      return promoHandle.status == TaskStatus.PENDING || promoHandle.status == TaskStatus.RUNNING;
+    }
+
+    TaskHandle syncHandle = syncTasks.get(taskId);
+    if (syncHandle != null) {
+      return syncHandle.status == TaskStatus.PENDING || syncHandle.status == TaskStatus.RUNNING;
+    }
+
+    return false;
+  }
+
+  /**
+   * Detect and cancel tasks that have exceeded the configured timeout.
+   * Runs periodically to prevent tasks from running indefinitely.
+   */
+  private void detectTimedOutTasks() {
+    long timeoutMs = getTaskTimeoutMs();
+    long now = System.currentTimeMillis();
+
+    checkTimedOutTasks(promotionTasks, timeoutMs, now, "promotion");
+    checkTimedOutTasks(syncTasks, timeoutMs, now, "sync");
+  }
+
+  private void checkTimedOutTasks(final Map<String, TaskHandle> tasks, final long timeoutMs, final long now, final String type) {
+    for (Map.Entry<String, TaskHandle> entry : tasks.entrySet()) {
+      String taskId = entry.getKey();
+      TaskHandle handle = entry.getValue();
+
+      // Only check running or pending tasks
+      if (handle.status != TaskStatus.RUNNING && handle.status != TaskStatus.PENDING) {
+        continue;
+      }
+
+      long elapsed = now - handle.startTime;
+      if (elapsed > timeoutMs) {
+        log.warn("{} task {} has exceeded timeout ({}min elapsed, {}min limit), cancelling",
+            type, taskId, elapsed / 60000, taskTimeoutMinutes);
+        handle.future.cancel(true);
+        handle.status = TaskStatus.CANCELLED;
+        handle.endTime = now;
+        cacheManager.cleanupTask(taskId);
+      }
+    }
+  }
+
+  /**
    * Graceful shutdown on plugin destroy.
    */
   @PreDestroy
   public void shutdown() {
     log.info("Shutting down TaskExecutorService...");
+
+    // Stop timeout detector
+    if (timeoutDetector != null) {
+      timeoutDetector.shutdownNow();
+    }
 
     shutdownExecutor(promotionExecutor, "promotion");
     shutdownExecutor(syncExecutor, "sync");
@@ -525,6 +701,7 @@ public class TaskExecutorService {
     public final String sourcePath;
     public final String targetRepository;
     public volatile String migratedToTaskId;
+    public volatile String username;
 
     public TaskHandle(String taskId, Future<?> future, TaskStatus status, long startTime) {
       this(taskId, future, status, startTime, null, null, null);

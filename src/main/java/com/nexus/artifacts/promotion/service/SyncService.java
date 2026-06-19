@@ -90,9 +90,6 @@ public class SyncService {
     }
   }
 
-  /** Maximum time (ms) to keep completed task info before cleanup (30 minutes) */
-  private static final long TASK_INFO_TTL_MS = 30 * 60 * 1000L;
-
   /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
   private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
   private static final String LOCAL_NEXUS_BASE_HTTP = "http://localhost:8081";
@@ -351,10 +348,14 @@ public class SyncService {
         }
         catch (Exception e) {
           log.error("Sync task failed: {}", e.getMessage(), e);
-          taskInfo.setStatus(TaskStatus.FAILED);
-          taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          // If the thread was interrupted (manual cancellation), use CANCELLED status
+          boolean isCancelled = Thread.currentThread().isInterrupted()
+              || (e instanceof InterruptedException)
+              || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
+          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
-          taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
+          taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
         }
 
         taskInfos.put(taskInfo.getTaskId(), taskInfo);
@@ -375,7 +376,7 @@ public class SyncService {
         }
       }
     }, String.format("Sync %s from %s", request.getPath(), request.getRepositoryName()),
-        request.getRepositoryName(), request.getPath(), preTaskId);
+        request.getRepositoryName(), request.getPath(), preTaskId, username);
 
     // Create initial task info record
     SyncTaskInfo initialInfo = new SyncTaskInfo();
@@ -475,10 +476,13 @@ public class SyncService {
     }
     catch (Exception e) {
       log.error("Scheduled sync task failed: {}", e.getMessage(), e);
-      taskInfo.setStatus(TaskStatus.FAILED);
-      taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      boolean isCancelled = Thread.currentThread().isInterrupted()
+          || (e instanceof InterruptedException)
+          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+      taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
+      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
-      taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
     }
 
     // Update stored info with final state
@@ -495,13 +499,13 @@ public class SyncService {
     SyncTaskInfo info = taskInfos.get(taskId);
     if (info != null) {
       // Only override status from TaskExecutor if info is not already in a terminal state
-      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED) {
+      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED && info.getStatus() != TaskStatus.CANCELLED) {
         TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
         if (status != null) {
           info.setStatus(status);
         }
       }
-      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED || info.getStatus() == TaskStatus.MIGRATED) {
+      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED || info.getStatus() == TaskStatus.CANCELLED || info.getStatus() == TaskStatus.MIGRATED) {
         taskExecutor.cleanupSyncTaskHandle(taskId);
       }
       return info;
@@ -524,19 +528,35 @@ public class SyncService {
   }
 
   /**
+   * Cancel a sync task by updating its task info status to CANCELLED.
+   */
+  public void cancelSyncTask(final String taskId) {
+    SyncTaskInfo info = taskInfos.get(taskId);
+    if (info != null && info.getStatus() != TaskStatus.CANCELLED) {
+      log.info("Updating sync task {} info status from {} to CANCELLED", taskId, info.getStatus());
+      info.setStatus(TaskStatus.CANCELLED);
+      info.setEndTime(System.currentTimeMillis());
+      info.setResult("Task cancelled");
+    }
+  }
+
+  /**
    * Get all sync tasks (for queue display).
-   * Returns at most maxSyncRecords entries (newest first).
+   * Returns at most maxTaskQueueRecords entries (newest first).
    */
   public List<SyncTaskInfo> getAllSyncTasks() {
     cleanupExpiredTaskInfos();
     List<SyncTaskInfo> tasks = new ArrayList<>();
     for (Map.Entry<String, SyncTaskInfo> entry : taskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
+      if (info.getTaskType() == null) {
+        info.setTaskType("sync");
+      }
       TaskStatus status = taskExecutor.getSyncTaskStatus(entry.getKey());
       if (status != null) {
         info.setStatus(status);
       }
-      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED) {
+      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.CANCELLED || status == TaskStatus.MIGRATED) {
         taskExecutor.cleanupSyncTaskHandle(entry.getKey());
       }
       tasks.add(info);
@@ -552,53 +572,11 @@ public class SyncService {
     }
 
     tasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
-    int maxRecords = taskExecutor.getMaxSyncRecords();
+    int maxRecords = taskExecutor.getMaxTaskQueueRecords();
     if (tasks.size() > maxRecords) {
       tasks = tasks.subList(0, maxRecords);
     }
     return tasks;
-  }
-
-  /**
-   * Resubmit a recovered sync task after Nexus restart.
-   * Called by {@link SyncQueuePersistenceManager} during startup recovery.
-   */
-  public void resubmitRecoveredTask(final SyncTaskInfo recoveredTask) {
-    if (recoveredTask == null || recoveredTask.getTaskId() == null) {
-      log.warn("Cannot resubmit null or invalid recovered task");
-      return;
-    }
-
-    String taskId = recoveredTask.getTaskId();
-    String repoName = recoveredTask.getSourceRepository();
-    String path = recoveredTask.getPath();
-
-    log.info("Resubmitting recovered sync task: {} for {}:{}", taskId, repoName, path);
-
-    // Store the task info in memory
-    taskInfos.put(taskId, recoveredTask);
-
-    // Create a new sync request and submit it
-    SyncRequest request = new SyncRequest();
-    request.setRepositoryName(repoName);
-    request.setPath(path);
-    request.setIsDirectory(recoveredTask.isDirectory());
-    request.setFormat(recoveredTask.getFormat());
-
-    // Submit via normal sync flow (which handles permission, queue capacity, etc.)
-    try {
-      String newTaskId = sync(request);
-      log.info("Recovered task {} resubmitted as new task {}", taskId, newTaskId);
-      // Mark the old task as migrated
-      recoveredTask.setStatus(TaskStatus.MIGRATED);
-      recoveredTask.setEndTime(System.currentTimeMillis());
-    }
-    catch (Exception e) {
-      log.error("Failed to resubmit recovered task {}: {}", taskId, e.getMessage());
-      recoveredTask.setStatus(TaskStatus.FAILED);
-      recoveredTask.setErrorMessage("Recovery failed: " + sanitizeErrorMessage(e.getMessage()));
-      recoveredTask.setEndTime(System.currentTimeMillis());
-    }
   }
 
   /**
@@ -615,18 +593,19 @@ public class SyncService {
   }
 
   /**
-   * Clean up task info entries that have been completed for longer than TASK_INFO_TTL_MS.
+   * Clean up task info entries that have been completed for longer than the configured TTL.
    */
   private void cleanupExpiredTaskInfos() {
+    long ttlMs = taskExecutor.getTaskLogTtlMs();
     long now = System.currentTimeMillis();
     List<String> expiredTaskIds = new ArrayList<>();
 
     for (Map.Entry<String, SyncTaskInfo> entry : taskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
       TaskStatus status = info.getStatus();
-      if ((status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.MIGRATED)
+      if ((status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.CANCELLED || status == TaskStatus.MIGRATED)
           && info.getEndTime() > 0
-          && (now - info.getEndTime()) > TASK_INFO_TTL_MS) {
+          && (now - info.getEndTime()) > ttlMs) {
         expiredTaskIds.add(entry.getKey());
       }
     }

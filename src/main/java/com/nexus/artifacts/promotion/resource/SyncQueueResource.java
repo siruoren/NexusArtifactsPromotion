@@ -1,12 +1,15 @@
 package com.nexus.artifacts.promotion.resource;
 
+import java.util.ArrayList;
 import java.util.List;
 
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
 import javax.ws.rs.GET;
+import javax.ws.rs.POST;
 import javax.ws.rs.Path;
+import javax.ws.rs.PathParam;
 import javax.ws.rs.Produces;
 import javax.ws.rs.QueryParam;
 import javax.ws.rs.DefaultValue;
@@ -19,17 +22,24 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.rest.Resource;
 
+import com.nexus.artifacts.promotion.model.PromotionTaskResult;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
+import com.nexus.artifacts.promotion.model.TaskStatus;
+import com.nexus.artifacts.promotion.service.DockerService;
+import com.nexus.artifacts.promotion.service.PromotionService;
 import com.nexus.artifacts.promotion.service.SyncService;
+import com.nexus.artifacts.promotion.service.TaskExecutorService;
+import com.nexus.artifacts.promotion.security.PermissionChecker;
 
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
 
 /**
- * REST API for the sync queue management page.
- * Displayed under Browse menu as "Sync Queue".
+ * REST API for the unified task queue management page.
+ * Displayed under Browse menu as "Task Queue".
+ * Shows both sync and promotion tasks.
  */
-@Api("Sync Queue")
+@Api("Task Queue")
 @Path("/v1/sync/queue")
 @Named
 @Singleton
@@ -38,10 +48,22 @@ public class SyncQueueResource implements Resource {
   private static final Logger log = LoggerFactory.getLogger(SyncQueueResource.class);
 
   private final SyncService syncService;
+  private final PromotionService promotionService;
+  private final DockerService dockerService;
+  private final TaskExecutorService taskExecutor;
+  private final PermissionChecker permissionChecker;
 
   @Inject
-  public SyncQueueResource(final SyncService syncService) {
+  public SyncQueueResource(final SyncService syncService,
+                            final PromotionService promotionService,
+                            final DockerService dockerService,
+                            final TaskExecutorService taskExecutor,
+                            final PermissionChecker permissionChecker) {
     this.syncService = syncService;
+    this.promotionService = promotionService;
+    this.dockerService = dockerService;
+    this.taskExecutor = taskExecutor;
+    this.permissionChecker = permissionChecker;
   }
 
   /**
@@ -51,9 +73,9 @@ public class SyncQueueResource implements Resource {
   private Response requireAuthenticated() {
     Subject subject = SecurityUtils.getSubject();
     if (subject == null || !subject.isAuthenticated() || isAnonymous(subject)) {
-      log.warn("Unauthenticated access attempt to sync queue API");
+      log.warn("Unauthenticated access attempt to task queue API");
       return Response.status(Response.Status.UNAUTHORIZED)
-          .entity("{\"error\":\"Authentication required\",\"message\":\"Please log in to access sync queue\"}")
+          .entity("{\"error\":\"Authentication required\",\"message\":\"Please log in to access task queue\"}")
           .build();
     }
     return null;
@@ -72,12 +94,30 @@ public class SyncQueueResource implements Resource {
   }
 
   /**
-   * Get all sync tasks (for queue display page).
-   * Shows: queue ID, source/target repo, file details, status, times, username, result.
+   * Check if the current user is an admin.
+   */
+  private boolean isAdmin() {
+    Subject subject = SecurityUtils.getSubject();
+    if (subject == null) return false;
+    return subject.hasRole("admin") || subject.isPermitted("nexus:*");
+  }
+
+  /**
+   * Check if the current user can terminate a task.
+   * Only the task creator or an admin can terminate.
+   */
+  private boolean canTerminateTask(final String taskCreator) {
+    if (isAdmin()) return true;
+    String currentUser = permissionChecker.getCurrentUsername();
+    return currentUser != null && currentUser.equals(taskCreator);
+  }
+
+  /**
+   * Get all tasks (sync + promotion) for the unified task queue.
    */
   @GET
   @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("List all sync queue tasks (root endpoint)")
+  @ApiOperation("List all tasks (sync + promotion)")
   public Response listAllTasks(
       @QueryParam("page") @DefaultValue("1") int page,
       @QueryParam("start") @DefaultValue("0") int start,
@@ -88,76 +128,80 @@ public class SyncQueueResource implements Resource {
       return authError;
     }
     try {
-      List<SyncTaskInfo> tasks = syncService.getAllSyncTasks();
+      List<SyncTaskInfo> tasks = getAllTasks();
       return Response.ok(tasks).build();
     }
     catch (Exception e) {
-      log.error("Failed to list sync tasks: {}", e.getMessage());
+      log.error("Failed to list tasks: {}", e.getMessage());
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Failed to list sync tasks\"}")
+          .entity("{\"error\":\"Failed to list tasks\"}")
           .build();
     }
   }
 
   /**
-   * Get all sync tasks (alias /list for backward compatibility).
+   * Get all tasks (alias /list for backward compatibility).
    */
   @GET
   @Path("/list")
   @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("List all sync queue tasks")
-  public Response listAllTasksAlias()
-  {
+  @ApiOperation("List all tasks")
+  public Response listAllTasksAlias() {
     Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
     }
     try {
-      List<SyncTaskInfo> tasks = syncService.getAllSyncTasks();
+      List<SyncTaskInfo> tasks = getAllTasks();
       return Response.ok(tasks).build();
     }
     catch (Exception e) {
-      log.error("Failed to list sync tasks: {}", e.getMessage());
+      log.error("Failed to list tasks: {}", e.getMessage());
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Failed to list sync tasks\"}")
+          .entity("{\"error\":\"Failed to list tasks\"}")
           .build();
     }
   }
 
   /**
-   * Get active (pending/running) sync tasks only.
+   * Get active (pending/running) tasks only.
    */
   @GET
   @Path("/active")
   @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("List active sync queue tasks")
-  public Response listActiveTasks()
-  {
+  @ApiOperation("List active tasks")
+  public Response listActiveTasks() {
     Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
     }
     try {
-      List<SyncTaskInfo> tasks = syncService.getActiveSyncTasks();
-      return Response.ok(tasks).build();
+      List<SyncTaskInfo> allTasks = getAllTasks();
+      List<SyncTaskInfo> activeTasks = new ArrayList<>();
+      for (SyncTaskInfo task : allTasks) {
+        TaskStatus status = task.getStatus();
+        if (status == TaskStatus.PENDING || status == TaskStatus.RUNNING) {
+          activeTasks.add(task);
+        }
+      }
+      return Response.ok(activeTasks).build();
     }
     catch (Exception e) {
-      log.error("Failed to list active sync tasks: {}", e.getMessage());
+      log.error("Failed to list active tasks: {}", e.getMessage());
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Failed to list active sync tasks\"}")
+          .entity("{\"error\":\"Failed to list active tasks\"}")
           .build();
     }
   }
 
   /**
-   * Get a specific sync task by ID.
+   * Get a specific task by ID.
    */
   @GET
   @Path("/{taskId}")
   @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("Get sync task details")
-  public Response getTask(@javax.ws.rs.PathParam("taskId") final String taskId)
-  {
+  @ApiOperation("Get task details")
+  public Response getTask(@PathParam("taskId") final String taskId) {
     Response authError = requireAuthenticated();
     if (authError != null) {
       return authError;
@@ -172,11 +216,166 @@ public class SyncQueueResource implements Resource {
       return Response.ok(info).build();
     }
     catch (Exception e) {
-      log.error("Failed to get sync task: {}", e.getMessage());
+      log.error("Failed to get task: {}", e.getMessage());
       return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Failed to get sync task\"}")
+          .entity("{\"error\":\"Failed to get task\"}")
           .build();
     }
+  }
+
+  /**
+   * Terminate a running or pending task.
+   * Only the task creator or an admin can terminate a task.
+   */
+  @POST
+  @Path("/terminate/{taskId}")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("Terminate a task")
+  public Response terminateTask(@PathParam("taskId") final String taskId) {
+    Response authError = requireAuthenticated();
+    if (authError != null) {
+      return authError;
+    }
+    try {
+      String safeTaskId = sanitize(taskId);
+
+      // Check if task exists and is cancellable
+      if (!taskExecutor.isTaskCancellable(safeTaskId)) {
+        // Also check sync/promotion task info maps for tasks that might have finished
+        SyncTaskInfo syncInfo = syncService.getTaskInfo(safeTaskId);
+        if (syncInfo != null && (syncInfo.getStatus() == TaskStatus.COMPLETED
+            || syncInfo.getStatus() == TaskStatus.FAILED
+            || syncInfo.getStatus() == TaskStatus.CANCELLED
+            || syncInfo.getStatus() == TaskStatus.MIGRATED)) {
+          return Response.status(Response.Status.BAD_REQUEST)
+              .entity("{\"error\":\"Task already finished\",\"status\":\"" + syncInfo.getStatus().getValue() + "\"}")
+              .build();
+        }
+
+        // Check promotion task result
+        PromotionTaskResult promoResult = promotionService.getTaskResult(safeTaskId);
+        if (promoResult != null) {
+          return Response.status(Response.Status.BAD_REQUEST)
+              .entity("{\"error\":\"Task already finished\",\"status\":\"" + promoResult.getStatus() + "\"}")
+              .build();
+        }
+
+        return Response.status(Response.Status.NOT_FOUND)
+            .entity("{\"error\":\"Task not found\"}")
+            .build();
+      }
+
+      // Check permission: only task creator or admin can terminate
+      String taskUsername = taskExecutor.getTaskUsername(safeTaskId);
+      // Also check from sync task info
+      if (taskUsername == null) {
+        SyncTaskInfo syncInfo = syncService.getTaskInfo(safeTaskId);
+        if (syncInfo != null) {
+          taskUsername = syncInfo.getUsername();
+        }
+      }
+      // Also check from promotion task result
+      if (taskUsername == null) {
+        PromotionTaskResult promoResult2 = promotionService.getTaskResult(safeTaskId);
+        if (promoResult2 != null) {
+          taskUsername = promoResult2.getUsername();
+        }
+      }
+
+      if (!canTerminateTask(taskUsername)) {
+        String currentUser = permissionChecker.getCurrentUsername();
+        log.warn("User {} attempted to terminate task {} owned by {} - permission denied",
+            currentUser, safeTaskId, taskUsername);
+        return Response.status(Response.Status.FORBIDDEN)
+            .entity("{\"error\":\"Permission denied\",\"message\":\"Only the task creator or admin can terminate this task\"}")
+            .build();
+      }
+
+      boolean cancelled = taskExecutor.cancelTask(safeTaskId);
+      // Also disconnect any active HTTP connections for this task
+      promotionService.cancelPromotionTask(safeTaskId);
+      if (cancelled) {
+        log.info("Task {} terminated by user {}", safeTaskId, permissionChecker.getCurrentUsername());
+
+        // Update sync task info if it exists
+        syncService.cancelSyncTask(safeTaskId);
+
+        // Update Docker task results if they exist
+        dockerService.cancelDockerPromotionTask(safeTaskId);
+        dockerService.cancelDockerSyncTask(safeTaskId);
+
+        return Response.ok()
+            .entity("{\"taskId\":\"" + jsonEscape(safeTaskId) + "\",\"status\":\"cancelled\",\"message\":\"Task terminated successfully\"}")
+            .build();
+      }
+      else {
+        return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+            .entity("{\"error\":\"Failed to terminate task\"}")
+            .build();
+      }
+    }
+    catch (Exception e) {
+      log.error("Failed to terminate task {}: {}", taskId, e.getMessage());
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to terminate task\"}")
+          .build();
+    }
+  }
+
+  /**
+   * Get current user info for frontend permission checks.
+   */
+  @GET
+  @Path("/currentUser")
+  @Produces(MediaType.APPLICATION_JSON)
+  @ApiOperation("Get current user info")
+  public Response getCurrentUser() {
+    Response authError = requireAuthenticated();
+    if (authError != null) {
+      return authError;
+    }
+    try {
+      String username = permissionChecker.getCurrentUsername();
+      boolean admin = isAdmin();
+      return Response.ok()
+          .entity("{\"username\":\"" + jsonEscape(username) + "\",\"isAdmin\":" + admin + "}")
+          .build();
+    }
+    catch (Exception e) {
+      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
+          .entity("{\"error\":\"Failed to get user info\"}")
+          .build();
+    }
+  }
+
+  /**
+   * Get all tasks (sync + promotion) combined and sorted.
+   */
+  private List<SyncTaskInfo> getAllTasks() {
+    List<SyncTaskInfo> tasks = new ArrayList<>();
+
+    // Get sync tasks
+    try {
+      List<SyncTaskInfo> syncTasks = syncService.getAllSyncTasks();
+      tasks.addAll(syncTasks);
+    }
+    catch (Exception e) {
+      log.warn("Failed to retrieve sync tasks: {}", e.getMessage());
+    }
+
+    // Get promotion tasks
+    try {
+      List<SyncTaskInfo> promoTasks = promotionService.getAllPromotionTasksAsSyncTaskInfo();
+      tasks.addAll(promoTasks);
+    }
+    catch (Exception e) {
+      log.warn("Failed to retrieve promotion tasks: {}", e.getMessage());
+    }
+
+    // Sort by start time descending
+    tasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
+
+    return tasks;
   }
 
   private String sanitize(final String input) {
@@ -186,5 +385,22 @@ public class SyncQueueResource implements Resource {
         .replace("\"", "&quot;")
         .replace("'", "&#x27;")
         .replace("&", "&amp;");
+  }
+
+  private String jsonEscape(final String input) {
+    if (input == null) return "";
+    StringBuilder sb = new StringBuilder(input.length() + 16);
+    for (int i = 0; i < input.length(); i++) {
+      char c = input.charAt(i);
+      switch (c) {
+        case '"':  sb.append("\\\""); break;
+        case '\\': sb.append("\\\\"); break;
+        case '\n': sb.append("\\n"); break;
+        case '\r': sb.append("\\r"); break;
+        case '\t': sb.append("\\t"); break;
+        default:   sb.append(c); break;
+      }
+    }
+    return sb.toString();
   }
 }

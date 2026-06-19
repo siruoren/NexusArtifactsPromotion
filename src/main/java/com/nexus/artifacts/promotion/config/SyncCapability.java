@@ -68,15 +68,39 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
       }
     }
 
-    String maxRecordsStr = props.get(PROP_MAX_SYNC_RECORDS);
+    String maxRecordsStr = props.get(PROP_MAX_TASK_QUEUE_RECORDS);
     if (maxRecordsStr != null) {
       try {
         int maxRecords = Integer.parseInt(maxRecordsStr);
-        taskExecutor.updateMaxSyncRecords(maxRecords);
-        log.info("Max sync records set to {} from capability configuration", maxRecords);
+        taskExecutor.updateMaxTaskQueueRecords(maxRecords);
+        log.info("Max task queue records set to {} from capability configuration", maxRecords);
       }
       catch (NumberFormatException e) {
-        log.warn("Invalid max sync records value: {}", maxRecordsStr);
+        log.warn("Invalid max task queue records value: {}", maxRecordsStr);
+      }
+    }
+
+    String taskLogTtlStr = props.get(PROP_TASK_LOG_TTL_MINUTES);
+    if (taskLogTtlStr != null) {
+      try {
+        int ttlMinutes = Integer.parseInt(taskLogTtlStr);
+        taskExecutor.updateTaskLogTtlMinutes(ttlMinutes);
+        log.info("Task log TTL set to {} minutes from capability configuration", ttlMinutes);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid task log TTL value: {}", taskLogTtlStr);
+      }
+    }
+
+    String taskTimeoutStr = props.get(PROP_TASK_TIMEOUT_MINUTES);
+    if (taskTimeoutStr != null) {
+      try {
+        int timeoutMinutes = Integer.parseInt(taskTimeoutStr);
+        taskExecutor.updateTaskTimeoutMinutes(timeoutMinutes);
+        log.info("Task timeout set to {} minutes from capability configuration", timeoutMinutes);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid task timeout value: {}", taskTimeoutStr);
       }
     }
 

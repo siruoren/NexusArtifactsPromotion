@@ -100,9 +100,6 @@ public class DockerService {
     }
   }
 
-  /** Maximum time (ms) to keep completed task results */
-  private static final long TASK_RESULT_TTL_MS = 30 * 60 * 1000L;
-
   /** Connection/read timeout in milliseconds */
   private static final int TIMEOUT_MS = 300_000;
 
@@ -1078,8 +1075,11 @@ public class DockerService {
         }
         catch (Exception e) {
           log.error("Docker promotion task {} failed: {}", taskId, e.getMessage(), e);
-          result.setStatus(TaskStatus.FAILED.getValue());
-          result.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          boolean isCancelled = Thread.currentThread().isInterrupted()
+              || (e instanceof InterruptedException)
+              || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
+          result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
         }
 
@@ -1671,10 +1671,13 @@ public class DockerService {
     }
     catch (Exception e) {
       log.error("Docker scheduled sync task failed: {}", e.getMessage(), e);
-      taskInfo.setStatus(TaskStatus.FAILED);
-      taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      boolean isCancelled = Thread.currentThread().isInterrupted()
+          || (e instanceof InterruptedException)
+          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+      taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
+      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
-      taskInfo.setResult("Failed: " + sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
     }
 
     syncTaskInfos.put(taskId, taskInfo);
@@ -1891,8 +1894,11 @@ public class DockerService {
         }
         catch (Exception e) {
           log.error("Docker sync task failed: {}", e.getMessage(), e);
-          taskInfo.setStatus(TaskStatus.FAILED);
-          taskInfo.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          boolean isCancelled = Thread.currentThread().isInterrupted()
+              || (e instanceof InterruptedException)
+              || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
+          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
         }
 
@@ -2413,28 +2419,58 @@ public class DockerService {
     SyncTaskInfo info = syncTaskInfos.get(taskId);
     if (info != null) {
       // Only override status from TaskExecutor if info is not already in a terminal state
-      // (DockerService sets FAILED/COMPLETED internally before TaskExecutor's finally block)
-      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED) {
+      // (DockerService sets FAILED/COMPLETED/CANCELLED internally before TaskExecutor's finally block)
+      if (info.getStatus() != TaskStatus.FAILED && info.getStatus() != TaskStatus.COMPLETED
+          && info.getStatus() != TaskStatus.CANCELLED) {
         TaskStatus status = taskExecutor.getSyncTaskStatus(taskId);
         if (status != null) {
           info.setStatus(status);
         }
       }
-      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED) {
+      if (info.getStatus() == TaskStatus.COMPLETED || info.getStatus() == TaskStatus.FAILED
+          || info.getStatus() == TaskStatus.CANCELLED) {
         taskExecutor.cleanupSyncTaskHandle(taskId);
       }
     }
     return info;
   }
 
+  /**
+   * Cancel a Docker promotion task by updating its result status to CANCELLED.
+   */
+  public void cancelDockerPromotionTask(final String taskId) {
+    PromotionTaskResult result = promotionTaskResults.get(taskId);
+    if (result != null && !"cancelled".equalsIgnoreCase(result.getStatus())) {
+      log.info("Updating Docker promotion task {} result status from {} to CANCELLED", taskId, result.getStatus());
+      result.setStatus(TaskStatus.CANCELLED.getValue());
+      result.setErrorMessage("Task cancelled");
+      result.setEndTime(System.currentTimeMillis());
+      promotionTaskResults.put(taskId, copyPromotionResult(result));
+    }
+  }
+
+  /**
+   * Cancel a Docker sync task by updating its task info status to CANCELLED.
+   */
+  public void cancelDockerSyncTask(final String taskId) {
+    SyncTaskInfo info = syncTaskInfos.get(taskId);
+    if (info != null && info.getStatus() != TaskStatus.CANCELLED) {
+      log.info("Updating Docker sync task {} info status from {} to CANCELLED", taskId, info.getStatus());
+      info.setStatus(TaskStatus.CANCELLED);
+      info.setEndTime(System.currentTimeMillis());
+      info.setResult("Task cancelled");
+    }
+  }
+
   private void cleanupExpiredPromotionTaskResults() {
+    long ttlMs = taskExecutor.getTaskLogTtlMs();
     long now = System.currentTimeMillis();
     List<String> expired = new ArrayList<>();
     for (Map.Entry<String, PromotionTaskResult> entry : promotionTaskResults.entrySet()) {
       PromotionTaskResult r = entry.getValue();
       String s = r.getStatus();
-      if (("completed".equalsIgnoreCase(s) || "failed".equalsIgnoreCase(s)) && r.getEndTime() > 0
-          && (now - r.getEndTime()) > TASK_RESULT_TTL_MS) {
+      if (("completed".equalsIgnoreCase(s) || "failed".equalsIgnoreCase(s) || "cancelled".equalsIgnoreCase(s)) && r.getEndTime() > 0
+          && (now - r.getEndTime()) > ttlMs) {
         expired.add(entry.getKey());
       }
     }
@@ -2445,13 +2481,14 @@ public class DockerService {
   }
 
   private void cleanupExpiredSyncTaskInfos() {
+    long ttlMs = taskExecutor.getTaskLogTtlMs();
     long now = System.currentTimeMillis();
     List<String> expired = new ArrayList<>();
     for (Map.Entry<String, SyncTaskInfo> entry : syncTaskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
       TaskStatus status = info.getStatus();
-      if ((status == TaskStatus.COMPLETED || status == TaskStatus.FAILED)
-          && info.getEndTime() > 0 && (now - info.getEndTime()) > TASK_RESULT_TTL_MS) {
+      if ((status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.CANCELLED)
+          && info.getEndTime() > 0 && (now - info.getEndTime()) > ttlMs) {
         expired.add(entry.getKey());
       }
     }
@@ -2474,7 +2511,7 @@ public class DockerService {
       if (status != null) {
         info.setStatus(status);
       }
-      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED) {
+      if (status == TaskStatus.COMPLETED || status == TaskStatus.FAILED || status == TaskStatus.CANCELLED) {
         taskExecutor.cleanupSyncTaskHandle(entry.getKey());
       }
       tasks.add(info);

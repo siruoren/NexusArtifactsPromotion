@@ -28,7 +28,9 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   public static final String PROP_SYNC_POOL_SIZE = "syncPoolSize";
   public static final String PROP_MAX_SYNC_QUEUE_SIZE = "maxSyncQueueSize";
-  public static final String PROP_MAX_SYNC_RECORDS = "maxSyncRecords";
+  public static final String PROP_MAX_TASK_QUEUE_RECORDS = "maxTaskQueueRecords";
+  public static final String PROP_TASK_LOG_TTL_MINUTES = "taskLogTtlMinutes";
+  public static final String PROP_TASK_TIMEOUT_MINUTES = "taskTimeoutMinutes";
   public static final String PROP_DOCKER_RELEASE_PROXY_REPOS = "dockerReleaseProxyRepos";
 
   private static final NumberTextFormField POOL_SIZE_FIELD = new NumberTextFormField(
@@ -43,10 +45,22 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
       "Maximum number of concurrent sync queue tasks (1-100, default: 20)",
       false);
 
-  private static final NumberTextFormField MAX_RECORDS_FIELD = new NumberTextFormField(
-      PROP_MAX_SYNC_RECORDS,
-      "Max Sync Queue Records",
-      "Maximum number of sync task records to retain (1-10000, default: 200)",
+  private static final NumberTextFormField MAX_TASK_QUEUE_RECORDS_FIELD = new NumberTextFormField(
+      PROP_MAX_TASK_QUEUE_RECORDS,
+      "Max Task Queue Records",
+      "Maximum number of task queue records to retain for both promotion and sync tasks (1-10000, default: 200)",
+      false);
+
+  private static final NumberTextFormField TASK_LOG_TTL_MINUTES_FIELD = new NumberTextFormField(
+      PROP_TASK_LOG_TTL_MINUTES,
+      "Task Log TTL (minutes)",
+      "Time in minutes before completed/failed/cancelled task logs are automatically cleaned up (1-1440, default: 30)",
+      false);
+
+  private static final NumberTextFormField TASK_TIMEOUT_MINUTES_FIELD = new NumberTextFormField(
+      PROP_TASK_TIMEOUT_MINUTES,
+      "Task Timeout (minutes)",
+      "Maximum time in minutes a task can run before being automatically cancelled (1-1440, default: 120). Prevents tasks from running indefinitely due to exceptions or resource issues.",
       false);
 
   private static final StringTextFormField DOCKER_RELEASE_PROXY_REPOS_FIELD = new StringTextFormField(
@@ -77,7 +91,7 @@ public class SyncCapabilityDescriptor extends CapabilityDescriptorSupport<Object
 
   @Override
   public java.util.List<FormField> formFields() {
-    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_RECORDS_FIELD, DOCKER_RELEASE_PROXY_REPOS_FIELD);
+    return Lists.newArrayList(POOL_SIZE_FIELD, MAX_QUEUE_FIELD, MAX_TASK_QUEUE_RECORDS_FIELD, TASK_LOG_TTL_MINUTES_FIELD, TASK_TIMEOUT_MINUTES_FIELD, DOCKER_RELEASE_PROXY_REPOS_FIELD);
   }
 
   public Set<Tag> getTags() {

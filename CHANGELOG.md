@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2026-06-18
+
+### Added
+
+- **Task Queue Management Configuration**: new capability parameters for task queue lifecycle control
+  - `Max Task Queue Records`: maximum number of task records retained for both promotion and sync tasks (default: 200), replaces per-type limits
+  - `Task Log TTL (minutes)`: time before completed/failed/cancelled task logs are automatically cleaned up (default: 30 minutes)
+  - `Task Timeout (minutes)`: maximum time a task can run before being automatically cancelled (default: 120 minutes), prevents tasks from running indefinitely
+- **Task Timeout Detection**: dual-layer timeout protection to prevent resource exhaustion and stuck tasks
+  - Per-task watchdog thread: interrupts task thread when timeout is reached
+  - Periodic scanner (every 60 seconds): scans all RUNNING/PENDING tasks and cancels those exceeding timeout
+  - Timeout is configurable via Sync Capability UI
+- **Task Cancellation State Consistency**: when a task is terminated, all task result stores are now consistently updated to CANCELLED
+  - `PromotionService.cancelPromotionTask()`: updates `taskResults` map entry to CANCELLED
+  - `SyncService.cancelSyncTask()`: updates `taskInfos` map entry to CANCELLED
+  - `DockerService.cancelDockerPromotionTask()` / `cancelDockerSyncTask()`: updates Docker task results to CANCELLED
+  - `SyncQueueResource.terminateTask()`: calls all cancel methods to ensure state consistency across all services
+- **Backend Search API Pagination**: `trySearchApi` and `tryComponentsApi` now follow Nexus `continuationToken` to retrieve all pages of results
+  - Prevents incomplete file lists when repositories have more than 10 items
+  - Safety limit of 100 pages to prevent infinite loops
+
+### Changed
+
+- **Task Cancellation Status**: tasks that are manually terminated or fail due to interruption now show "Cancelled" instead of "Failed"
+  - `PromotionService`: thread interruption detected and mapped to CANCELLED status
+  - `SyncService`: thread interruption detected and mapped to CANCELLED status
+  - `DockerService`: thread interruption detected and mapped to CANCELLED status
+  - `TaskExecutorService.getPromotionTaskStatus()` / `getSyncTaskStatus()`: exception from `future.get()` now maps to CANCELLED
+  - Frontend: `cancelled` status rendered as orange "Cancelled" / "终止" text
+- **Removed Sync Record Max Limit**: `maxSyncRecords` (per-type limit) replaced by `maxTaskQueueRecords` (unified limit for all task types)
+- **Task Log TTL Now Configurable**: previously hardcoded 30-minute TTL is now configurable via capability UI
+- **Task Timeout Now Configurable**: previously hardcoded 60-minute timeout is now configurable via capability UI
+
+### Fixed
+
+- **Promotion Pagination State**: second page files still showed "pending" after promotion completed
+  - Added `store.on('load')` event listener to sync `statusMap` to current page records on page change
+  - Fixed `eachAllRecords` function that only returned current page records in paginated mode
+- **Task Status Shows "Completed" After Termination**: cancelled tasks incorrectly displayed as "completed"
+  - Root cause: `cancelTask()` only updated `TaskHandle.status` but not `PromotionTaskResult` / `SyncTaskInfo` in service-level maps
+  - Fix: all cancel methods now update both executor handle and service-level result objects
+- **`SyncService.getTaskInfo()` Override**: tasks already in CANCELLED state could be overridden by TaskExecutor status
+  - Added CANCELLED to the terminal state check that prevents status override
+- **Docker Task Expired Cleanup**: `cleanupExpiredPromotionTaskResults()` now includes `cancelled` status in expiry check
+
+### Removed
+
+- **Service Restart Task Recovery**: `SyncQueuePersistenceManager` no longer recovers persisted tasks on startup
+  - Active tasks from before restart are simply discarded
+  - Only cleanup of leftover state files is performed on startup
+  - Prevents stale or duplicate task execution after Nexus restart
+
 ## [1.0.2] - 2026-06-17
 
 ### Fixed
