@@ -78,6 +78,12 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
     "sync.button.text": "Sync",
     "sync.button.text.directory": "Sync Directory",
+    "sync.incremental.title": "Sync Mode",
+    "sync.incremental.message": "Choose sync mode for this operation:",
+    "sync.incremental.full": "Full Sync",
+    "sync.incremental.full.desc": "Re-download all files from remote",
+    "sync.incremental.incremental": "Incremental Sync",
+    "sync.incremental.incremental.desc": "Only sync files with different MD5 checksums (skips unchanged files)",
     "sync.permission.denied": "You do not have sync permission for this repository.",
     "sync.permission.denied.admin": "You do not have sync permission. Please contact your administrator.",
     "sync.permission.disabled.tooltip": "You do not have delete permission for this repository. Sync requires delete permission.",
@@ -214,6 +220,12 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
     "sync.button.text": "\u540c\u6b65",
     "sync.button.text.directory": "\u540c\u6b65\u76ee\u5f55",
+    "sync.incremental.title": "\u540c\u6b65\u6a21\u5f0f",
+    "sync.incremental.message": "\u8bf7\u9009\u62e9\u540c\u6b65\u6a21\u5f0f\uff1a",
+    "sync.incremental.full": "\u5168\u91cf\u540c\u6b65",
+    "sync.incremental.full.desc": "\u91cd\u65b0\u4e0b\u8f7d\u8fdc\u7a0b\u4ed3\u5e93\u7684\u6240\u6709\u6587\u4ef6",
+    "sync.incremental.incremental": "\u589e\u91cf\u540c\u6b65",
+    "sync.incremental.incremental.desc": "\u4ec5\u540c\u6b65MD5\u4e0d\u4e00\u81f4\u7684\u6587\u4ef6\uff08\u8df3\u8fc7\u672a\u53d8\u66f4\u7684\u6587\u4ef6\uff09",
     "sync.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u540c\u6b65\u6743\u9650\u3002",
     "sync.permission.denied.admin": "\u60a8\u6ca1\u6709\u540c\u6b65\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
     "sync.permission.disabled.tooltip": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u5220\u9664\u6743\u9650\uff0c\u540c\u6b65\u9700\u8981\u5220\u9664\u6743\u9650\u624d\u80fd\u6267\u884c\u3002",
@@ -1436,6 +1448,74 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
   handleSyncClick: function (repoName, path, isDirectory, format) {
     var me = this;
+
+    // Show sync mode selection dialog
+    var syncModeWin = Ext.create('Ext.window.Window', {
+      title: _t('sync.incremental.title'),
+      width: 420,
+      modal: true,
+      closable: true,
+      layout: { type: 'vbox', align: 'stretch' },
+      bodyPadding: 15,
+      items: [
+        {
+          xtype: 'component',
+          html: '<div style="margin-bottom:10px;font-size:13px;">' + _t('sync.incremental.message') + '</div>'
+        },
+        {
+          xtype: 'container',
+          layout: { type: 'vbox', align: 'stretch' },
+          items: [
+            {
+              xtype: 'button',
+              text: _t('sync.incremental.incremental'),
+              iconCls: 'x-fa fa-bolt',
+              cls: 'x-btn-default-small',
+              scale: 'medium',
+              margin: '0 0 8 0',
+              height: 40,
+              tooltip: _t('sync.incremental.incremental.desc'),
+              handler: function () {
+                syncModeWin.close();
+                me.executeSync(repoName, path, isDirectory, format, true);
+              }
+            },
+            {
+              xtype: 'component',
+              html: '<div style="color:#888;font-size:11px;margin-bottom:12px;padding-left:4px;">' + _t('sync.incremental.incremental.desc') + '</div>'
+            },
+            {
+              xtype: 'button',
+              text: _t('sync.incremental.full'),
+              iconCls: 'x-fa fa-sync',
+              cls: 'x-btn-default-small',
+              scale: 'medium',
+              height: 40,
+              tooltip: _t('sync.incremental.full.desc'),
+              handler: function () {
+                syncModeWin.close();
+                me.executeSync(repoName, path, isDirectory, format, false);
+              }
+            },
+            {
+              xtype: 'component',
+              html: '<div style="color:#888;font-size:11px;padding-left:4px;">' + _t('sync.incremental.full.desc') + '</div>'
+            }
+          ]
+        }
+      ],
+      buttons: [
+        {
+          text: _t('promotion.result.close'),
+          handler: function () { syncModeWin.close(); }
+        }
+      ]
+    });
+    syncModeWin.show();
+  },
+
+  executeSync: function (repoName, path, isDirectory, format, incrementalSync) {
+    var me = this;
     // Docker format: use the same sync mechanism as other formats
     if (format === 'docker') {
       checkSyncPermission(repoName, format).then(function (hasPermission) {
@@ -1447,7 +1527,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           repositoryName: repoName,
           path: path,
           isDirectory: isDirectory,
-          format: format
+          format: format,
+          incrementalSync: incrementalSync
         })
         .then(function (result) {
           me.showSyncProgressWindow(result, repoName, path, isDirectory);
@@ -1468,7 +1549,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         repositoryName: repoName,
         path: path,
         isDirectory: isDirectory,
-        format: format
+        format: format,
+        incrementalSync: incrementalSync
       })
       .then(function (result) {
         me.showSyncProgressWindow(result, repoName, path, isDirectory);

@@ -37,6 +37,9 @@ public class DockerImageRequest {
    */
   private String imagePrefix;
 
+  /** If true, only sync files that differ from local cache (MD5/digest comparison) */
+  private boolean incrementalSync;
+
   public DockerImageRequest() {}
 
   public void validate() {
@@ -93,4 +96,7 @@ public class DockerImageRequest {
   public boolean isPrefixMode() {
     return imagePrefix != null && !imagePrefix.trim().isEmpty();
   }
+
+  public boolean isIncrementalSync() { return incrementalSync; }
+  public void setIncrementalSync(boolean incrementalSync) { this.incrementalSync = incrementalSync; }
 }

@@ -1641,7 +1641,7 @@ public class DockerService {
 
         for (String tag : tags) {
           try {
-            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
             syncedFiles.addAll(tagFiles);
           }
           catch (Exception e) {
@@ -1765,7 +1765,7 @@ public class DockerService {
 
               for (String tag : tags) {
                 try {
-                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
                   syncedFiles.addAll(tagFiles);
                 }
                 catch (Exception e) {
@@ -1820,7 +1820,7 @@ public class DockerService {
 
               for (String tag : tags) {
                 try {
-                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
                   syncedFiles.addAll(tagFiles);
                 }
                 catch (Exception e) {
@@ -1866,7 +1866,7 @@ public class DockerService {
 
             for (String tag : tags) {
               try {
-                List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag);
+                List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag, request.isIncrementalSync());
                 syncedFiles.addAll(tagFiles);
               }
               catch (Exception e) {
@@ -1927,7 +1927,8 @@ public class DockerService {
    * 4. Sync each referenced blob
    */
   private List<SyncTaskInfo.SyncFileDetail> syncDockerTag(
-      final Repository repo, final String image, final String tag) throws Exception
+      final Repository repo, final String image, final String tag,
+      final boolean incrementalSync) throws Exception
   {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
@@ -1968,7 +1969,7 @@ public class DockerService {
               String subManifestContent = readManifestContentFromCache(repo, subManifestPath);
               if (subManifestContent != null && !subManifestContent.isEmpty()) {
                 DockerManifestParser.DockerManifest subParsed = DockerManifestParser.parse(subManifestContent, ref.getMediaType());
-                syncBlobsForManifest(repo, image, subParsed, details);
+                syncBlobsForManifest(repo, image, subParsed, details, incrementalSync);
               }
             }
             catch (Exception e) {
@@ -1982,7 +1983,7 @@ public class DockerService {
         }
         else {
           // Single-platform manifest: sync config + layers
-          syncBlobsForManifest(repo, image, parsed, details);
+          syncBlobsForManifest(repo, image, parsed, details, incrementalSync);
         }
       }
       catch (Exception e) {
@@ -2013,15 +2014,29 @@ public class DockerService {
 
   /**
    * Sync all blobs (config + layers) for a single-platform manifest.
+   * If incrementalSync is true, skip blobs that already exist locally with the same digest.
    */
   private void syncBlobsForManifest(final Repository repo, final String image,
                                      final DockerManifestParser.DockerManifest manifest,
-                                     final List<SyncTaskInfo.SyncFileDetail> details) {
+                                     final List<SyncTaskInfo.SyncFileDetail> details,
+                                     final boolean incrementalSync) {
     Set<String> blobDigests = manifest.getAllBlobDigests();
-    log.info("[DOCKER-SYNC] Syncing {} blobs for image {}", blobDigests.size(), image);
+    log.info("[DOCKER-SYNC] Syncing {} blobs for image {} (incremental: {})",
+        blobDigests.size(), image, incrementalSync);
 
     for (String digest : blobDigests) {
       String blobPath = "v2/" + image + "/blobs/" + digest;
+
+      // Incremental sync: check if blob already exists locally
+      if (incrementalSync && isDockerBlobCached(repo, blobPath, digest)) {
+        log.info("[DOCKER-SYNC] Incremental: skipping cached blob {} (digest: {})", blobPath, digest);
+        SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
+        skippedDetail.setStatus("skipped");
+        skippedDetail.setErrorMessage("Blob already cached (digest: " + digest.substring(0, Math.min(19, digest.length())) + "...)");
+        details.add(skippedDetail);
+        continue;
+      }
+
       try {
         SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
         details.add(blobDetail);
@@ -3031,5 +3046,45 @@ public class DockerService {
         promotionTaskResults.put(tid, copyPromotionResult(taskResult));
       }
     }
+  }
+
+  /**
+   * Check if a Docker blob is already cached locally with the given digest.
+   * Used for incremental sync to skip already-cached blobs.
+   */
+  private boolean isDockerBlobCached(final Repository repo, final String blobPath, final String digest) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return false;
+
+      // Check by asset name
+      Asset asset = tx.findAssetWithProperty("name", blobPath, bucket);
+      if (asset == null && !blobPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + blobPath, bucket);
+      }
+
+      if (asset != null) {
+        // Verify the blob exists and has content
+        if (asset.requireBlobRef() != null) {
+          Blob blob = tx.requireBlob(asset.requireBlobRef());
+          if (blob != null) {
+            log.debug("Docker blob {} already cached locally", blobPath);
+            return true;
+          }
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to check if Docker blob {} is cached: {}", blobPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return false;
   }
 }

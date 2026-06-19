@@ -9,6 +9,7 @@ import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -30,6 +31,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
+import org.sonatype.nexus.blobstore.api.Blob;
 import org.sonatype.nexus.repository.storage.Asset;
 import org.sonatype.nexus.repository.storage.Bucket;
 import org.sonatype.nexus.repository.storage.StorageFacet;
@@ -267,6 +269,7 @@ public class SyncService {
       else {
         dockerRequest.setAllImages(true);
       }
+      dockerRequest.setIncrementalSync(request.isIncrementalSync());
       return dockerService.syncDockerImage(dockerRequest);
     }
 
@@ -326,7 +329,7 @@ public class SyncService {
           // Execute sync using ContentFacet
           List<SyncTaskInfo.SyncFileDetail> syncedFiles;
           if (request.isDirectory()) {
-            syncedFiles = syncDirectory(repo, request.getPath());
+            syncedFiles = syncDirectory(repo, request.getPath(), request.isIncrementalSync());
           }
           else {
             syncedFiles = syncFile(repo, request.getPath());
@@ -454,7 +457,7 @@ public class SyncService {
       // Execute sync using ContentFacet
       List<SyncTaskInfo.SyncFileDetail> syncedFiles;
       if (request.isDirectory()) {
-        syncedFiles = syncDirectory(repo, request.getPath());
+        syncedFiles = syncDirectory(repo, request.getPath(), request.isIncrementalSync());
       }
       else {
         syncedFiles = syncFile(repo, request.getPath());
@@ -632,22 +635,33 @@ public class SyncService {
    * 2. For each file, compare MD5 of remote vs local cached asset
    * 3. If MD5 matches, skip (incremental sync); otherwise call ContentFacet.get(path)
    */
-  private List<SyncTaskInfo.SyncFileDetail> syncDirectory(final Repository repo, final String directoryPath) {
+  private List<SyncTaskInfo.SyncFileDetail> syncDirectory(final Repository repo, final String directoryPath,
+      final boolean incrementalSync) {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
-      log.info("Starting {} for {}:{}", isFullSync ? "full repository sync" : "directory sync",
-          repo.getName(), isFullSync ? "/" : directoryPath);
+      log.info("Starting {} for {}:{} (incremental: {})",
+          isFullSync ? "full repository sync" : "directory sync",
+          repo.getName(), isFullSync ? "/" : directoryPath, incrementalSync);
 
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
 
       // Step 1: Get remote file list
       List<String> remoteAssets = listRemoteAssets(repo, directoryPath);
-      log.info("Found {} remote assets to sync in {}:{}", remoteAssets.size(), repo.getName(), directoryPath);
+      log.info("Found {} remote assets to sync in {}:{} (incremental: {})",
+          remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
 
-      // Step 2: Sync each asset using ContentFacet.get()
+      // Step 2: For incremental sync, build local MD5 map
+      Map<String, String> localMd5Map = Collections.emptyMap();
+      if (incrementalSync) {
+        localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
+        log.info("Incremental sync: found {} locally cached assets with MD5 in {}:{}",
+            localMd5Map.size(), repo.getName(), directoryPath);
+      }
+
+      // Step 3: Sync each asset using ContentFacet.get()
       for (String assetPath : remoteAssets) {
         // Skip directory entries
         if (assetPath.endsWith("/")) {
@@ -658,7 +672,29 @@ public class SyncService {
             assetPath, determineType(assetPath));
 
         try {
-          // Always re-sync from remote
+          // Incremental sync: check if file needs to be synced
+          if (incrementalSync) {
+            String localMd5 = localMd5Map.get(assetPath);
+            if (localMd5 != null) {
+              // File exists locally, compare MD5 with remote
+              String remoteMd5 = getRemoteAssetMd5(repo, assetPath);
+              if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
+                log.info("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
+                    repo.getName(), assetPath, localMd5);
+                detail.setStatus("skipped");
+                detail.setErrorMessage("MD5 unchanged");
+                details.add(detail);
+                continue;
+              }
+              log.info("Incremental sync: asset {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
+                  repo.getName(), assetPath, localMd5, remoteMd5);
+            }
+            else {
+              log.info("Incremental sync: new asset {}/{}, syncing", repo.getName(), assetPath);
+            }
+          }
+
+          // Sync the asset (full sync or incremental with changes)
           log.info("Syncing asset: {}/{}", repo.getName(), assetPath);
           RetryableOperation.executeRun("sync asset " + assetPath,
               () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
@@ -1783,5 +1819,154 @@ public class SyncService {
       }
     }
     return -1;
+  }
+
+  // ========================================================================
+  // Incremental sync helpers: MD5 comparison
+  // ========================================================================
+
+  /**
+   * Build a map of asset path -> MD5 for all locally cached assets under a directory.
+   */
+  private Map<String, String> buildLocalAssetMd5Map(final Repository repo, final String directoryPath) {
+    Map<String, String> md5Map = new HashMap<>();
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) {
+        log.debug("Bucket not found for repository: {}", repo.getName());
+        return md5Map;
+      }
+
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String normalizedPrefix = directoryPath;
+      if (normalizedPrefix != null && normalizedPrefix.startsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(1);
+      }
+      if (normalizedPrefix != null && normalizedPrefix.endsWith("/")) {
+        normalizedPrefix = normalizedPrefix.substring(0, normalizedPrefix.length() - 1);
+      }
+
+      Iterable<Asset> assets = tx.browseAssets(bucket);
+      for (Asset asset : assets) {
+        String name = asset.name();
+        if (name == null) continue;
+
+        String normalizedName = name.startsWith("/") ? name.substring(1) : name;
+        if (normalizedName.endsWith("/")) continue;
+
+        if (isFullSync || normalizedName.startsWith(normalizedPrefix + "/")) {
+          // Get MD5 checksum from asset attributes
+          String md5 = getAssetMd5(asset);
+          if (md5 != null) {
+            md5Map.put(normalizedName, md5);
+          }
+        }
+      }
+
+      log.debug("Built local MD5 map with {} entries for {}:{}",
+          md5Map.size(), repo.getName(), isFullSync ? "/" : normalizedPrefix);
+    }
+    catch (Exception e) {
+      log.warn("Failed to build local MD5 map for {}:{}: {}", repo.getName(), directoryPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return md5Map;
+  }
+
+  /**
+   * Get MD5 checksum from an asset's attributes.
+   */
+  private String getAssetMd5(final Asset asset) {
+    try {
+      // Try checksum_md5 attribute first (standard Nexus attribute)
+      Map<String, Object> attributes = asset.attributes() != null ? asset.attributes().backing() : null;
+      if (attributes != null && attributes.containsKey("checksum")) {
+        @SuppressWarnings("unchecked")
+        Map<String, String> checksums = (Map<String, String>) attributes.get("checksum");
+        if (checksums != null) {
+          String md5 = checksums.get("md5");
+          if (md5 != null) return md5;
+        }
+      }
+
+      // Fallback: try sha1 and compute from blob content if needed
+      // For now, if no MD5 in checksum attributes, return null (will re-sync)
+    }
+    catch (Exception e) {
+      log.debug("Failed to get MD5 for asset {}: {}", asset.name(), e.getMessage());
+    }
+    return null;
+  }
+
+  /**
+   * Get MD5 checksum of a remote asset by querying the Nexus Search API or Components API.
+   * For non-Nexus remotes, returns null (will always re-sync).
+   */
+  private String getRemoteAssetMd5(final Repository repo, final String assetPath) {
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null) return null;
+
+      Map<String, Map<String, Object>> attributes = config.getAttributes();
+      if (attributes == null || !attributes.containsKey("proxy")) return null;
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = attributes.get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return null;
+
+      if (!remoteUrl.endsWith("/")) {
+        remoteUrl += "/";
+      }
+
+      // Check if remote URL points to a local Nexus instance
+      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
+      if (remoteRepoName == null) return null;
+
+      // Build Nexus Search API URL to get asset checksum
+      String nexusBaseUrl = remoteUrl.substring(0, remoteUrl.indexOf("/repository/"));
+      String searchUrl = nexusBaseUrl + "/service/rest/v1/search/assets"
+          + "?repository=" + remoteRepoName
+          + "&name=" + java.net.URLEncoder.encode(assetPath, "UTF-8");
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      HttpURLConnection conn = null;
+      try {
+        java.net.URL url = new java.net.URL(searchUrl);
+        conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("GET");
+        conn.setRequestProperty("Accept", "application/json");
+        conn.setConnectTimeout(5000);
+        conn.setReadTimeout(10000);
+
+        if (repoAuth != null) {
+          String auth = encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
+          conn.setRequestProperty("Authorization", "Basic " + auth);
+        }
+
+        int responseCode = conn.getResponseCode();
+        if (responseCode == 200) {
+          String response = readResponse(conn);
+          // Parse MD5 from checksums in response
+          return extractChecksumValue(response, "md5");
+        }
+      }
+      finally {
+        if (conn != null) {
+          try { conn.disconnect(); } catch (Exception ignored) { }
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 for {}/{}: {}", repo.getName(), assetPath, e.getMessage());
+    }
+    return null;
   }
 }
