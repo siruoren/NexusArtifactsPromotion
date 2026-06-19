@@ -46,7 +46,7 @@ public class TaskExecutorService {
   private static final int DEFAULT_MAX_PROMOTION_QUEUE_SIZE = 50;
   private static final int DEFAULT_MAX_TASK_QUEUE_RECORDS = 200;
   private static final int DEFAULT_TASK_LOG_TTL_MINUTES = 30;
-  private static final long TASK_TIMEOUT_MINUTES = 60;
+  private static final int DEFAULT_TASK_TIMEOUT_MINUTES = 120;
   private static final long SHUTDOWN_TIMEOUT_SECONDS = 30;
 
   // Bounded queue capacity for thread pool (prevents OOM from unbounded task accumulation)
@@ -59,9 +59,11 @@ public class TaskExecutorService {
   private volatile int maxPromotionQueueSize = DEFAULT_MAX_PROMOTION_QUEUE_SIZE;
   private volatile int maxTaskQueueRecords = DEFAULT_MAX_TASK_QUEUE_RECORDS;
   private volatile int taskLogTtlMinutes = DEFAULT_TASK_LOG_TTL_MINUTES;
+  private volatile int taskTimeoutMinutes = DEFAULT_TASK_TIMEOUT_MINUTES;
 
   private ExecutorService promotionExecutor;
   private ExecutorService syncExecutor;
+  private java.util.concurrent.ScheduledExecutorService timeoutDetector;
 
   private final Map<String, TaskHandle> promotionTasks = new ConcurrentHashMap<>();
   private final Map<String, TaskHandle> syncTasks = new ConcurrentHashMap<>();
@@ -77,8 +79,18 @@ public class TaskExecutorService {
   private void initExecutors() {
     this.promotionExecutor = createThreadPool("promotion", promotionPoolSize, PROMOTION_QUEUE_CAPACITY);
     this.syncExecutor = createThreadPool("sync", syncPoolSize, SYNC_QUEUE_CAPACITY);
-    log.info("TaskExecutorService initialized - promotion pool: {} (queue: {}), sync pool: {} (queue: {}), max sync queue: {}",
-        promotionPoolSize, PROMOTION_QUEUE_CAPACITY, syncPoolSize, SYNC_QUEUE_CAPACITY, maxSyncQueueSize);
+    // Start timeout detector - checks every 60 seconds
+    this.timeoutDetector = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+      private final AtomicInteger counter = new AtomicInteger(0);
+      @Override public Thread newThread(Runnable r) {
+        Thread t = new Thread(r, "nexus-task-timeout-detector-" + counter.incrementAndGet());
+        t.setDaemon(true);
+        return t;
+      }
+    });
+    this.timeoutDetector.scheduleAtFixedRate(this::detectTimedOutTasks, 60, 60, TimeUnit.SECONDS);
+    log.info("TaskExecutorService initialized - promotion pool: {} (queue: {}), sync pool: {} (queue: {}), max sync queue: {}, task timeout: {}min",
+        promotionPoolSize, PROMOTION_QUEUE_CAPACITY, syncPoolSize, SYNC_QUEUE_CAPACITY, maxSyncQueueSize, taskTimeoutMinutes);
   }
 
   private ExecutorService createThreadPool(final String type, final int poolSize, final int queueCapacity) {
@@ -261,12 +273,13 @@ public class TaskExecutorService {
         log.debug("Task {} ({}) started", taskId, type);
 
         // Set timeout watchdog
+        final long timeoutMinutes = taskTimeoutMinutes;
         Thread timeoutWatchdog = new Thread(() -> {
           try {
-            Thread.sleep(TimeUnit.MINUTES.toMillis(TASK_TIMEOUT_MINUTES));
+            Thread.sleep(TimeUnit.MINUTES.toMillis(timeoutMinutes));
             if (!currentThread.isInterrupted()) {
               log.warn("Task {} ({}) exceeded timeout of {} minutes, interrupting",
-                  taskId, type, TASK_TIMEOUT_MINUTES);
+                  taskId, type, timeoutMinutes);
               currentThread.interrupt();
             }
           }
@@ -451,6 +464,11 @@ public class TaskExecutorService {
     log.info("Task log TTL updated to {} minutes", taskLogTtlMinutes);
   }
 
+  public void updateTaskTimeoutMinutes(final int newTimeout) {
+    this.taskTimeoutMinutes = Math.max(1, newTimeout);
+    log.info("Task timeout updated to {} minutes", taskTimeoutMinutes);
+  }
+
   private void reconfigurePool(final ExecutorService executor, final int newSize, final String type) {
     if (executor instanceof ThreadPoolExecutor) {
       ThreadPoolExecutor tpe = (ThreadPoolExecutor) executor;
@@ -467,6 +485,8 @@ public class TaskExecutorService {
   public int getMaxTaskQueueRecords() { return maxTaskQueueRecords; }
   public int getTaskLogTtlMinutes() { return taskLogTtlMinutes; }
   public long getTaskLogTtlMs() { return taskLogTtlMinutes * 60 * 1000L; }
+  public int getTaskTimeoutMinutes() { return taskTimeoutMinutes; }
+  public long getTaskTimeoutMs() { return taskTimeoutMinutes * 60 * 1000L; }
 
   /**
    * Update max promotion queue size.
@@ -582,11 +602,50 @@ public class TaskExecutorService {
   }
 
   /**
+   * Detect and cancel tasks that have exceeded the configured timeout.
+   * Runs periodically to prevent tasks from running indefinitely.
+   */
+  private void detectTimedOutTasks() {
+    long timeoutMs = getTaskTimeoutMs();
+    long now = System.currentTimeMillis();
+
+    checkTimedOutTasks(promotionTasks, timeoutMs, now, "promotion");
+    checkTimedOutTasks(syncTasks, timeoutMs, now, "sync");
+  }
+
+  private void checkTimedOutTasks(final Map<String, TaskHandle> tasks, final long timeoutMs, final long now, final String type) {
+    for (Map.Entry<String, TaskHandle> entry : tasks.entrySet()) {
+      String taskId = entry.getKey();
+      TaskHandle handle = entry.getValue();
+
+      // Only check running or pending tasks
+      if (handle.status != TaskStatus.RUNNING && handle.status != TaskStatus.PENDING) {
+        continue;
+      }
+
+      long elapsed = now - handle.startTime;
+      if (elapsed > timeoutMs) {
+        log.warn("{} task {} has exceeded timeout ({}min elapsed, {}min limit), cancelling",
+            type, taskId, elapsed / 60000, taskTimeoutMinutes);
+        handle.future.cancel(true);
+        handle.status = TaskStatus.CANCELLED;
+        handle.endTime = now;
+        cacheManager.cleanupTask(taskId);
+      }
+    }
+  }
+
+  /**
    * Graceful shutdown on plugin destroy.
    */
   @PreDestroy
   public void shutdown() {
     log.info("Shutting down TaskExecutorService...");
+
+    // Stop timeout detector
+    if (timeoutDetector != null) {
+      timeoutDetector.shutdownNow();
+    }
 
     shutdownExecutor(promotionExecutor, "promotion");
     shutdownExecutor(syncExecutor, "sync");

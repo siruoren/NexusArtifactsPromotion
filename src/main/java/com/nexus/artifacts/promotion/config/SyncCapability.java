@@ -92,6 +92,18 @@ public class SyncCapability extends CapabilitySupport<Map<String, String>> {
       }
     }
 
+    String taskTimeoutStr = props.get(PROP_TASK_TIMEOUT_MINUTES);
+    if (taskTimeoutStr != null) {
+      try {
+        int timeoutMinutes = Integer.parseInt(taskTimeoutStr);
+        taskExecutor.updateTaskTimeoutMinutes(timeoutMinutes);
+        log.info("Task timeout set to {} minutes from capability configuration", timeoutMinutes);
+      }
+      catch (NumberFormatException e) {
+        log.warn("Invalid task timeout value: {}", taskTimeoutStr);
+      }
+    }
+
     // Update Docker release proxy repositories configuration
     String dockerReleaseProxyRepos = props.get(PROP_DOCKER_RELEASE_PROXY_REPOS);
     if (dockerReleaseProxyRepos != null && !dockerReleaseProxyRepos.trim().isEmpty()) {
