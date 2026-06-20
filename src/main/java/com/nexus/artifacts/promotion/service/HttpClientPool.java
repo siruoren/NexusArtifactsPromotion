@@ -352,6 +352,7 @@ public class HttpClientPool {
   private HttpURLConnection openConnection(final String url, final String method,
                                             final Map<String, String> headers) throws IOException {
     HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+    SslHelper.applyTrustAllSsl(conn);
     conn.setRequestMethod(method);
     conn.setConnectTimeout(connectTimeoutMs);
     conn.setReadTimeout(readTimeoutMs);

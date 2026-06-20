@@ -6,8 +6,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -20,10 +18,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,31 +68,6 @@ import com.nexus.artifacts.promotion.security.PermissionChecker;
 public class DockerService {
 
   private static final Logger log = LoggerFactory.getLogger(DockerService.class);
-
-  /**
-   * Trust-all-SSL manager for self-signed certificates.
-   * Ensures HTTPS connections to remote storage with self-signed certs work correctly.
-   */
-  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
-      new X509TrustManager() {
-        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-      }
-  };
-
-  static {
-    try {
-      SSLContext sc = SSLContext.getInstance("TLS");
-      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
-      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
-      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
-      log.info("DockerService SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
-    }
-    catch (Exception e) {
-      log.warn("Failed to initialize SSL trust manager for DockerService: {}", e.getMessage(), e);
-    }
-  }
 
   /** Connection/read timeout in milliseconds */
   private static final int TIMEOUT_MS = 300_000;
@@ -153,6 +122,7 @@ public class DockerService {
     try {
       URL url = new URL(baseUrl + "/service/rest/v1/status");
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(3000);
       conn.setReadTimeout(3000);
@@ -368,6 +338,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -439,6 +410,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -493,6 +465,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -746,6 +719,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -803,6 +777,7 @@ public class DockerService {
       try {
         String tagsUrl = remoteUrl + (remoteUrl.endsWith("/") ? "" : "/") + "v2/" + imageName + "/tags/list";
         HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(30_000);
@@ -839,6 +814,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -2154,6 +2130,7 @@ public class DockerService {
           // Try Docker Registry V2 tags/list API
           String tagsUrl = remoteUrl + "v2/" + imageName + "/tags/list";
           HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+          SslHelper.applyTrustAllSsl(conn);
           conn.setRequestMethod("GET");
           conn.setConnectTimeout(15_000);
           conn.setReadTimeout(30_000);
@@ -2223,6 +2200,7 @@ public class DockerService {
       // Try Docker Registry V2 tags/list API
       String tagsUrl = remoteUrl + "v2/" + imageName + "/tags/list";
       HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);

@@ -5,8 +5,6 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -22,10 +20,6 @@ import java.util.regex.Pattern;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -66,31 +60,6 @@ import com.nexus.artifacts.promotion.security.PermissionChecker;
 public class SyncService {
 
   private static final Logger log = LoggerFactory.getLogger(SyncService.class);
-
-  /**
-   * Trust-all-SSL manager for self-signed certificates.
-   * Ensures HTTPS connections to remote storage with self-signed certs work correctly.
-   */
-  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
-      new X509TrustManager() {
-        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-      }
-  };
-
-  static {
-    try {
-      SSLContext sc = SSLContext.getInstance("TLS");
-      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
-      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
-      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
-      log.info("SyncService SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
-    }
-    catch (Exception e) {
-      log.warn("Failed to initialize SSL trust manager for SyncService: {}", e.getMessage(), e);
-    }
-  }
 
   /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
   private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
@@ -167,6 +136,7 @@ public class SyncService {
     try {
       URL url = new URL(baseUrl + "/service/rest/v1/status");
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(3000);
       conn.setReadTimeout(3000);
@@ -975,6 +945,7 @@ public class SyncService {
         log.info("Calling remote Nexus Search API: {}", searchUrl);
 
         HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -1060,6 +1031,7 @@ public class SyncService {
         log.info("Calling remote Nexus Components API: {}", compUrl);
 
         HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -1377,6 +1349,7 @@ public class SyncService {
       }
 
       HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
@@ -1459,6 +1432,7 @@ public class SyncService {
       }
 
       HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
@@ -1529,6 +1503,7 @@ public class SyncService {
       log.info("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? authUsername : "no");
 
       HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
@@ -1941,6 +1916,7 @@ public class SyncService {
       try {
         java.net.URL url = new java.net.URL(searchUrl);
         conn = (HttpURLConnection) url.openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setRequestProperty("Accept", "application/json");
         conn.setConnectTimeout(5000);

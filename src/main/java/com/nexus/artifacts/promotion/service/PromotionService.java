@@ -5,8 +5,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -16,10 +14,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 import javax.ws.rs.core.HttpHeaders;
 
 import org.slf4j.Logger;
@@ -66,31 +60,6 @@ public class PromotionService {
 
   /** Maximum retry attempts for individual file operations */
   private static final int FILE_RETRY_ATTEMPTS = 3;
-
-  /**
-   * Trust-all-SSL manager for self-signed certificates.
-   * Initialized once at class load time.
-   */
-  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
-      new X509TrustManager() {
-        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-      }
-  };
-
-  static {
-    try {
-      SSLContext sc = SSLContext.getInstance("TLS");
-      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
-      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
-      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
-      log.info("SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
-    }
-    catch (Exception e) {
-      log.warn("Failed to initialize SSL trust manager: {}", e.getMessage(), e);
-    }
-  }
 
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
@@ -1033,6 +1002,7 @@ public class PromotionService {
 
         URL url = new URL(searchUrlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(30_000);
         conn.setReadTimeout(60_000);
@@ -1090,6 +1060,7 @@ public class PromotionService {
 
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(30_000);
         conn.setReadTimeout(120_000);
@@ -1354,6 +1325,7 @@ public class PromotionService {
     try {
       URL url = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + assetName);
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("HEAD");
       conn.setConnectTimeout(10_000);
       conn.setReadTimeout(10_000);
@@ -1545,6 +1517,7 @@ public class PromotionService {
     // Step 1: Download manifest from source with proper Accept headers
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + filePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    SslHelper.applyTrustAllSsl(downloadConn);
     downloadConn.setRequestMethod("GET");
     downloadConn.setConnectTimeout(TIMEOUT_MS);
     downloadConn.setReadTimeout(TIMEOUT_MS);
@@ -1599,6 +1572,7 @@ public class PromotionService {
     // Step 3: Push manifest to target via Docker v2 API
     URL pushUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/manifests/" + tag);
     HttpURLConnection pushConn = (HttpURLConnection) pushUrl.openConnection();
+    SslHelper.applyTrustAllSsl(pushConn);
     pushConn.setRequestMethod("PUT");
     pushConn.setDoOutput(true);
     pushConn.setConnectTimeout(TIMEOUT_MS);
@@ -1660,6 +1634,7 @@ public class PromotionService {
     // Step 1: Initiate blob upload - POST /v2/<name>/blobs/uploads/
     URL initUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/blobs/uploads/");
     HttpURLConnection initConn = (HttpURLConnection) initUrl.openConnection();
+    SslHelper.applyTrustAllSsl(initConn);
     initConn.setRequestMethod("POST");
     initConn.setConnectTimeout(TIMEOUT_MS);
     initConn.setReadTimeout(TIMEOUT_MS);
@@ -1696,6 +1671,7 @@ public class PromotionService {
     // Step 2: Download blob from source
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + filePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    SslHelper.applyTrustAllSsl(downloadConn);
     downloadConn.setRequestMethod("GET");
     downloadConn.setConnectTimeout(TIMEOUT_MS);
     downloadConn.setReadTimeout(TIMEOUT_MS);
@@ -1719,6 +1695,7 @@ public class PromotionService {
     }
 
     HttpURLConnection putConn = (HttpURLConnection) new URL(putUrl).openConnection();
+    SslHelper.applyTrustAllSsl(putConn);
     putConn.setRequestMethod("PUT");
     putConn.setDoOutput(true);
     putConn.setConnectTimeout(TIMEOUT_MS);
