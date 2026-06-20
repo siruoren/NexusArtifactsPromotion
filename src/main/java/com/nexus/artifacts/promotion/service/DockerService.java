@@ -1909,12 +1909,20 @@ public class DockerService {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
 
-    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {})", image, tag, manifestPath);
+    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {}, incremental: {})", image, tag, manifestPath, incrementalSync);
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity
     writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
-      // Step 1: Sync manifest - delete cached, invalidate neg cache, dispatch
-      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath);
+      // Step 1: Sync manifest - with incremental check if enabled
+      SyncTaskInfo.SyncFileDetail manifestDetail;
+      if (incrementalSync && isDockerManifestCached(repo, manifestPath, tag)) {
+        log.info("[DOCKER-SYNC] Incremental: skipping cached manifest {} (image: {})", manifestPath, image + ":" + tag);
+        manifestDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+        manifestDetail.setStatus("skipped");
+        manifestDetail.setErrorMessage("Manifest already cached (" + image + ":" + tag + ")");
+      } else {
+        manifestDetail = syncDockerAssetInternal(repo, manifestPath);
+      }
       details.add(manifestDetail);
 
       // Step 2: Read manifest content from local cache to parse blob references
@@ -3057,6 +3065,51 @@ public class DockerService {
     }
     catch (Exception e) {
       log.debug("Failed to check if Docker blob {} is cached: {}", blobPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Check if a Docker manifest is already cached locally.
+   * Used for incremental sync to skip already-cached manifests.
+   * A manifest is considered cached if the asset exists and has a non-empty blob.
+   */
+  private boolean isDockerManifestCached(final Repository repo, final String manifestPath, final String tag) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return false;
+
+      // Check by asset name
+      Asset asset = tx.findAssetWithProperty("name", manifestPath, bucket);
+      if (asset == null && !manifestPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
+      }
+      // Also try with leading slash
+      if (asset == null && !manifestPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
+      }
+
+      if (asset != null) {
+        // Verify the blob exists and has content
+        if (asset.requireBlobRef() != null) {
+          Blob blob = tx.requireBlob(asset.requireBlobRef());
+          if (blob != null) {
+            log.debug("Docker manifest {} already cached locally", manifestPath);
+            return true;
+          }
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to check if Docker manifest {} is cached: {}", manifestPath, e.getMessage());
     }
     finally {
       if (tx != null) {
