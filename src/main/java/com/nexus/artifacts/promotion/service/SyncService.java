@@ -113,14 +113,14 @@ public class SyncService {
     // Try HTTPS first
     if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
       cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
-      log.info("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
+      log.debug("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
       return cachedLocalNexusBase;
     }
 
     // Fall back to HTTP
     if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
       cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-      log.info("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
+      log.debug("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
       return cachedLocalNexusBase;
     }
 
@@ -206,14 +206,14 @@ public class SyncService {
                 dockerRequest.setImage(path);
                 dockerRequest.setTags(null);
                 dockerRequest.setAllImages(false);
-                log.info("Parsed Docker path '{}' as image='{}' (found {} tags), will sync all tags from remote",
+                log.debug("Parsed Docker path '{}' as image='{}' (found {} tags), will sync all tags from remote",
                     path, path, prefixImages.get(path).size());
               }
               else {
                 // Multiple sub-images or the path is a directory prefix
                 dockerRequest.setImagePrefix(path);
                 dockerRequest.setAllImages(false);
-                log.info("Parsed Docker path '{}' as directory prefix (found {} images), will sync all from remote",
+                log.debug("Parsed Docker path '{}' as directory prefix (found {} images), will sync all from remote",
                     path, prefixImages.size());
               }
             }
@@ -224,7 +224,7 @@ public class SyncService {
               dockerRequest.setImage(parentImage);
               dockerRequest.setTags(Collections.singletonList(tagCandidate));
               dockerRequest.setAllImages(false);
-              log.info("Parsed Docker path '{}' as image='{}', tag='{}' (no images found for full path)",
+            log.debug("Parsed Docker path '{}' as image='{}', tag='{}' (no images found for full path)",
                   path, parentImage, tagCandidate);
             }
           }
@@ -233,7 +233,7 @@ public class SyncService {
             dockerRequest.setImage(path);
             dockerRequest.setTags(null);
             dockerRequest.setAllImages(false);
-            log.info("Parsed Docker path '{}' as image name, will sync all tags from remote", path);
+          log.debug("Parsed Docker path '{}' as image name, will sync all tags from remote", path);
           }
         }
       }
@@ -626,13 +626,13 @@ public class SyncService {
         // For incremental sync, get assets with MD5 in one pass to avoid per-asset API calls
         remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
         remoteAssets = new ArrayList<>(remoteMd5Map.keySet());
-        log.info("Found {} remote assets with MD5 for {}:{} (incremental: {})",
+        log.debug("Found {} remote assets with MD5 for {}:{} (incremental: {})",
             remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
       }
       else {
         // For full sync, just get the file list (no need for MD5 comparison)
         remoteAssets = listRemoteAssets(repo, directoryPath);
-        log.info("Found {} remote assets to sync in {}:{} (incremental: {})",
+        log.debug("Found {} remote assets to sync in {}:{} (incremental: {})",
             remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
       }
 
@@ -640,7 +640,7 @@ public class SyncService {
       Map<String, String> localMd5Map = Collections.emptyMap();
       if (incrementalSync) {
         localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
-        log.info("Incremental sync: found {} locally cached assets with MD5 in {}:{}",
+      log.debug("Incremental sync: found {} locally cached assets with MD5 in {}:{}",
             localMd5Map.size(), repo.getName(), directoryPath);
       }
 
@@ -670,23 +670,23 @@ public class SyncService {
                 remoteMd5 = getRemoteAssetMd5(repo, assetPath);
               }
               if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-                log.info("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
+                log.debug("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
                     repo.getName(), assetPath, localMd5);
                 detail.setStatus("skipped");
                 detail.setErrorMessage("MD5 unchanged");
                 details.add(detail);
                 continue;
               }
-              log.info("Incremental sync: asset {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
+              log.debug("Incremental sync: asset {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
                   repo.getName(), assetPath, localMd5, remoteMd5);
             }
             else {
-              log.info("Incremental sync: new asset {}/{}, syncing", repo.getName(), assetPath);
+            log.debug("Incremental sync: new asset {}/{}, syncing", repo.getName(), assetPath);
             }
           }
 
           // Sync the asset (full sync or incremental with changes)
-          log.info("Syncing asset: {}/{}", repo.getName(), assetPath);
+          log.debug("Syncing asset: {}/{}", repo.getName(), assetPath);
           RetryableOperation.executeRun("sync asset " + assetPath,
               () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
               SYNC_RETRY_ATTEMPTS);
@@ -731,23 +731,23 @@ public class SyncService {
             // File exists locally, compare MD5 with remote
             String remoteMd5 = getRemoteAssetMd5(repo, filePath);
             if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-              log.info("Incremental sync: skipping unchanged file {}/{} (MD5: {})",
+              log.debug("Incremental sync: skipping unchanged file {}/{} (MD5: {})",
                   repo.getName(), filePath, localMd5);
               detail.setStatus("skipped");
               detail.setErrorMessage("MD5 unchanged");
               details.add(detail);
               return details;
             }
-            log.info("Incremental sync: file {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
+            log.debug("Incremental sync: file {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
                 repo.getName(), filePath, localMd5, remoteMd5);
           }
           else {
-            log.info("Incremental sync: new file {}/{}, syncing", repo.getName(), filePath);
+            log.debug("Incremental sync: new file {}/{}, syncing", repo.getName(), filePath);
           }
         }
 
         // Sync the file (full sync or incremental with changes)
-        log.info("Syncing file: {}/{}", repo.getName(), filePath);
+        log.debug("Syncing file: {}/{}", repo.getName(), filePath);
         syncAssetViaContentFacet(repo, filePath, repoAuth);
         detail.setStatus("success");
       }
@@ -815,7 +815,7 @@ public class SyncService {
    */
   private void syncAssetViaContentFacet(final Repository repo, final String assetPath,
       final String[] repoAuth) throws Exception {
-    log.info("Syncing asset {} via ViewFacet.dispatch()", assetPath);
+    log.debug("Syncing asset {} via ViewFacet.dispatch()", assetPath);
 
     // Use file write lock to prevent concurrent sync of the same asset in the same repo
     writeLockManager.executeWithFileLockVoid(repo.getName(), assetPath, () -> {
@@ -837,7 +837,7 @@ public class SyncService {
           Response response = viewFacet.dispatch(request);
 
           if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-            log.info("Successfully synced asset {} from remote (HTTP {})",
+            log.debug("Successfully synced asset {} from remote (HTTP {})",
                 assetPath, response.getStatus().getCode());
           }
           else {
@@ -848,7 +848,7 @@ public class SyncService {
               log.warn("ViewFacet.dispatch() returned HTTP {} for {}, attempting direct HTTP download fallback", httpCode, assetPath);
               boolean fallbackResult = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
               if (fallbackResult) {
-                log.info("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
+                log.debug("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
                 return;
               }
               log.warn("Direct HTTP fallback also failed for {}", assetPath);
@@ -867,10 +867,10 @@ public class SyncService {
           log.warn("Content-Type mismatch for {}, attempting direct HTTP download fallback", assetPath);
           boolean fallbackResult = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
           if (fallbackResult) {
-            log.info("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
-            return;
-          }
-          log.warn("Direct HTTP fallback also failed for {} after InvalidContentException", assetPath);
+          log.debug("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
+          return;
+        }
+        log.warn("Direct HTTP fallback also failed for {} after InvalidContentException", assetPath);
         }
         log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
         throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
@@ -916,7 +916,7 @@ public class SyncService {
 
     // Download the file from remote via HTTP
     String fileUrl = remoteUrl + assetPath;
-    log.info("Direct HTTP download: {}", fileUrl);
+    log.debug("Direct HTTP download: {}", fileUrl);
 
     HttpURLConnection conn = null;
     java.nio.file.Path tempFile = null;
@@ -934,7 +934,7 @@ public class SyncService {
       }
 
       int responseCode = conn.getResponseCode();
-      log.info("Direct HTTP download: {} returned HTTP {}", fileUrl, responseCode);
+      log.debug("Direct HTTP download: {} returned HTTP {}", fileUrl, responseCode);
       if (responseCode != 200) {
         log.warn("Direct HTTP download returned HTTP {} for {}", responseCode, fileUrl);
         return false;
@@ -951,13 +951,17 @@ public class SyncService {
         contentType = contentType.substring(0, semicolon).trim();
       }
 
-      // Determine content type based on file extension if remote type is generic
+      // Use remote content type as-is to avoid mismatch with Nexus content validation on download.
+      // Files like .xpi are essentially zip archives; if remote says application/zip,
+      // storing as application/x-xpinstall will cause InvalidContentException on download
+      // because Nexus detects the actual content as application/zip.
+      // Only override when remote returns truly generic types like application/octet-stream.
       String effectiveContentType = contentType;
-      if ("application/zip".equals(contentType) || "application/x-zip-compressed".equals(contentType)) {
+      if ("application/octet-stream".equals(contentType)) {
         String specificType = getContentTypeByExtension(assetPath);
         if (specificType != null) {
           effectiveContentType = specificType;
-          log.info("Overriding content type from {} to {} for {}", contentType, specificType, assetPath);
+          log.debug("Overriding content type from {} to {} for {}", contentType, specificType, assetPath);
         }
       }
 
@@ -972,7 +976,7 @@ public class SyncService {
         }
       }
       long fileSize = java.nio.file.Files.size(tempFile);
-      log.info("Direct HTTP download: saved {} bytes to temp file for {}", fileSize, assetPath);
+      log.debug("Direct HTTP download: saved {} bytes to temp file for {}", fileSize, assetPath);
 
       if (fileSize == 0) {
         log.warn("Direct HTTP download: empty file for {}", assetPath);
@@ -992,7 +996,7 @@ public class SyncService {
           return false;
         }
 
-        String assetName = "/" + assetPath;
+        String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
 
         // Determine group and component name first
         String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
@@ -1015,7 +1019,7 @@ public class SyncService {
           Component existingComp = tx.findComponentWithProperty("name", componentName, bucket);
           if (existingComp != null && group.equals(existingComp.group())) {
             component = existingComp;
-            log.info("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
+            log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
           } else {
             // Fallback: browse and match
             component = null;
@@ -1030,9 +1034,9 @@ public class SyncService {
                   .group(group)
                   .name(componentName);
               tx.saveComponent(component);
-              log.info("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
+              log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
             } else {
-              log.info("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
+              log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
             }
           }
         } else {
@@ -1040,7 +1044,7 @@ public class SyncService {
               .group(group)
               .name(componentName);
           tx.saveComponent(component);
-          log.info("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
+          log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
         }
 
         // Create Asset under the Component
@@ -1063,7 +1067,7 @@ public class SyncService {
         tx.setBlob(asset, assetName, streamSupplier, hashAlgos, headers, effectiveContentType, true);
         tx.saveAsset(asset);
         tx.commit();
-        log.info("Direct HTTP sync: stored asset {} with content type {} ({} bytes)", assetPath, effectiveContentType, fileSize);
+        log.debug("Direct HTTP sync: stored asset {} with content type {} ({} bytes)", assetPath, effectiveContentType, fileSize);
         return true;
       }
       catch (Exception e) {
@@ -1162,11 +1166,11 @@ public class SyncService {
         try {
           Repository remoteRepo = repositoryManager.get(remoteRepoName);
           if (remoteRepo != null) {
-            log.info("Remote URL points to local Nexus repo: {}, listing via REST API (auth: {})",
+            log.debug("Remote URL points to local Nexus repo: {}, listing via REST API (auth: {})",
                 remoteRepoName, authUsername != null ? authUsername : "default");
             List<String> assets = listAssetsViaApi(remoteRepoName,
                 isFullSync ? "" : directoryPath, authUsername, authPassword);
-            log.info("Found {} assets from local repo {} in path {}",
+            log.debug("Found {} assets from local repo {} in path {}",
                 assets.size(), remoteRepoName, isFullSync ? "/" : directoryPath);
             return assets;
           }
@@ -1181,21 +1185,21 @@ public class SyncService {
       List<String> remoteApiAssets = listAssetsViaRemoteNexusApi(remoteUrl, repo.getName(),
           directoryPath, authUsername, authPassword);
       if (!remoteApiAssets.isEmpty()) {
-        log.info("Found {} assets via remote Nexus Search API for repo {} in path '{}'",
+        log.debug("Found {} assets via remote Nexus Search API for repo {} in path '{}'",
             remoteApiAssets.size(), repo.getName(), isFullSync ? "/" : directoryPath);
         return remoteApiAssets;
       }
 
       // Strategy 3: Fall back to HTTP directory listing
       if (isFullSync) {
-        log.info("Falling back to HTTP recursive directory listing for full repo sync: {}", remoteUrl);
+      log.debug("Falling back to HTTP recursive directory listing for full repo sync: {}", remoteUrl);
         List<String> httpAssets = listRemoteAssetsViaHttpRecursive("", remoteUrl, authUsername, authPassword);
         if (!httpAssets.isEmpty()) {
           return httpAssets;
         }
       }
       else {
-        log.info("Falling back to HTTP directory listing for remote: {}", remoteUrl);
+      log.debug("Falling back to HTTP directory listing for remote: {}", remoteUrl);
         List<String> httpAssets = listRemoteAssetsViaHttp(directoryPath, remoteUrl, authUsername, authPassword);
         if (!httpAssets.isEmpty()) {
           return httpAssets;
@@ -1204,7 +1208,7 @@ public class SyncService {
 
       // Strategy 4: Last resort - list locally cached assets
       // This only finds already-cached assets, but better than returning empty.
-      log.info("All remote listing strategies failed, falling back to locally cached assets for repo {}", repo.getName());
+      log.debug("All remote listing strategies failed, falling back to locally cached assets for repo {}", repo.getName());
       return listCachedAssetsInternal(repo, directoryPath);
 
     }
@@ -1253,16 +1257,16 @@ public class SyncService {
         try {
           Repository remoteRepo = repositoryManager.get(remoteRepoName);
           if (remoteRepo != null) {
-            log.info("listRemoteAssetsWithMd5: Strategy 1 - local Nexus repo '{}' found, querying with MD5", remoteRepoName);
+            log.debug("listRemoteAssetsWithMd5: Strategy 1 - local Nexus repo '{}' found, querying with MD5", remoteRepoName);
             assetMd5Map.putAll(listAssetsWithMd5ViaApi(repo.getName(), remoteRepoName,
                 isFullSync ? "" : directoryPath, authUsername, authPassword));
-            log.info("listRemoteAssetsWithMd5: Strategy 1 returned {} assets", assetMd5Map.size());
+            log.debug("listRemoteAssetsWithMd5: Strategy 1 returned {} assets", assetMd5Map.size());
             if (!assetMd5Map.isEmpty()) {
               return assetMd5Map;
             }
           }
           else {
-            log.info("listRemoteAssetsWithMd5: Strategy 1 - remote repo '{}' not found locally, trying next strategy", remoteRepoName);
+            log.debug("listRemoteAssetsWithMd5: Strategy 1 - remote repo '{}' not found locally, trying next strategy", remoteRepoName);
           }
         }
         catch (Exception e) {
@@ -1281,9 +1285,9 @@ public class SyncService {
             if (normalizedDir.endsWith("/")) normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
             searchUrlBase += "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
           }
-          log.info("listRemoteAssetsWithMd5: Strategy 2 - remote Nexus Search API: {}", searchUrlBase);
+          log.debug("listRemoteAssetsWithMd5: Strategy 2 - remote Nexus Search API: {}", searchUrlBase);
           Map<String, String> remoteMd5Map = listAssetsWithMd5ViaApiUrl(searchUrlBase, effectiveAuth);
-          log.info("listRemoteAssetsWithMd5: Strategy 2 returned {} assets", remoteMd5Map.size());
+          log.debug("listRemoteAssetsWithMd5: Strategy 2 returned {} assets", remoteMd5Map.size());
           if (!remoteMd5Map.isEmpty()) {
             assetMd5Map.putAll(remoteMd5Map);
             return assetMd5Map;
@@ -1296,7 +1300,7 @@ public class SyncService {
 
       // Strategy 3: If Search API didn't return MD5s, fall back to getRemoteAssetMd5 per asset
       // This is the slow path but ensures we get MD5s for HTTP-listed assets
-      log.info("listRemoteAssetsWithMd5: Strategy 3 - falling back to per-asset MD5 query");
+      log.debug("listRemoteAssetsWithMd5: Strategy 3 - falling back to per-asset MD5 query");
       List<String> assetPaths = listRemoteAssets(repo, directoryPath);
       for (String assetPath : assetPaths) {
         String normalizedPath = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
@@ -1392,11 +1396,11 @@ public class SyncService {
       }
 
       if (remoteRepoName == null || remoteBaseUrl == null) {
-        log.info("Cannot extract Nexus base URL and repo name from remote URL: {}", remoteUrl);
+        log.debug("Cannot extract Nexus base URL and repo name from remote URL: {}", remoteUrl);
         return results;
       }
 
-      log.info("Remote Nexus API: baseUrl={}, repoName={}, auth={}", remoteBaseUrl, remoteRepoName,
+      log.debug("Remote Nexus API: baseUrl={}, repoName={}, auth={}", remoteBaseUrl, remoteRepoName,
           authUsername != null ? authUsername : "none");
 
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
@@ -1423,7 +1427,7 @@ public class SyncService {
           searchUrl += "&continuationToken=" + continuationToken;
         }
 
-        log.info("Calling remote Nexus Search API: {}", searchUrl);
+        log.debug("Calling remote Nexus Search API: {}", searchUrl);
 
         HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
         SslHelper.applyTrustAllSsl(conn);
@@ -1437,22 +1441,22 @@ public class SyncService {
         }
 
         int code = conn.getResponseCode();
-        log.info("Remote Nexus Search API response: HTTP {} for {}", code, searchUrl);
+        log.debug("Remote Nexus Search API response: HTTP {} for {}", code, searchUrl);
 
         if (code == 404) {
-          log.info("Remote Nexus Search API not available at {}, trying Components API", remoteBaseUrl);
+          log.debug("Remote Nexus Search API not available at {}, trying Components API", remoteBaseUrl);
           conn.disconnect();
           // Fall back to Components API
           return listAssetsViaRemoteComponentsApi(remoteBaseUrl, remoteRepoName,
               directoryPath, effectiveAuth);
         }
         if (code == 403 || code == 401) {
-          log.info("Remote Nexus Search API returned {} - authentication required for {}", code, remoteBaseUrl);
+          log.debug("Remote Nexus Search API returned {} - authentication required for {}", code, remoteBaseUrl);
           conn.disconnect();
           return results;
         }
         if (code != 200) {
-          log.info("Remote Nexus Search API returned HTTP {} for {}", code, searchUrl);
+          log.debug("Remote Nexus Search API returned HTTP {} for {}", code, searchUrl);
           conn.disconnect();
           return results;
         }
@@ -1473,11 +1477,11 @@ public class SyncService {
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
-      log.info("Remote Nexus Search API found {} assets from {}/{}", results.size(), remoteBaseUrl, remoteRepoName);
+      log.debug("Remote Nexus Search API found {} assets from {}/{}", results.size(), remoteBaseUrl, remoteRepoName);
 
       // If Search API found nothing, try Components API as fallback
       if (results.isEmpty()) {
-        log.info("Search API returned 0 results, trying Components API as fallback");
+        log.debug("Search API returned 0 results, trying Components API as fallback");
         List<String> compResults = listAssetsViaRemoteComponentsApi(remoteBaseUrl, remoteRepoName,
             directoryPath, effectiveAuth);
         if (!compResults.isEmpty()) {
@@ -1486,7 +1490,7 @@ public class SyncService {
       }
     }
     catch (Exception e) {
-      log.info("Remote Nexus Search API failed for {}: {}", remoteUrl, e.getMessage());
+      log.debug("Remote Nexus Search API failed for {}: {}", remoteUrl, e.getMessage());
     }
     return results;
   }
@@ -1509,7 +1513,7 @@ public class SyncService {
           compUrl += "&continuationToken=" + continuationToken;
         }
 
-        log.info("Calling remote Nexus Components API: {}", compUrl);
+        log.debug("Calling remote Nexus Components API: {}", compUrl);
 
         HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
         SslHelper.applyTrustAllSsl(conn);
@@ -1523,7 +1527,7 @@ public class SyncService {
         }
 
         int code = conn.getResponseCode();
-        log.info("Remote Nexus Components API response: HTTP {}", code);
+        log.debug("Remote Nexus Components API response: HTTP {}", code);
 
         if (code != 200) {
           conn.disconnect();
@@ -1541,10 +1545,10 @@ public class SyncService {
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
-      log.info("Remote Nexus Components API found {} assets from {}/{}", results.size(), remoteBaseUrl, remoteRepoName);
+      log.debug("Remote Nexus Components API found {} assets from {}/{}", results.size(), remoteBaseUrl, remoteRepoName);
     }
     catch (Exception e) {
-      log.info("Remote Nexus Components API failed: {}", e.getMessage());
+      log.debug("Remote Nexus Components API failed: {}", e.getMessage());
     }
     return results;
   }
@@ -1609,7 +1613,7 @@ public class SyncService {
       }
     }
     catch (Exception e) {
-      log.info("Failed to parse Components API assets: {}", e.getMessage());
+      log.debug("Failed to parse Components API assets: {}", e.getMessage());
     }
     return results;
   }
@@ -1776,7 +1780,7 @@ public class SyncService {
     if (isFullSync) {
       String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
       List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
-      log.info("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
+      log.debug("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
       return allAssets;
     }
 
@@ -1796,7 +1800,7 @@ public class SyncService {
     // but still filter by path prefix to ensure accuracy
     if (!assetsWithGroup.isEmpty()) {
       List<String> filtered = filterByPathPrefix(assetsWithGroup, pathPrefix);
-      log.info("Search with group filter returned {} assets, {} matched path prefix '{}'",
+      log.debug("Search with group filter returned {} assets, {} matched path prefix '{}'",
           assetsWithGroup.size(), filtered.size(), pathPrefix);
       return filtered;
     }
@@ -1804,12 +1808,12 @@ public class SyncService {
     // Step 2: Group filter returned 0 results — fall back to listing all assets
     // and filtering by path prefix. This handles raw/hosted repos where the Search API's
     // group parameter doesn't correspond to the file system directory path.
-    log.info("Group filter returned 0 results for '{}', falling back to path-prefix filter", normalizedDir);
+    log.debug("Group filter returned 0 results for '{}', falling back to path-prefix filter", normalizedDir);
     String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
     List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
     List<String> filtered = filterByPathPrefix(allAssets, pathPrefix);
 
-    log.info("Total assets in repo {}: {}, matched path prefix '{}': {}",
+    log.debug("Total assets in repo {}: {}, matched path prefix '{}': {}",
         repoName, allAssets.size(), pathPrefix, filtered.size());
 
     return filtered;
@@ -1941,7 +1945,7 @@ public class SyncService {
               if (!loggedFirstMissingItem) {
                 loggedFirstMissingItem = true;
                 String snippet = item.length() > 500 ? item.substring(0, 500) + "..." : item;
-                log.info("MD5 extraction failed for asset '{}', raw item JSON (first 500 chars): {}", path, snippet);
+                log.debug("MD5 extraction failed for asset '{}', raw item JSON (first 500 chars): {}", path, snippet);
               }
             }
           }
@@ -1954,7 +1958,7 @@ public class SyncService {
 
     } while (continuationToken != null && !continuationToken.isEmpty());
 
-    log.info("Search API MD5 extraction result: {} assets with MD5, {} assets without MD5 (total: {})",
+    log.debug("Search API MD5 extraction result: {} assets with MD5, {} assets without MD5 (total: {})",
         md5Found, md5Missing, assetMap.size());
 
     return assetMap;
@@ -2068,7 +2072,7 @@ public class SyncService {
         dirUrl += "/";
       }
 
-      log.info("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? authUsername : "no");
+      log.debug("Fetching remote directory listing from: {} (auth: {})", dirUrl, authUsername != null ? authUsername : "no");
 
       HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
       SslHelper.applyTrustAllSsl(conn);
@@ -2082,7 +2086,7 @@ public class SyncService {
       }
 
       int responseCode = conn.getResponseCode();
-      log.info("Remote directory listing response: HTTP {} for {}", responseCode, dirUrl);
+      log.debug("Remote directory listing response: HTTP {} for {}", responseCode, dirUrl);
 
       if (responseCode != 200) {
         log.warn("Failed to fetch remote directory listing: HTTP {} for {}", responseCode, dirUrl);
@@ -2114,7 +2118,7 @@ public class SyncService {
         remoteAssets.add(assetPath);
       }
 
-      log.info("Found {} remote assets via HTTP directory listing", remoteAssets.size());
+      log.debug("Found {} remote assets via HTTP directory listing", remoteAssets.size());
 
     }
     catch (Exception e) {
@@ -2147,12 +2151,12 @@ public class SyncService {
       }
 
       if (asset != null) {
-        log.info("Asset {} exists in cache, deleting to force fresh download", assetPath);
+        log.debug("Asset {} exists in cache, deleting to force fresh download", assetPath);
         tx.deleteAsset(asset);
         tx.commit();
       }
       else {
-        log.info("Asset {} not in cache, will fetch fresh from remote", assetPath);
+        log.debug("Asset {} not in cache, will fetch fresh from remote", assetPath);
       }
     }
     catch (Exception e) {
@@ -2525,7 +2529,7 @@ public class SyncService {
       if (md5Map != null && md5Map.containsKey(normalizedPath)) {
         String md5 = md5Map.get(normalizedPath);
         if (md5 != null) {
-          log.info("getRemoteAssetMd5: got MD5 {} for {}/{} via listRemoteAssetsWithMd5", md5, repo.getName(), assetPath);
+          log.debug("getRemoteAssetMd5: got MD5 {} for {}/{} via listRemoteAssetsWithMd5", md5, repo.getName(), assetPath);
           return md5;
         }
       }
@@ -2537,20 +2541,20 @@ public class SyncService {
         String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
         String md5 = getRemoteMd5ViaNexusApi(nexusBaseUrl, remoteRepoName, repoAuth, assetPath, "/" + normalizedPath, format);
         if (md5 != null) {
-          log.info("getRemoteAssetMd5: got MD5 {} for {}/{} via Nexus API", md5, repo.getName(), assetPath);
+          log.debug("getRemoteAssetMd5: got MD5 {} for {}/{} via Nexus API", md5, repo.getName(), assetPath);
           return md5;
         }
-        log.info("getRemoteAssetMd5: Nexus API returned null MD5 for {}/{}", repo.getName(), assetPath);
+        log.debug("getRemoteAssetMd5: Nexus API returned null MD5 for {}/{}", repo.getName(), assetPath);
       }
 
       // Fallback for non-Nexus remotes or when Search API fails:
       // Try HTTP HEAD request to get Content-MD5 header or ETag
       String headMd5 = getRemoteMd5ViaHttpHead(remoteUrl, assetPath, repoAuth);
       if (headMd5 != null) {
-        log.info("getRemoteAssetMd5: got MD5 {} for {}/{} via HTTP HEAD", headMd5, repo.getName(), assetPath);
+        log.debug("getRemoteAssetMd5: got MD5 {} for {}/{} via HTTP HEAD", headMd5, repo.getName(), assetPath);
       }
       else {
-        log.info("getRemoteAssetMd5: all methods failed for {}/{}", repo.getName(), assetPath);
+        log.debug("getRemoteAssetMd5: all methods failed for {}/{}", repo.getName(), assetPath);
       }
       return headMd5;
     }
