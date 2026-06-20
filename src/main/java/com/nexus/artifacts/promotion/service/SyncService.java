@@ -618,10 +618,22 @@ public class SyncService {
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
 
-      // Step 1: Get remote file list
-      List<String> remoteAssets = listRemoteAssets(repo, directoryPath);
-      log.info("Found {} remote assets to sync in {}:{} (incremental: {})",
-          remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
+      // Step 1: Get remote file list with MD5 checksums (single API call)
+      Map<String, String> remoteMd5Map = Collections.emptyMap();
+      List<String> remoteAssets;
+      if (incrementalSync) {
+        // For incremental sync, get assets with MD5 in one pass to avoid per-asset API calls
+        remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
+        remoteAssets = new ArrayList<>(remoteMd5Map.keySet());
+        log.info("Found {} remote assets with MD5 for {}:{} (incremental: {})",
+            remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
+      }
+      else {
+        // For full sync, just get the file list (no need for MD5 comparison)
+        remoteAssets = listRemoteAssets(repo, directoryPath);
+        log.info("Found {} remote assets to sync in {}:{} (incremental: {})",
+            remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
+      }
 
       // Step 2: For incremental sync, build local MD5 map
       Map<String, String> localMd5Map = Collections.emptyMap();
@@ -632,7 +644,10 @@ public class SyncService {
       }
 
       // Step 3: Sync each asset using ContentFacet.get()
-      for (String assetPath : remoteAssets) {
+      for (String rawAssetPath : remoteAssets) {
+        // Normalize: strip leading slash for consistent path matching
+        String assetPath = rawAssetPath.startsWith("/") ? rawAssetPath.substring(1) : rawAssetPath;
+
         // Skip directory entries
         if (assetPath.endsWith("/")) {
           continue;
@@ -647,7 +662,12 @@ public class SyncService {
             String localMd5 = localMd5Map.get(assetPath);
             if (localMd5 != null) {
               // File exists locally, compare MD5 with remote
-              String remoteMd5 = getRemoteAssetMd5(repo, assetPath);
+              // Use pre-fetched MD5 from remoteMd5Map, fall back to per-asset query
+              String remoteMd5 = remoteMd5Map.get(assetPath);
+              if (remoteMd5 == null) {
+                // MD5 not available from listing, try per-asset query as fallback
+                remoteMd5 = getRemoteAssetMd5(repo, assetPath);
+              }
               if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
                 log.info("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
                     repo.getName(), assetPath, localMd5);
@@ -878,6 +898,153 @@ public class SyncService {
       log.error("Failed to list remote assets for {}: {}", directoryPath, e.getMessage(), e);
       return listCachedAssetsInternal(repo, directoryPath);
     }
+  }
+
+  /**
+   * List remote assets with their MD5 checksums.
+   * Returns a Map of (normalized path → MD5 checksum).
+   * This extracts MD5 from the same Search API response that lists assets,
+   * avoiding the need for a separate getRemoteAssetMd5() call per asset.
+   */
+  private Map<String, String> listRemoteAssetsWithMd5(final Repository repo, final String directoryPath) {
+    Map<String, String> assetMd5Map = new java.util.LinkedHashMap<>();
+    try {
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null) return assetMd5Map;
+
+      Map<String, Map<String, Object>> attributes = config.getAttributes();
+      if (attributes == null || !attributes.containsKey("proxy")) return assetMd5Map;
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = attributes.get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return assetMd5Map;
+
+      if (!remoteUrl.endsWith("/")) {
+        remoteUrl += "/";
+      }
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String authUsername = (repoAuth != null) ? repoAuth[0] : null;
+      String authPassword = (repoAuth != null) ? repoAuth[1] : null;
+      String effectiveAuth = (authUsername != null && authPassword != null)
+          ? authUsername + ":" + authPassword : null;
+
+      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
+
+      // Strategy 1: Local Nexus repo
+      if (remoteRepoName != null) {
+        try {
+          Repository remoteRepo = repositoryManager.get(remoteRepoName);
+          if (remoteRepo != null) {
+            log.info("listRemoteAssetsWithMd5: Strategy 1 - local Nexus repo '{}' found, querying with MD5", remoteRepoName);
+            assetMd5Map.putAll(listAssetsWithMd5ViaApi(repo.getName(), remoteRepoName,
+                isFullSync ? "" : directoryPath, authUsername, authPassword));
+            log.info("listRemoteAssetsWithMd5: Strategy 1 returned {} assets", assetMd5Map.size());
+            if (!assetMd5Map.isEmpty()) {
+              return assetMd5Map;
+            }
+          }
+          else {
+            log.info("listRemoteAssetsWithMd5: Strategy 1 - remote repo '{}' not found locally, trying next strategy", remoteRepoName);
+          }
+        }
+        catch (Exception e) {
+          log.warn("listRemoteAssetsWithMd5: Strategy 1 failed for repo '{}': {}", remoteRepoName, e.getMessage());
+        }
+      }
+
+      // Strategy 2: Remote Nexus Search API
+      if (remoteRepoName != null) {
+        String remoteBaseUrl = remoteUrl.substring(0, remoteUrl.indexOf("/repository/"));
+        try {
+          String searchUrlBase = remoteBaseUrl + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
+          if (!isFullSync) {
+            String normalizedDir = directoryPath;
+            if (normalizedDir.startsWith("/")) normalizedDir = normalizedDir.substring(1);
+            if (normalizedDir.endsWith("/")) normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
+            searchUrlBase += "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
+          }
+          log.info("listRemoteAssetsWithMd5: Strategy 2 - remote Nexus Search API: {}", searchUrlBase);
+          Map<String, String> remoteMd5Map = listAssetsWithMd5ViaApiUrl(searchUrlBase, effectiveAuth);
+          log.info("listRemoteAssetsWithMd5: Strategy 2 returned {} assets", remoteMd5Map.size());
+          if (!remoteMd5Map.isEmpty()) {
+            assetMd5Map.putAll(remoteMd5Map);
+            return assetMd5Map;
+          }
+        }
+        catch (Exception e) {
+          log.warn("listRemoteAssetsWithMd5: Strategy 2 failed: {}", e.getMessage());
+        }
+      }
+
+      // Strategy 3: If Search API didn't return MD5s, fall back to getRemoteAssetMd5 per asset
+      // This is the slow path but ensures we get MD5s for HTTP-listed assets
+      log.info("listRemoteAssetsWithMd5: Strategy 3 - falling back to per-asset MD5 query");
+      List<String> assetPaths = listRemoteAssets(repo, directoryPath);
+      for (String assetPath : assetPaths) {
+        String normalizedPath = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
+        if (!assetMd5Map.containsKey(normalizedPath)) {
+          String md5 = getRemoteAssetMd5(repo, normalizedPath);
+          assetMd5Map.put(normalizedPath, md5);
+        }
+      }
+    }
+    catch (Exception e) {
+      log.error("Failed to list remote assets with MD5: {}", e.getMessage());
+    }
+    return assetMd5Map;
+  }
+
+  /**
+   * List assets with MD5 from a local Nexus repo via Search API.
+   */
+  private Map<String, String> listAssetsWithMd5ViaApi(final String localRepoName, final String remoteRepoName,
+      final String directoryPath, final String authUsername, final String authPassword) throws Exception {
+    String effectiveAuth = (authUsername != null && authPassword != null)
+        ? authUsername + ":" + authPassword : null;
+
+    boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+    if (isFullSync) {
+      String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
+      return listAssetsWithMd5ViaApiUrl(allApiUrl, effectiveAuth);
+    }
+
+    String normalizedDir = directoryPath;
+    if (normalizedDir.endsWith("/")) {
+      normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
+    }
+
+    // Try with group filter first
+    String groupApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName
+        + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
+    Map<String, String> assetsWithGroup = listAssetsWithMd5ViaApiUrl(groupApiUrl, effectiveAuth);
+
+    if (!assetsWithGroup.isEmpty()) {
+      // Filter by path prefix
+      Map<String, String> filtered = new java.util.LinkedHashMap<>();
+      for (Map.Entry<String, String> entry : assetsWithGroup.entrySet()) {
+        String path = entry.getKey();
+        if (path.equals(normalizedDir) || path.startsWith(normalizedDir + "/")) {
+          filtered.put(path, entry.getValue());
+        }
+      }
+      return filtered;
+    }
+
+    // Fall back to listing all assets and filtering
+    String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
+    Map<String, String> allAssets = listAssetsWithMd5ViaApiUrl(allApiUrl, effectiveAuth);
+    Map<String, String> filtered = new java.util.LinkedHashMap<>();
+    for (Map.Entry<String, String> entry : allAssets.entrySet()) {
+      String path = entry.getKey();
+      if (path.equals(normalizedDir) || path.startsWith(normalizedDir + "/")) {
+        filtered.put(path, entry.getValue());
+      }
+    }
+    return filtered;
   }
 
   /**
@@ -1378,6 +1545,10 @@ public class SyncService {
           String path = extractJsonValue(item, "path");
 
           if (path != null) {
+            // Normalize: strip leading slash for consistent path matching
+            if (path.startsWith("/")) {
+              path = path.substring(1);
+            }
             assetNames.add(path);
           }
 
@@ -1390,6 +1561,89 @@ public class SyncService {
     } while (continuationToken != null && !continuationToken.isEmpty());
 
     return assetNames;
+  }
+
+  /**
+   * List assets from a Search API URL, extracting both path and MD5 checksum.
+   * Returns a Map of (normalized path → MD5 checksum).
+   * This avoids the need for a separate getRemoteAssetMd5() call per asset.
+   */
+  private Map<String, String> listAssetsWithMd5ViaApiUrl(final String apiUrl, final String effectiveAuth) throws Exception {
+    Map<String, String> assetMap = new java.util.LinkedHashMap<>();
+    String continuationToken = null;
+    int md5Found = 0;
+    int md5Missing = 0;
+    boolean loggedFirstMissingItem = false;
+
+    do {
+      String url = apiUrl;
+      if (continuationToken != null) {
+        url += "&continuationToken=" + continuationToken;
+      }
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(15_000);
+      conn.setReadTimeout(30_000);
+      conn.setRequestProperty("Accept", "application/json");
+      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+
+      if (conn.getResponseCode() != 200) {
+        log.warn("Search API returned HTTP {} for MD5 query: {}", conn.getResponseCode(), url);
+        conn.disconnect();
+        return assetMap;
+      }
+
+      String json = readResponse(conn);
+
+      // Parse items array
+      String itemsSection = extractJsonArray(json, "items");
+      if (itemsSection != null) {
+        int pos = 0;
+        while (pos < itemsSection.length()) {
+          int objStart = itemsSection.indexOf("{", pos);
+          if (objStart < 0) break;
+          int objEnd = findMatchingBrace(itemsSection, objStart);
+          if (objEnd < 0) break;
+
+          String item = itemsSection.substring(objStart, objEnd + 1);
+          String path = extractJsonValue(item, "path");
+
+          if (path != null) {
+            // Normalize: strip leading slash for consistent path matching
+            if (path.startsWith("/")) {
+              path = path.substring(1);
+            }
+            // Extract MD5 from checksums in the same item
+            String md5 = extractChecksumValue(item, "md5");
+            assetMap.put(path, md5);
+            if (md5 != null) {
+              md5Found++;
+            }
+            else {
+              md5Missing++;
+              // Log the first item where MD5 extraction failed for diagnosis
+              if (!loggedFirstMissingItem) {
+                loggedFirstMissingItem = true;
+                String snippet = item.length() > 500 ? item.substring(0, 500) + "..." : item;
+                log.info("MD5 extraction failed for asset '{}', raw item JSON (first 500 chars): {}", path, snippet);
+              }
+            }
+          }
+
+          pos = objEnd + 1;
+        }
+      }
+
+      continuationToken = extractJsonValue(json, "continuationToken");
+
+    } while (continuationToken != null && !continuationToken.isEmpty());
+
+    log.info("Search API MD5 extraction result: {} assets with MD5, {} assets without MD5 (total: {})",
+        md5Found, md5Missing, assetMap.size());
+
+    return assetMap;
   }
 
   /**
@@ -1699,19 +1953,45 @@ public class SyncService {
     // Find "checksums" key
     String checksumsPattern = "\"checksums\"";
     int checksumsIdx = json.indexOf(checksumsPattern);
-    if (checksumsIdx < 0) return null;
+    if (checksumsIdx >= 0) {
+      // Find the opening brace of the checksums object
+      int objStart = json.indexOf('{', checksumsIdx + checksumsPattern.length());
+      if (objStart >= 0) {
+        // Find the matching closing brace
+        int objEnd = findMatchingBrace(json, objStart);
+        if (objEnd >= 0) {
+          // Extract the checksums object and find the algorithm value
+          String checksumsObj = json.substring(objStart, objEnd + 1);
+          String value = extractJsonValue(checksumsObj, algo);
+          if (value != null) return value;
+        }
+      }
+    }
 
-    // Find the opening brace of the checksums object
-    int objStart = json.indexOf('{', checksumsIdx + checksumsPattern.length());
-    if (objStart < 0) return null;
+    // Fallback: try to find the algorithm directly in the JSON
+    // Some Nexus versions or formats may structure checksums differently
+    // e.g. "checksum": {"md5": "..."} or "md5": "..." at top level
+    String algoPattern = "\"" + algo + "\"";
+    int algoIdx = json.indexOf(algoPattern);
+    if (algoIdx >= 0) {
+      int colonIdx = json.indexOf(':', algoIdx + algoPattern.length());
+      if (colonIdx >= 0) {
+        int valueStart = json.indexOf('"', colonIdx + 1);
+        if (valueStart >= 0) {
+          int valueEnd = valueStart + 1;
+          while (valueEnd < json.length()) {
+            char c = json.charAt(valueEnd);
+            if (c == '"' && json.charAt(valueEnd - 1) != '\\') break;
+            valueEnd++;
+          }
+          if (valueEnd < json.length()) {
+            return json.substring(valueStart + 1, valueEnd);
+          }
+        }
+      }
+    }
 
-    // Find the matching closing brace
-    int objEnd = findMatchingBrace(json, objStart);
-    if (objEnd < 0) return null;
-
-    // Extract the checksums object and find the algorithm value
-    String checksumsObj = json.substring(objStart, objEnd + 1);
-    return extractJsonValue(checksumsObj, algo);
+    return null;
   }
 
   private String extractJsonValue(final String json, final String key) {
@@ -1860,7 +2140,17 @@ public class SyncService {
    */
   private String getAssetMd5(final Asset asset) {
     try {
-      // Try checksum_md5 attribute first (standard Nexus attribute)
+      // Method 1: Use Asset.getChecksum(HashAlgorithm.MD5) — Nexus 3.7+
+      try {
+        com.google.common.hash.HashCode md5Hash = asset.getChecksum(org.sonatype.nexus.common.hash.HashAlgorithm.MD5);
+        if (md5Hash != null) {
+          String md5 = md5Hash.toString();
+          if (!md5.isEmpty()) return md5;
+        }
+      }
+      catch (Exception ignored) { }
+
+      // Method 2: Try checksum attribute map
       Map<String, Object> attributes = asset.attributes() != null ? asset.attributes().backing() : null;
       if (attributes != null && attributes.containsKey("checksum")) {
         @SuppressWarnings("unchecked")
@@ -1870,9 +2160,6 @@ public class SyncService {
           if (md5 != null) return md5;
         }
       }
-
-      // Fallback: try sha1 and compute from blob content if needed
-      // For now, if no MD5 in checksum attributes, return null (will re-sync)
     }
     catch (Exception e) {
       log.debug("Failed to get MD5 for asset {}: {}", asset.name(), e.getMessage());
@@ -1882,7 +2169,7 @@ public class SyncService {
 
   /**
    * Get MD5 checksum of a remote asset by querying the Nexus Search API or Components API.
-   * For non-Nexus remotes, returns null (will always re-sync).
+   * For non-Nexus remotes, falls back to HTTP HEAD request to get Content-MD5 or ETag.
    */
   private String getRemoteAssetMd5(final Repository repo, final String assetPath) {
     try {
@@ -1901,21 +2188,235 @@ public class SyncService {
         remoteUrl += "/";
       }
 
-      // Check if remote URL points to a local Nexus instance
-      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
-      if (remoteRepoName == null) return null;
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String normalizedPath = assetPath.startsWith("/") ? assetPath : "/" + assetPath;
 
-      // Build Nexus Search API URL to get asset checksum
-      String nexusBaseUrl = remoteUrl.substring(0, remoteUrl.indexOf("/repository/"));
+      // Check if remote URL points to a Nexus instance
+      String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
+      if (remoteRepoName != null) {
+        // Remote is a Nexus instance — use Search API to get checksum
+        String nexusBaseUrl = remoteUrl.substring(0, remoteUrl.indexOf("/repository/"));
+        String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
+        String md5 = getRemoteMd5ViaNexusApi(nexusBaseUrl, remoteRepoName, repoAuth, assetPath, normalizedPath, format);
+        if (md5 != null) {
+          return md5;
+        }
+      }
+
+      // Fallback for non-Nexus remotes or when Search API fails:
+      // Try HTTP HEAD request to get Content-MD5 header or ETag
+      return getRemoteMd5ViaHttpHead(remoteUrl, assetPath, repoAuth);
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 for {}/{}: {}", repo.getName(), assetPath, e.getMessage());
+    }
+    return null;
+  }
+
+  /**
+   * Get remote MD5 via Nexus Search API with multiple query strategies.
+   * Tries various combinations of group and name parameters to handle different
+   * repository formats (maven2, raw, npm, etc.) and path structures.
+   * @param format the repository format (e.g. "maven2", "raw", "npm") for format-aware group extraction
+   */
+  private String getRemoteMd5ViaNexusApi(final String nexusBaseUrl, final String remoteRepoName,
+      final String[] repoAuth, final String assetPath, final String normalizedPath, final String format) {
+    try {
+      String group = extractGroupFromPath(assetPath, format);
+      String componentName = extractComponentNameFromPath(assetPath);
+      String fileName = extractFileName(assetPath);
+
+      // Strategy 1: group + component name (parent directory name)
+      // Works for Maven2 (artifactId) and some raw repos
+      if (group != null && componentName != null) {
+        String md5 = searchAndExtractMd5(nexusBaseUrl, remoteRepoName, repoAuth, group, componentName, normalizedPath);
+        if (md5 != null) {
+          log.debug("Got remote MD5 for {} via group+componentName query (group={}, name={})", assetPath, group, componentName);
+          return md5;
+        }
+      }
+
+      // Strategy 2: group + file name
+      // Works for raw format where component name equals file name
+      if (group != null && fileName != null && !fileName.equals(componentName)) {
+        String md5 = searchAndExtractMd5(nexusBaseUrl, remoteRepoName, repoAuth, group, fileName, normalizedPath);
+        if (md5 != null) {
+          log.debug("Got remote MD5 for {} via group+fileName query (group={}, name={})", assetPath, group, fileName);
+          return md5;
+        }
+      }
+
+      // Strategy 3: group only (no name filter)
+      if (group != null) {
+        String searchUrl = nexusBaseUrl + "/service/rest/v1/search/assets"
+            + "?repository=" + remoteRepoName
+            + "&group=" + java.net.URLEncoder.encode(group, "UTF-8");
+        String md5 = queryRemoteMd5(searchUrl, repoAuth, normalizedPath);
+        if (md5 != null) {
+          log.debug("Got remote MD5 for {} via group-only query (group={})", assetPath, group);
+          return md5;
+        }
+      }
+
+      // Strategy 4: name only (file name, no group filter)
+      // Works when the component is in an unexpected group or root group
+      if (fileName != null) {
+        String searchUrl = nexusBaseUrl + "/service/rest/v1/search/assets"
+            + "?repository=" + remoteRepoName
+            + "&name=" + java.net.URLEncoder.encode(fileName, "UTF-8");
+        String md5 = queryRemoteMd5(searchUrl, repoAuth, normalizedPath);
+        if (md5 != null) {
+          log.debug("Got remote MD5 for {} via name-only query (name={})", assetPath, fileName);
+          return md5;
+        }
+      }
+
+      // Strategy 5: component name only (parent directory name, no group filter)
+      if (componentName != null && !componentName.equals(fileName)) {
+        String searchUrl = nexusBaseUrl + "/service/rest/v1/search/assets"
+            + "?repository=" + remoteRepoName
+            + "&name=" + java.net.URLEncoder.encode(componentName, "UTF-8");
+        String md5 = queryRemoteMd5(searchUrl, repoAuth, normalizedPath);
+        if (md5 != null) {
+          log.debug("Got remote MD5 for {} via componentName-only query (name={})", assetPath, componentName);
+          return md5;
+        }
+      }
+
+      // Strategy 6: For Maven2, try with path-based group (slash-separated) as additional fallback
+      if ("maven2".equals(format)) {
+        String pathGroup = extractGroupFromPath(assetPath, "raw");
+        if (pathGroup != null && !pathGroup.equals(group)) {
+          String md5 = searchAndExtractMd5(nexusBaseUrl, remoteRepoName, repoAuth, pathGroup, componentName, normalizedPath);
+          if (md5 != null) {
+            log.debug("Got remote MD5 for {} via path-based group query (group={})", assetPath, pathGroup);
+            return md5;
+          }
+        }
+      }
+
+      // Strategy 7: Full repository query (last resort, may be slow for large repos)
+      log.debug("Falling back to full repository query for remote MD5 of {}", assetPath);
+      String searchUrl = nexusBaseUrl + "/service/rest/v1/search/assets"
+          + "?repository=" + remoteRepoName;
+      String md5 = queryRemoteMd5(searchUrl, repoAuth, normalizedPath);
+      if (md5 != null) {
+        log.debug("Got remote MD5 for {} via full repository query", assetPath);
+      }
+      return md5;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 via Nexus API for {}: {}", assetPath, e.getMessage());
+    }
+    return null;
+  }
+
+  /**
+   * Search Nexus API with group and name parameters, then extract MD5 by matching path.
+   */
+  private String searchAndExtractMd5(final String nexusBaseUrl, final String remoteRepoName,
+      final String[] repoAuth, final String group, final String name, final String normalizedPath) {
+    try {
       String searchUrl = nexusBaseUrl + "/service/rest/v1/search/assets"
           + "?repository=" + remoteRepoName
-          + "&name=" + java.net.URLEncoder.encode(assetPath, "UTF-8");
+          + "&group=" + java.net.URLEncoder.encode(group, "UTF-8")
+          + "&name=" + java.net.URLEncoder.encode(name, "UTF-8");
+      return queryRemoteMd5(searchUrl, repoAuth, normalizedPath);
+    }
+    catch (Exception e) {
+      log.debug("Search API query failed for group={}, name={}: {}", group, name, e.getMessage());
+    }
+    return null;
+  }
 
-      String[] repoAuth = extractAuthFromRepo(repo);
-      HttpURLConnection conn = null;
-      try {
-        java.net.URL url = new java.net.URL(searchUrl);
-        conn = (HttpURLConnection) url.openConnection();
+  /**
+   * Get remote MD5 via HTTP HEAD request.
+   * Checks Content-MD5 header first, then falls back to ETag comparison.
+   * For non-Nexus remotes, this is the only way to get remote checksum info.
+   */
+  private String getRemoteMd5ViaHttpHead(final String remoteUrl, final String assetPath,
+      final String[] repoAuth) {
+    HttpURLConnection conn = null;
+    try {
+      String fileUrl = remoteUrl + assetPath;
+      java.net.URL url = new java.net.URL(fileUrl);
+      conn = (HttpURLConnection) url.openConnection();
+      SslHelper.applyTrustAllSsl(conn);
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(5000);
+      conn.setReadTimeout(10000);
+
+      if (repoAuth != null) {
+        String auth = encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
+        conn.setRequestProperty("Authorization", "Basic " + auth);
+      }
+
+      int responseCode = conn.getResponseCode();
+      if (responseCode != 200) {
+        log.debug("HTTP HEAD returned {} for {}", responseCode, fileUrl);
+        return null;
+      }
+
+      // Try Content-MD5 header (RFC 2616, base64 encoded)
+      String contentMd5 = conn.getHeaderField("Content-MD5");
+      if (contentMd5 != null && !contentMd5.isEmpty()) {
+        try {
+          byte[] md5Bytes = java.util.Base64.getDecoder().decode(contentMd5);
+          return bytesToHex(md5Bytes);
+        }
+        catch (Exception e) {
+          log.debug("Failed to decode Content-MD5 header '{}': {}", contentMd5, e.getMessage());
+        }
+      }
+
+      // Try ETag header as a fallback for change detection
+      String etag = conn.getHeaderField("ETag");
+      if (etag != null && !etag.isEmpty()) {
+        String cleanedEtag = etag.replace("\"", "").trim();
+        if (!cleanedEtag.isEmpty()) {
+          log.debug("Using ETag as fallback checksum for {}: {}", assetPath, cleanedEtag);
+          return "etag:" + cleanedEtag;
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote MD5 via HTTP HEAD for {}: {}", assetPath, e.getMessage());
+    }
+    finally {
+      if (conn != null) {
+        try { conn.disconnect(); } catch (Exception ignored) { }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Convert byte array to lowercase hex string.
+   */
+  private static String bytesToHex(final byte[] bytes) {
+    StringBuilder sb = new StringBuilder(bytes.length * 2);
+    for (byte b : bytes) {
+      sb.append(String.format("%02x", b & 0xff));
+    }
+    return sb.toString();
+  }
+
+  /**
+   * Query remote Nexus Search API and extract MD5 for a specific asset path.
+   * Handles pagination to search through all results.
+   */
+  private String queryRemoteMd5(final String searchUrlBase, final String[] repoAuth, final String normalizedPath) {
+    HttpURLConnection conn = null;
+    try {
+      String continuationToken = null;
+      do {
+        String url = searchUrlBase;
+        if (continuationToken != null) {
+          url += "&continuationToken=" + continuationToken;
+        }
+
+        java.net.URL searchUrl = new java.net.URL(url);
+        conn = (HttpURLConnection) searchUrl.openConnection();
         SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setRequestProperty("Accept", "application/json");
@@ -1928,21 +2429,134 @@ public class SyncService {
         }
 
         int responseCode = conn.getResponseCode();
-        if (responseCode == 200) {
-          String response = readResponse(conn);
-          // Parse MD5 from checksums in response
-          return extractChecksumValue(response, "md5");
+        if (responseCode != 200) {
+          log.debug("Search API returned HTTP {} for MD5 query", responseCode);
+          return null;
         }
-      }
-      finally {
-        if (conn != null) {
-          try { conn.disconnect(); } catch (Exception ignored) { }
+
+        String response = readResponse(conn);
+        String md5 = extractChecksumForPath(response, normalizedPath, "md5");
+        if (md5 != null) {
+          return md5;
         }
-      }
+
+        // Check next page
+        continuationToken = extractJsonValue(response, "continuationToken");
+        conn.disconnect();
+        conn = null;
+      } while (continuationToken != null && !continuationToken.isEmpty());
     }
     catch (Exception e) {
-      log.debug("Failed to get remote MD5 for {}/{}: {}", repo.getName(), assetPath, e.getMessage());
+      log.debug("Failed to query remote MD5: {}", e.getMessage());
     }
+    finally {
+      if (conn != null) {
+        try { conn.disconnect(); } catch (Exception ignored) { }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Extract the group from an asset path for Nexus Search API.
+   * For Maven2 format: converts path to dot-separated groupId without version.
+   *   e.g. "com/example/my-app/1.0/my-app-1.0.jar" → "com.example.my-app"
+   * For other formats: uses the parent directory path as-is.
+   *   e.g. "some/dir/file.txt" → "some/dir"
+   */
+  private String extractGroupFromPath(final String assetPath, final String format) {
+    if (assetPath == null || assetPath.isEmpty()) return null;
+    int lastSlash = assetPath.lastIndexOf('/');
+    if (lastSlash <= 0) {
+      // No parent directory or only root — asset is at the root level
+      // Return empty string for root group (Nexus uses "" for root-level components)
+      return lastSlash == 0 ? "" : null;
+    }
+    String parentPath = assetPath.substring(0, lastSlash);
+
+    if ("maven2".equals(format)) {
+      // Maven2 path structure: groupId/artifactId/version/artifactId-version.ext
+      // The version directory is the last segment of parentPath.
+      // We need to extract groupId (everything before version/artifactId).
+      int versionSlash = parentPath.lastIndexOf('/');
+      if (versionSlash > 0) {
+        String possibleVersion = parentPath.substring(versionSlash + 1);
+        // Check if this looks like a version (starts with digit)
+        if (possibleVersion.length() > 0 && Character.isDigit(possibleVersion.charAt(0))) {
+          String groupPart = parentPath.substring(0, versionSlash);
+          // Convert slash-separated path to dot-separated groupId
+          return groupPart.replace('/', '.');
+        }
+      }
+      // Fallback: if no version detected, use the full parent path as dot-separated
+      return parentPath.replace('/', '.');
+    }
+
+    // For non-Maven formats, use the parent directory path as-is
+    return parentPath;
+  }
+
+  /**
+   * Extract the component name from an asset path.
+   * For Maven repos, the component name is typically the directory name
+   * just above the version directory (i.e., the artifactId).
+   * e.g. "com/example/my-app/1.0/my-app-1.0.jar" → "my-app"
+   * For non-Maven paths, use the parent directory name.
+   * e.g. "some/dir/file.txt" → "dir"
+   */
+  private String extractComponentNameFromPath(final String assetPath) {
+    if (assetPath == null || assetPath.isEmpty()) return null;
+    int lastSlash = assetPath.lastIndexOf('/');
+    if (lastSlash < 0) {
+      // No slash — file is at root, component name is the file name itself
+      return assetPath;
+    }
+    if (lastSlash == 0) {
+      // Path starts with "/" — treat as root-level file
+      return assetPath.substring(1);
+    }
+    String parentPath = assetPath.substring(0, lastSlash);
+    int parentSlash = parentPath.lastIndexOf('/');
+    return parentSlash >= 0 ? parentPath.substring(parentSlash + 1) : parentPath;
+  }
+
+  /**
+   * Extract the file name from an asset path.
+   * e.g. "com/example/artifact/1.0/artifact-1.0.jar" → "artifact-1.0.jar"
+   * e.g. "1/test_network_daemon.sh" → "test_network_daemon.sh"
+   */
+  private String extractFileName(final String assetPath) {
+    if (assetPath == null || assetPath.isEmpty()) return null;
+    int lastSlash = assetPath.lastIndexOf('/');
+    return lastSlash >= 0 ? assetPath.substring(lastSlash + 1) : assetPath;
+  }
+
+  /**
+   * Extract checksum value from a Search API response for a specific asset path.
+   * The response may contain multiple assets (e.g. .jar + .pom with same name),
+   * so we match by path to find the correct one.
+   */
+  private String extractChecksumForPath(final String json, final String targetPath, final String algo) {
+    String itemsSection = extractJsonArray(json, "items");
+    if (itemsSection == null) return null;
+
+    int pos = 0;
+    while (pos < itemsSection.length()) {
+      int objStart = itemsSection.indexOf("{", pos);
+      if (objStart < 0) break;
+      int objEnd = findMatchingBrace(itemsSection, objStart);
+      if (objEnd < 0) break;
+
+      String item = itemsSection.substring(objStart, objEnd + 1);
+      String itemPath = extractJsonValue(item, "path");
+
+      if (itemPath != null && itemPath.equals(targetPath)) {
+        return extractChecksumValue(item, algo);
+      }
+
+      pos = objEnd + 1;
+    }
+
     return null;
   }
 }
