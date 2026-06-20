@@ -670,12 +670,21 @@ public class SyncService {
                 remoteMd5 = getRemoteAssetMd5(repo, assetPath);
               }
               if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-                log.debug("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
-                    repo.getName(), assetPath, localMd5);
-                detail.setStatus("skipped");
-                detail.setErrorMessage("MD5 unchanged");
-                details.add(detail);
-                continue;
+                // For zip-based extensions (e.g. .xpi), check if cached content_type is correct.
+                // If the cached asset has a mismatched content_type (e.g. application/x-xpinstall
+                // instead of application/zip), Nexus will reject downloads with InvalidContentException.
+                // Force re-sync to fix the content_type.
+                if (isZipBasedExtension(assetPath) && hasMismatchedContentType(repo, assetPath)) {
+                  log.info("Incremental sync: forcing re-sync for {}/{} to fix mismatched content type",
+                      repo.getName(), assetPath);
+                } else {
+                  log.debug("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
+                      repo.getName(), assetPath, localMd5);
+                  detail.setStatus("skipped");
+                  detail.setErrorMessage("MD5 unchanged");
+                  details.add(detail);
+                  continue;
+                }
               }
               log.debug("Incremental sync: asset {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
                   repo.getName(), assetPath, localMd5, remoteMd5);
@@ -731,12 +740,18 @@ public class SyncService {
             // File exists locally, compare MD5 with remote
             String remoteMd5 = getRemoteAssetMd5(repo, filePath);
             if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-              log.debug("Incremental sync: skipping unchanged file {}/{} (MD5: {})",
-                  repo.getName(), filePath, localMd5);
-              detail.setStatus("skipped");
-              detail.setErrorMessage("MD5 unchanged");
-              details.add(detail);
-              return details;
+              // For zip-based extensions, check if cached content_type is correct
+              if (isZipBasedExtension(filePath) && hasMismatchedContentType(repo, filePath)) {
+                log.info("Incremental sync: forcing re-sync for {}/{} to fix mismatched content type",
+                    repo.getName(), filePath);
+              } else {
+                log.debug("Incremental sync: skipping unchanged file {}/{} (MD5: {})",
+                    repo.getName(), filePath, localMd5);
+                detail.setStatus("skipped");
+                detail.setErrorMessage("MD5 unchanged");
+                details.add(detail);
+                return details;
+              }
             }
             log.debug("Incremental sync: file {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
                 repo.getName(), filePath, localMd5, remoteMd5);
@@ -815,6 +830,19 @@ public class SyncService {
    */
   private void syncAssetViaContentFacet(final Repository repo, final String assetPath,
       final String[] repoAuth) throws Exception {
+    // For file extensions that are essentially zip archives but have specific MIME types,
+    // ViewFacet.dispatch() will store the specific type (e.g. application/x-xpinstall for .xpi),
+    // but Nexus's content validation on download will detect application/zip and reject it.
+    // Bypass ViewFacet.dispatch() for these files and use direct HTTP sync instead.
+    if (isZipBasedExtension(assetPath)) {
+      log.debug("Asset {} has zip-based extension, using direct HTTP sync to avoid Content-Type mismatch", assetPath);
+      boolean result = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
+      if (!result) {
+        throw new RuntimeException("Failed to sync asset " + assetPath + " via direct HTTP (zip-based extension)");
+      }
+      return;
+    }
+
     log.debug("Syncing asset {} via ViewFacet.dispatch()", assetPath);
 
     // Use file write lock to prevent concurrent sync of the same asset in the same repo
@@ -1092,6 +1120,67 @@ public class SyncService {
         try { conn.disconnect(); } catch (Exception ignored) { }
       }
     }
+  }
+
+  /**
+   * Check if the file extension indicates a format that is essentially a zip archive
+   * but has a specific MIME type. These files cause Content-Type mismatch errors
+   * when synced via ViewFacet.dispatch() because Nexus stores the specific MIME type
+   * (e.g. application/x-xpinstall for .xpi) but detects application/zip on download.
+   */
+  private boolean isZipBasedExtension(final String assetPath) {
+    if (assetPath == null) return false;
+    String lower = assetPath.toLowerCase();
+    return lower.endsWith(".xpi")
+        || lower.endsWith(".crx")
+        || lower.endsWith(".apk")
+        || lower.endsWith(".docx")
+        || lower.endsWith(".xlsx")
+        || lower.endsWith(".pptx")
+        || lower.endsWith(".odt")
+        || lower.endsWith(".ods");
+  }
+
+  /**
+   * Check if a cached asset has a content_type that will cause InvalidContentException on download.
+   * This happens when the asset was stored with a specific MIME type (e.g. application/x-xpinstall)
+   * but the actual content is detected as application/zip by Nexus's content validation.
+   */
+  private boolean hasMismatchedContentType(final Repository repo, final String assetPath) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return false;
+
+      String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
+      Asset asset = tx.findAssetWithProperty("name", assetName, bucket);
+      if (asset == null && !assetPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
+      }
+      if (asset == null) return false;
+
+      String contentType = asset.contentType();
+      if (contentType != null && !contentType.isEmpty()) {
+        // If the stored content_type is NOT application/zip but the file is a zip-based extension,
+        // it means the content_type was set to a specific type (e.g. application/x-xpinstall)
+        // which will conflict with Nexus's content detection on download.
+        boolean isZipType = "application/zip".equals(contentType)
+            || "application/x-zip-compressed".equals(contentType);
+        return !isZipType;
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to check content type for {}: {}", assetPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return false;
   }
 
   /**
