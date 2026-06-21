@@ -979,13 +979,18 @@ public class SyncService {
         contentType = contentType.substring(0, semicolon).trim();
       }
 
-      // Use remote content type as-is to avoid mismatch with Nexus content validation on download.
-      // Files like .xpi are essentially zip archives; if remote says application/zip,
-      // storing as application/x-xpinstall will cause InvalidContentException on download
-      // because Nexus detects the actual content as application/zip.
-      // Only override when remote returns truly generic types like application/octet-stream.
+      // Use extension-based content type to match user upload behavior.
+      // User uploads can specify content type based on file extension (e.g. application/x-xpinstall for .xpi).
+      // Sync should behave the same way: use extension-specific content type regardless of what remote returns.
+      // This ensures consistency between user-uploaded and synced files.
       String effectiveContentType = contentType;
-      if ("application/octet-stream".equals(contentType)) {
+      if (isZipBasedExtension(assetPath)) {
+        String specificType = getContentTypeByExtension(assetPath);
+        if (specificType != null) {
+          effectiveContentType = specificType;
+          log.debug("Using extension-specific content type {} for {} (remote returned {})", specificType, assetPath, contentType);
+        }
+      } else if ("application/octet-stream".equals(contentType)) {
         String specificType = getContentTypeByExtension(assetPath);
         if (specificType != null) {
           effectiveContentType = specificType;
@@ -1037,7 +1042,29 @@ public class SyncService {
           existingAsset = tx.findAssetWithProperty("name", assetPath, bucket);
         }
         if (existingAsset != null) {
-          tx.deleteAsset(existingAsset);
+          // For zip-based extensions, check if the existing asset has mismatched content type
+          // If so, force delete it to fix the content type
+          boolean forceDelete = false;
+          if (isZipBasedExtension(assetPath)) {
+            String existingContentType = existingAsset.contentType();
+            if (existingContentType != null && !existingContentType.isEmpty()) {
+              boolean isZipType = "application/zip".equals(existingContentType)
+                  || "application/x-zip-compressed".equals(existingContentType);
+              if (!isZipType) {
+                log.info("Direct HTTP sync: force deleting asset {} with mismatched content type {} (should be zip-based)", 
+                    assetPath, existingContentType);
+                forceDelete = true;
+              }
+            }
+          }
+          
+          if (forceDelete) {
+            tx.deleteAsset(existingAsset);
+            existingAsset = null;
+          } else {
+            log.debug("Direct HTTP sync: deleting existing asset {} before re-sync", assetPath);
+            tx.deleteAsset(existingAsset);
+          }
         }
 
         // Find or create Component (avoid ORecordDuplicatedException by reusing existing)
