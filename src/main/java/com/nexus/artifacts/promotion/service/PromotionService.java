@@ -428,8 +428,8 @@ public class PromotionService {
       List<String> assetNames;
 
       if (providedFiles != null && !providedFiles.isEmpty()) {
-        // Use files from frontend preview - filter out any non-file entries
-        assetNames = new ArrayList<>();
+        // Use files from frontend preview - filter out any non-file entries and deduplicate
+        java.util.LinkedHashSet<String> assetSet = new java.util.LinkedHashSet<>();
         for (String f : providedFiles) {
           if (f == null || f.isEmpty()) continue;
           if (f.equals(directoryPath)) {
@@ -440,8 +440,9 @@ public class PromotionService {
             log.warn("Frontend sent directory entry, skipping: {}", f);
             continue;
           }
-          assetNames.add(f);
+          assetSet.add(f);
         }
+        assetNames = new ArrayList<>(assetSet);
         log.info("After filtering providedFiles: {} valid files", assetNames.size());
       } else {
         // No files from frontend - try search API
@@ -890,29 +891,31 @@ public class PromotionService {
    * Tries multiple approaches: search API → components API fallback.
    */
   private List<String> searchAssets(final String repository, final String pathPrefix, final String nexusBaseUrl) throws IOException {
-    List<String> results = new ArrayList<>();
+    java.util.LinkedHashSet<String> resultsSet = new java.util.LinkedHashSet<>();
 
     // Normalize path: strip trailing slash
     String normalizedPrefix = (pathPrefix != null && pathPrefix.endsWith("/"))
         ? pathPrefix.substring(0, pathPrefix.length() - 1) : pathPrefix;
 
     // Approach 0: Internal Java API (most reliable, no auth issues)
-    results = searchAssetsViaInternalApi(repository, normalizedPrefix);
-    if (!results.isEmpty()) {
-      log.debug("Internal API found {} items for {}/{}", results.size(), repository, normalizedPrefix);
-      return results;
+    List<String> internalResults = searchAssetsViaInternalApi(repository, normalizedPrefix);
+    if (!internalResults.isEmpty()) {
+      resultsSet.addAll(internalResults);
+      log.debug("Internal API found {} items for {}/{}", internalResults.size(), repository, normalizedPrefix);
     }
 
     // Approach 1: Search API with wildcard
-    results = trySearchApi(repository, normalizedPrefix, nexusBaseUrl);
+    List<String> searchResults = trySearchApi(repository, normalizedPrefix, nexusBaseUrl);
+    resultsSet.addAll(searchResults);
 
     // Approach 2: Components API fallback if search returned nothing
-    if (results.isEmpty() && normalizedPrefix != null && !normalizedPrefix.isEmpty()) {
+    if (resultsSet.isEmpty() && normalizedPrefix != null && !normalizedPrefix.isEmpty()) {
       log.debug("Search API returned empty for {}/{}, trying components API", repository, normalizedPrefix);
-      results = tryComponentsApi(repository, normalizedPrefix, nexusBaseUrl);
+      List<String> componentResults = tryComponentsApi(repository, normalizedPrefix, nexusBaseUrl);
+      resultsSet.addAll(componentResults);
     }
 
-    return results;
+    return new ArrayList<>(resultsSet);
   }
 
   /**

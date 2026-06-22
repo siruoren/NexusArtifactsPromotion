@@ -1628,7 +1628,7 @@ public class DockerService {
             throw new InterruptedException("Task cancelled during Docker sync");
           }
           try {
-            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
+            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
             syncedFiles.addAll(tagFiles);
           }
           catch (Exception e) {
@@ -1766,7 +1766,7 @@ public class DockerService {
                   throw new InterruptedException("Task cancelled during Docker sync");
                 }
                 try {
-                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
+                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
                   syncedFiles.addAll(tagFiles);
                 }
                 catch (Exception e) {
@@ -1832,7 +1832,7 @@ public class DockerService {
                   throw new InterruptedException("Task cancelled during Docker sync");
                 }
                 try {
-                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
+                  List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
                   syncedFiles.addAll(tagFiles);
                 }
                 catch (Exception e) {
@@ -1883,7 +1883,7 @@ public class DockerService {
                 throw new InterruptedException("Task cancelled during Docker sync");
               }
               try {
-                List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag, request.isIncrementalSync());
+                List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag);
                 syncedFiles.addAll(tagFiles);
               }
               catch (Exception e) {
@@ -1947,26 +1947,17 @@ public class DockerService {
    * 4. Sync each referenced blob
    */
   private List<SyncTaskInfo.SyncFileDetail> syncDockerTag(
-      final Repository repo, final String image, final String tag,
-      final boolean incrementalSync) throws Exception
+      final Repository repo, final String image, final String tag) throws Exception
   {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
 
-    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {}, incremental: {})", image, tag, manifestPath, incrementalSync);
+    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {})", image, tag, manifestPath);
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity
     writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
-      // Step 1: Sync manifest - with incremental check if enabled
-      SyncTaskInfo.SyncFileDetail manifestDetail;
-      if (incrementalSync && isDockerManifestCached(repo, manifestPath, tag)) {
-        log.debug("[DOCKER-SYNC] Incremental: skipping cached manifest {} (image: {})", manifestPath, image + ":" + tag);
-        manifestDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
-        manifestDetail.setStatus("skipped");
-        manifestDetail.setErrorMessage("Manifest already cached (" + image + ":" + tag + ")");
-      } else {
-        manifestDetail = syncDockerAssetInternal(repo, manifestPath);
-      }
+      // Step 1: Sync manifest
+      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath);
       details.add(manifestDetail);
 
       // Step 2: Read manifest content from local cache to parse blob references
@@ -1997,7 +1988,7 @@ public class DockerService {
               String subManifestContent = readManifestContentFromCache(repo, subManifestPath);
               if (subManifestContent != null && !subManifestContent.isEmpty()) {
                 DockerManifestParser.DockerManifest subParsed = DockerManifestParser.parse(subManifestContent, ref.getMediaType());
-                syncBlobsForManifest(repo, image, subParsed, details, incrementalSync);
+                syncBlobsForManifest(repo, image, subParsed, details);
               }
             }
             catch (Exception e) {
@@ -2011,7 +2002,7 @@ public class DockerService {
         }
         else {
           // Single-platform manifest: sync config + layers
-          syncBlobsForManifest(repo, image, parsed, details, incrementalSync);
+          syncBlobsForManifest(repo, image, parsed, details);
         }
       }
       catch (Exception e) {
@@ -2047,15 +2038,12 @@ public class DockerService {
 
   /**
    * Sync all blobs (config + layers) for a single-platform manifest.
-   * If incrementalSync is true, skip blobs that already exist locally with the same digest.
    */
   private void syncBlobsForManifest(final Repository repo, final String image,
                                      final DockerManifestParser.DockerManifest manifest,
-                                     final List<SyncTaskInfo.SyncFileDetail> details,
-                                     final boolean incrementalSync) {
+                                     final List<SyncTaskInfo.SyncFileDetail> details) {
     Set<String> blobDigests = manifest.getAllBlobDigests();
-    log.info("[DOCKER-SYNC] Syncing {} blobs for image {} (incremental: {})",
-        blobDigests.size(), image, incrementalSync);
+    log.info("[DOCKER-SYNC] Syncing {} blobs for image {}", blobDigests.size(), image);
 
     for (String digest : blobDigests) {
       // Check for task cancellation/interruption
@@ -2065,16 +2053,6 @@ public class DockerService {
       }
 
       String blobPath = "v2/" + image + "/blobs/" + digest;
-
-      // Incremental sync: check if blob already exists locally
-      if (incrementalSync && isDockerBlobCached(repo, blobPath, digest)) {
-        log.debug("[DOCKER-SYNC] Incremental: skipping cached blob {} (digest: {})", blobPath, digest);
-        SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
-        skippedDetail.setStatus("skipped");
-        skippedDetail.setErrorMessage("Blob already cached (digest: " + digest.substring(0, Math.min(19, digest.length())) + "...)");
-        details.add(skippedDetail);
-        continue;
-      }
 
       try {
         SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);

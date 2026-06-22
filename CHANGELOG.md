@@ -16,15 +16,6 @@ All notable changes to this project will be documented in this file.
   - Fix: host is now derived from `request.getServerName()` + `request.getServerPort()` only; `X-Forwarded-Proto` is still allowed (affects scheme only, http vs https); added `isLocalHost()` validation that restricts hosts to `localhost` / `127.0.0.1` / `[::1]`
   - Compliance: satisfies GB/T 22239-2019 §8.1.3.3 (access control) and ISO 27001 Annex A.9.4.2 (secure logon procedures)
 
-### Added
-
-- **Incremental Sync**: new sync mode that only transfers files with different checksums, significantly reducing sync time for repositories with large numbers of unchanged files
-  - Non-Docker: compares local MD5 vs remote MD5 via Nexus Search API; skips files with matching checksums
-  - Docker: checks if blob already exists in local cache by digest; skips already-cached blobs (manifests are always re-synced since tags may point to different manifests)
-  - `SyncRequest.incrementalSync` and `DockerImageRequest.incrementalSync` fields added to API
-  - Frontend: sync button now shows a mode selection dialog with "Incremental Sync" (default, recommended) and "Full Sync" options
-  - Incremental sync falls back to full sync for non-Nexus remotes where MD5 cannot be queried
-
 ## [2.0.0] - 2026-06-18
 
 ### Added

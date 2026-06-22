@@ -240,7 +240,6 @@ public class SyncService {
       else {
         dockerRequest.setAllImages(true);
       }
-      dockerRequest.setIncrementalSync(request.isIncrementalSync());
       return dockerService.syncDockerImage(dockerRequest);
     }
 
@@ -300,10 +299,10 @@ public class SyncService {
           // Execute sync using ContentFacet
           List<SyncTaskInfo.SyncFileDetail> syncedFiles;
           if (request.isDirectory()) {
-            syncedFiles = syncDirectory(repo, request.getPath(), request.isIncrementalSync());
+            syncedFiles = syncDirectory(repo, request.getPath(), null);
           }
           else {
-            syncedFiles = syncFile(repo, request.getPath(), request.isIncrementalSync());
+            syncedFiles = syncFile(repo, request.getPath(), null);
           }
 
           taskInfo.setFileDetails(syncedFiles);
@@ -383,6 +382,18 @@ public class SyncService {
    * @return SyncTaskInfo with sync results
    */
   public SyncTaskInfo syncScheduled(final SyncRequest request) {
+    return syncScheduled(request, null);
+  }
+
+  /**
+   * Execute a scheduled sync task with support for Nexus task cancellation.
+   * 
+   * @param request the sync request
+   * @param task the Nexus task instance (may be null for direct API calls)
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncScheduled(final SyncRequest request, 
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
     request.validate();
 
     // Delegate Docker format syncs to DockerService (synchronous, asset-based approach)
@@ -431,10 +442,10 @@ public class SyncService {
       // Execute sync using ContentFacet
       List<SyncTaskInfo.SyncFileDetail> syncedFiles;
       if (request.isDirectory()) {
-        syncedFiles = syncDirectory(repo, request.getPath(), request.isIncrementalSync());
+        syncedFiles = syncDirectory(repo, request.getPath(), task);
       }
       else {
-        syncedFiles = syncFile(repo, request.getPath(), request.isIncrementalSync());
+        syncedFiles = syncFile(repo, request.getPath(), task);
       }
 
       taskInfo.setFileDetails(syncedFiles);
@@ -610,52 +621,32 @@ public class SyncService {
    * Sync all files in a directory from remote using ContentFacet.
    * Flow:
    * 1. Get remote file list (from remote repo REST API or HTTP directory listing)
-   * 2. For each file, compare MD5 of remote vs local cached asset
-   * 3. If MD5 matches, skip (incremental sync); otherwise call ContentFacet.get(path)
+   * 2. For each file, call ContentFacet.get(path) to sync from remote
    */
   private List<SyncTaskInfo.SyncFileDetail> syncDirectory(final Repository repo, final String directoryPath,
-      final boolean incrementalSync) {
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
-      log.info("Starting {} for {}:{} (incremental: {})",
+      log.info("Starting {} for {}:{}",
           isFullSync ? "full repository sync" : "directory sync",
-          repo.getName(), isFullSync ? "/" : directoryPath, incrementalSync);
+          repo.getName(), isFullSync ? "/" : directoryPath);
 
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
 
-      // Step 1: Get remote file list with MD5 checksums (single API call)
-      Map<String, String> remoteMd5Map = Collections.emptyMap();
-      List<String> remoteAssets;
-      if (incrementalSync) {
-        // For incremental sync, get assets with MD5 in one pass to avoid per-asset API calls
-        remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
-        remoteAssets = new ArrayList<>(remoteMd5Map.keySet());
-        log.info("Found {} remote assets with MD5 for {}:{} (incremental: {})",
-            remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
-      }
-      else {
-        // For full sync, just get the file list (no need for MD5 comparison)
-        remoteAssets = listRemoteAssets(repo, directoryPath);
-        log.info("Found {} remote assets to sync in {}:{} (incremental: {})",
-            remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
-      }
+      // Step 1: Get remote file list
+      List<String> remoteAssets = listRemoteAssets(repo, directoryPath);
+      log.info("Found {} remote assets to sync in {}:{}",
+          remoteAssets.size(), repo.getName(), directoryPath);
 
-      // Step 2: For incremental sync, build local MD5 map
-      Map<String, String> localMd5Map = Collections.emptyMap();
-      if (incrementalSync) {
-        localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
-        log.info("Incremental sync: found {} locally cached assets with MD5 in {}:{}",
-            localMd5Map.size(), repo.getName(), directoryPath);
-      }
-
-      // Step 3: Sync each asset using ContentFacet.get()
+      // Step 2: Sync each asset using ContentFacet.get()
       for (String rawAssetPath : remoteAssets) {
         // Check for task cancellation/interruption
-        if (Thread.currentThread().isInterrupted()) {
-          log.warn("Sync task interrupted, stopping directory sync for {}:{}", repo.getName(), directoryPath);
+        // Support both Nexus task cancellation (task.isCanceled()) and thread interruption
+        if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+          log.warn("Sync task cancelled, stopping directory sync for {}:{}", repo.getName(), directoryPath);
           throw new InterruptedException("Task cancelled during directory sync");
         }
 
@@ -671,43 +662,7 @@ public class SyncService {
             assetPath, determineType(assetPath));
 
         try {
-          // Incremental sync: check if file needs to be synced
-          if (incrementalSync) {
-            String localMd5 = localMd5Map.get(assetPath);
-            if (localMd5 != null) {
-              // File exists locally, compare MD5 with remote
-              // Use pre-fetched MD5 from remoteMd5Map, fall back to per-asset query
-              String remoteMd5 = remoteMd5Map.get(assetPath);
-              if (remoteMd5 == null) {
-                // MD5 not available from listing, try per-asset query as fallback
-                remoteMd5 = getRemoteAssetMd5(repo, assetPath);
-              }
-              if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-                // For zip-based extensions (e.g. .xpi), check if cached content_type is correct.
-                // If the cached asset has a mismatched content_type (e.g. application/x-xpinstall
-                // instead of application/zip), Nexus will reject downloads with InvalidContentException.
-                // Force re-sync to fix the content_type.
-                if (isZipBasedExtension(assetPath) && hasMismatchedContentType(repo, assetPath)) {
-                  log.info("Incremental sync: forcing re-sync for {}/{} to fix mismatched content type",
-                      repo.getName(), assetPath);
-                } else {
-                  log.debug("Incremental sync: skipping unchanged asset {}/{} (MD5: {})",
-                      repo.getName(), assetPath, localMd5);
-                  detail.setStatus("skipped");
-                  detail.setErrorMessage("MD5 unchanged");
-                  details.add(detail);
-                  continue;
-                }
-              }
-              log.debug("Incremental sync: asset {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
-                  repo.getName(), assetPath, localMd5, remoteMd5);
-            }
-            else {
-            log.debug("Incremental sync: new asset {}/{}, syncing", repo.getName(), assetPath);
-            }
-          }
-
-          // Sync the asset (full sync or incremental with changes)
+          // Sync the asset
           log.info("Syncing asset: {}/{}", repo.getName(), assetPath);
           RetryableOperation.executeRun("sync asset " + assetPath,
               () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
@@ -735,10 +690,16 @@ public class SyncService {
    * Sync a single file from remote using ContentFacet.
    */
   private List<SyncTaskInfo.SyncFileDetail> syncFile(final Repository repo, final String filePath,
-      final boolean incrementalSync) {
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) throws InterruptedException {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
+      // Check for task cancellation/interruption at start
+      if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+        log.warn("Sync task cancelled, skipping file sync for {}:{}", repo.getName(), filePath);
+        throw new InterruptedException("Task cancelled during file sync");
+      }
+
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
 
@@ -746,35 +707,7 @@ public class SyncService {
           filePath, determineType(filePath));
 
       try {
-        // Incremental sync: check if file needs to be synced
-        if (incrementalSync) {
-          String localMd5 = getLocalAssetMd5(repo, filePath);
-          if (localMd5 != null) {
-            // File exists locally, compare MD5 with remote
-            String remoteMd5 = getRemoteAssetMd5(repo, filePath);
-            if (remoteMd5 != null && remoteMd5.equalsIgnoreCase(localMd5)) {
-              // For zip-based extensions, check if cached content_type is correct
-              if (isZipBasedExtension(filePath) && hasMismatchedContentType(repo, filePath)) {
-                log.info("Incremental sync: forcing re-sync for {}/{} to fix mismatched content type",
-                    repo.getName(), filePath);
-              } else {
-                log.debug("Incremental sync: skipping unchanged file {}/{} (MD5: {})",
-                    repo.getName(), filePath, localMd5);
-                detail.setStatus("skipped");
-                detail.setErrorMessage("MD5 unchanged");
-                details.add(detail);
-                return details;
-              }
-            }
-            log.debug("Incremental sync: file {}/{} changed (local MD5: {}, remote MD5: {}), re-syncing",
-                repo.getName(), filePath, localMd5, remoteMd5);
-          }
-          else {
-            log.debug("Incremental sync: new file {}/{}, syncing", repo.getName(), filePath);
-          }
-        }
-
-        // Sync the file (full sync or incremental with changes)
+        // Sync the file
         log.info("Syncing file: {}/{}", repo.getName(), filePath);
         syncAssetViaContentFacet(repo, filePath, repoAuth);
         detail.setStatus("success");
@@ -785,6 +718,9 @@ public class SyncService {
       }
 
       details.add(detail);
+    }
+    catch (InterruptedException e) {
+      throw e;
     }
     catch (Exception e) {
       log.error("Failed to sync file {}: {}", filePath, e.getMessage(), e);
@@ -1953,7 +1889,8 @@ public class SyncService {
    * Returns all asset paths found across all pages.
    */
   private List<String> listAssetsViaApiUrl(final String apiUrl, final String effectiveAuth) throws Exception {
-    List<String> assetNames = new ArrayList<>();
+    // Use LinkedHashSet to preserve order while preventing duplicates
+    java.util.LinkedHashSet<String> assetNamesSet = new java.util.LinkedHashSet<>();
     String continuationToken = null;
 
     do {
@@ -1973,7 +1910,7 @@ public class SyncService {
       if (conn.getResponseCode() != 200) {
         log.warn("Search API returned HTTP {} for {}", conn.getResponseCode(), url);
         conn.disconnect();
-        return assetNames;
+        return new ArrayList<>(assetNamesSet);
       }
 
       String json = readResponse(conn);
@@ -1996,7 +1933,7 @@ public class SyncService {
             if (path.startsWith("/")) {
               path = path.substring(1);
             }
-            assetNames.add(path);
+            assetNamesSet.add(path);
           }
 
           pos = objEnd + 1;
@@ -2007,7 +1944,7 @@ public class SyncService {
 
     } while (continuationToken != null && !continuationToken.isEmpty());
 
-    return assetNames;
+    return new ArrayList<>(assetNamesSet);
   }
 
   /**

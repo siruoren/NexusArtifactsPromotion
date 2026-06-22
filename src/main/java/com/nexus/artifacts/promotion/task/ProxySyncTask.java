@@ -79,7 +79,8 @@ public class ProxySyncTask
     request.setFormat(format);
 
     // Execute sync (synchronous, no permission check for scheduled tasks)
-    SyncTaskInfo result = syncService.syncScheduled(request);
+    // Pass the task context so sync can check for cancellation
+    SyncTaskInfo result = syncService.syncScheduled(request, this);
 
     // Build result message based on task status
     String message;

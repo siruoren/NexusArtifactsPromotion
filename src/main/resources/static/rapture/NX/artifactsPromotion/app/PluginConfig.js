@@ -1498,73 +1498,11 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
   handleSyncClick: function (repoName, path, isDirectory, format) {
     var me = this;
-
-    // Show sync mode selection dialog
-    var syncModeWin = Ext.create('Ext.window.Window', {
-      title: _t('sync.incremental.title'),
-      width: 420,
-      modal: true,
-      closable: true,
-      layout: { type: 'vbox', align: 'stretch' },
-      bodyPadding: 15,
-      items: [
-        {
-          xtype: 'component',
-          html: '<div style="margin-bottom:10px;font-size:13px;">' + _t('sync.incremental.message') + '</div>'
-        },
-        {
-          xtype: 'container',
-          layout: { type: 'vbox', align: 'stretch' },
-          items: [
-            {
-              xtype: 'button',
-              text: _t('sync.incremental.incremental'),
-              iconCls: 'x-fa fa-bolt',
-              cls: 'x-btn-default-small',
-              scale: 'medium',
-              margin: '0 0 8 0',
-              height: 40,
-              tooltip: _t('sync.incremental.incremental.desc'),
-              handler: function () {
-                syncModeWin.close();
-                me.executeSync(repoName, path, isDirectory, format, true);
-              }
-            },
-            {
-              xtype: 'component',
-              html: '<div style="color:#888;font-size:11px;margin-bottom:12px;padding-left:4px;">' + _t('sync.incremental.incremental.desc') + '</div>'
-            },
-            {
-              xtype: 'button',
-              text: _t('sync.incremental.full'),
-              iconCls: 'x-fa fa-sync',
-              cls: 'x-btn-default-small',
-              scale: 'medium',
-              height: 40,
-              tooltip: _t('sync.incremental.full.desc'),
-              handler: function () {
-                syncModeWin.close();
-                me.executeSync(repoName, path, isDirectory, format, false);
-              }
-            },
-            {
-              xtype: 'component',
-              html: '<div style="color:#888;font-size:11px;padding-left:4px;">' + _t('sync.incremental.full.desc') + '</div>'
-            }
-          ]
-        }
-      ],
-      buttons: [
-        {
-          text: _t('promotion.result.close'),
-          handler: function () { syncModeWin.close(); }
-        }
-      ]
-    });
-    syncModeWin.show();
+    // Execute sync directly
+    me.executeSync(repoName, path, isDirectory, format);
   },
 
-  executeSync: function (repoName, path, isDirectory, format, incrementalSync) {
+  executeSync: function (repoName, path, isDirectory, format) {
     var me = this;
     // Docker format: use the same sync mechanism as other formats
     if (format === 'docker') {
@@ -1577,8 +1515,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
           repositoryName: repoName,
           path: path,
           isDirectory: isDirectory,
-          format: format,
-          incrementalSync: incrementalSync
+          format: format
         })
         .then(function (result) {
           me.showSyncProgressWindow(result, repoName, path, isDirectory);
@@ -1599,8 +1536,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         repositoryName: repoName,
         path: path,
         isDirectory: isDirectory,
-        format: format,
-        incrementalSync: incrementalSync
+        format: format
       })
       .then(function (result) {
         me.showSyncProgressWindow(result, repoName, path, isDirectory);
@@ -1801,10 +1737,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     });
 
     // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    // Also used for deduplication
     var statusMap = {};
+    var seenPaths = {};
     if (preview && preview.files) {
       Ext.each(preview.files, function (f) {
-        if (f.path) { statusMap[f.path] = 'pending'; }
+        if (f.path && !seenPaths[f.path]) {
+          seenPaths[f.path] = true;
+          statusMap[f.path] = 'pending';
+        }
       });
     }
 
@@ -1817,8 +1758,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       },
       data: preview && preview.files ? (function () {
         var arr = [];
+        var seen = {};
         Ext.each(preview.files, function (f) {
-          arr.push({ path: f.path, type: f.type, size: f.size, status: 'pending' });
+          if (f.path && !seen[f.path]) {
+            seen[f.path] = true;
+            arr.push({ path: f.path, type: f.type, size: f.size, status: 'pending' });
+          }
         });
         return arr;
       })() : []

@@ -12,7 +12,6 @@ public class SyncRequest {
   private String path;
   private boolean isDirectory;
   private String format;
-  private boolean incrementalSync;
 
   public SyncRequest() {}
 
@@ -27,9 +26,6 @@ public class SyncRequest {
 
   public String getFormat() { return format; }
   public void setFormat(String format) { this.format = format; }
-
-  public boolean isIncrementalSync() { return incrementalSync; }
-  public void setIncrementalSync(boolean incrementalSync) { this.incrementalSync = incrementalSync; }
 
   /**
    * Validate the request.
