@@ -73,8 +73,20 @@ public class RetryableOperation {
     Exception lastException = null;
 
     for (int attempt = 0; attempt <= maxRetries; attempt++) {
+      // Check for task cancellation/interruption before each attempt
+      if (Thread.currentThread().isInterrupted()) {
+        log.warn("[RETRY] {} cancelled before attempt {}/{}", operationName, attempt + 1, maxRetries + 1);
+        throw new InterruptedException("Operation cancelled: " + operationName);
+      }
+      
       try {
         return callable.call();
+      }
+      catch (InterruptedException e) {
+        // Re-interrupt and propagate - task was cancelled
+        Thread.currentThread().interrupt();
+        log.warn("[RETRY] {} interrupted during attempt {}/{}", operationName, attempt + 1, maxRetries + 1);
+        throw e;
       }
       catch (Exception e) {
         lastException = e;
@@ -91,6 +103,13 @@ public class RetryableOperation {
         log.warn("[RETRY] {} failed (attempt {}/{}), retrying in {}ms: {}",
             operationName, attempt + 1, maxRetries + 1, delay, e.getMessage());
 
+        // Check for cancellation before sleeping
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("[RETRY] {} cancelled before retry sleep (attempt {}/{})", 
+              operationName, attempt + 1, maxRetries + 1);
+          throw new InterruptedException("Operation cancelled during retry delay: " + operationName);
+        }
+        
         Thread.sleep(delay);
       }
     }

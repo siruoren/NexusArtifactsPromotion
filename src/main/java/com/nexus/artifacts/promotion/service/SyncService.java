@@ -448,18 +448,29 @@ public class SyncService {
         syncedFiles = syncFile(repo, request.getPath(), task);
       }
 
+      // Check if task was cancelled during sync
+      boolean taskCancelled = Thread.currentThread().isInterrupted() || (task != null && task.isCanceled());
+
       taskInfo.setFileDetails(syncedFiles);
-      taskInfo.setStatus(TaskStatus.COMPLETED);
-      taskInfo.setEndTime(System.currentTimeMillis());
+      
+      // Set status based on whether task was cancelled
+      if (taskCancelled) {
+        Thread.currentThread().interrupt(); // Reset interrupted flag
+        taskInfo.setStatus(TaskStatus.CANCELLED);
+        taskInfo.setResult("Cancelled: " + syncedFiles.size() + " items synced");
+      } else {
+        taskInfo.setStatus(TaskStatus.COMPLETED);
+        taskInfo.setEndTime(System.currentTimeMillis());
 
-      // Count skipped vs actually synced items
-      long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-      long syncedCount = syncedFiles.size() - skippedCount;
-      taskInfo.setResult("Synced " + syncedCount + " items" +
-          (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
+        // Count skipped vs actually synced items
+        long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+        long syncedCount = syncedFiles.size() - skippedCount;
+        taskInfo.setResult("Synced " + syncedCount + " items" +
+            (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
+      }
 
-      log.info("Scheduled sync task completed: {} items synced, {} skipped from {}:{}",
-          syncedCount, skippedCount, request.getRepositoryName(),
+      log.info("Scheduled sync task {}: {} items synced from {}:{}",
+          taskCancelled ? "cancelled" : "completed", syncedFiles.size(), request.getRepositoryName(),
           isFullSync ? "/" : request.getPath());
     }
     catch (Exception e) {
@@ -647,7 +658,16 @@ public class SyncService {
         // Support both Nexus task cancellation (task.isCanceled()) and thread interruption
         if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
           log.warn("Sync task cancelled, stopping directory sync for {}:{}", repo.getName(), directoryPath);
-          throw new InterruptedException("Task cancelled during directory sync");
+          // Filter to only return successfully synced files to avoid showing 404 files
+          List<SyncTaskInfo.SyncFileDetail> successfulFiles = new ArrayList<>();
+          for (SyncTaskInfo.SyncFileDetail detail : details) {
+            if ("success".equals(detail.getStatus())) {
+              successfulFiles.add(detail);
+            }
+          }
+          log.info("Sync task cancelled, returning {} successfully synced files out of {}", 
+              successfulFiles.size(), details.size());
+          return successfulFiles;
         }
 
         // Normalize: strip leading slash for consistent path matching
@@ -690,14 +710,14 @@ public class SyncService {
    * Sync a single file from remote using ContentFacet.
    */
   private List<SyncTaskInfo.SyncFileDetail> syncFile(final Repository repo, final String filePath,
-      final com.nexus.artifacts.promotion.task.ProxySyncTask task) throws InterruptedException {
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
 
     try {
       // Check for task cancellation/interruption at start
       if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
         log.warn("Sync task cancelled, skipping file sync for {}:{}", repo.getName(), filePath);
-        throw new InterruptedException("Task cancelled during file sync");
+        return details; // Return empty list when cancelled
       }
 
       // Extract auth from proxy repo configuration
@@ -718,9 +738,6 @@ public class SyncService {
       }
 
       details.add(detail);
-    }
-    catch (InterruptedException e) {
-      throw e;
     }
     catch (Exception e) {
       log.error("Failed to sync file {}: {}", filePath, e.getMessage(), e);
@@ -1009,7 +1026,11 @@ public class SyncService {
           
           if (forceDelete) {
             tx.deleteAsset(existingAsset);
-            existingAsset = null;
+            // Commit delete to ensure index is updated before creating new asset
+            tx.commit();
+            tx.begin();
+            // Re-find bucket after re-opening transaction
+            bucket = tx.findBucket(repo);
           } else {
             log.debug("Direct HTTP sync: deleting existing asset {} before re-sync", assetPath);
             tx.deleteAsset(existingAsset);
