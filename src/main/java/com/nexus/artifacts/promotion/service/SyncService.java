@@ -306,17 +306,27 @@ public class SyncService {
           }
 
           taskInfo.setFileDetails(syncedFiles);
-          taskInfo.setStatus(TaskStatus.COMPLETED);
-          taskInfo.setEndTime(System.currentTimeMillis());
-
+          
           // Count skipped vs actually synced items
           long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
           long syncedCount = syncedFiles.size() - skippedCount;
-          taskInfo.setResult("Synced " + syncedCount + " items" +
-              (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
+          
+          // Check if task was cancelled during sync
+          boolean taskCancelled = Thread.currentThread().isInterrupted();
+          
+          if (taskCancelled) {
+            Thread.currentThread().interrupt(); // Reset interrupted flag
+            taskInfo.setStatus(TaskStatus.CANCELLED);
+            taskInfo.setResult("Cancelled: " + syncedFiles.size() + " items synced");
+          } else {
+            taskInfo.setStatus(TaskStatus.COMPLETED);
+            taskInfo.setEndTime(System.currentTimeMillis());
+            taskInfo.setResult("Synced " + syncedCount + " items" +
+                (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
+          }
 
-          log.info("Sync task completed: {} items synced, {} skipped from {}:{}",
-              syncedCount, skippedCount, request.getRepositoryName(), request.getPath());
+          log.info("Sync task {}: {} items synced, {} skipped from {}:{}",
+              taskCancelled ? "cancelled" : "completed", syncedCount, skippedCount, request.getRepositoryName(), request.getPath());
 
         }
         catch (Exception e) {
@@ -654,20 +664,13 @@ public class SyncService {
 
       // Step 2: Sync each asset using ContentFacet.get()
       for (String rawAssetPath : remoteAssets) {
-        // Check for task cancellation/interruption
+        // Check for task cancellation/interruption before starting next file
         // Support both Nexus task cancellation (task.isCanceled()) and thread interruption
+        // Wait for current file to complete, then stop syncing subsequent files
         if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
-          log.warn("Sync task cancelled, stopping directory sync for {}:{}", repo.getName(), directoryPath);
-          // Filter to only return successfully synced files to avoid showing 404 files
-          List<SyncTaskInfo.SyncFileDetail> successfulFiles = new ArrayList<>();
-          for (SyncTaskInfo.SyncFileDetail detail : details) {
-            if ("success".equals(detail.getStatus())) {
-              successfulFiles.add(detail);
-            }
-          }
-          log.info("Sync task cancelled, returning {} successfully synced files out of {}", 
-              successfulFiles.size(), details.size());
-          return successfulFiles;
+          log.warn("Sync task cancelled, stopping directory sync for {}:{}, current file completed", repo.getName(), directoryPath);
+          log.info("Sync task cancelled, {} files successfully synced out of {}", details.size(), remoteAssets.size());
+          return details;
         }
 
         // Normalize: strip leading slash for consistent path matching
@@ -855,6 +858,16 @@ public class SyncService {
         }
       }
       catch (Exception e) {
+        // Check if the exception is caused by thread interruption (task cancellation)
+        if (e instanceof java.nio.channels.ClosedByInterruptException || 
+            (e.getCause() instanceof java.nio.channels.ClosedByInterruptException)) {
+          // Restore interrupted status but don't throw - let current file sync complete
+          Thread.currentThread().interrupt();
+          log.warn("Thread interrupted during sync of {} - will complete current file then stop", assetPath);
+          // Don't throw, allow method to return normally so current file can be marked as completed
+          return;
+        }
+        
         // Check if the exception is caused by Content-Type mismatch
         String errorMsg = e.getMessage();
         if (errorMsg != null && errorMsg.contains("InvalidContentException")) {
@@ -1106,6 +1119,14 @@ public class SyncService {
       }
       catch (Exception e) {
         log.error("Direct HTTP sync: StorageTx failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
+        // Roll back any partial asset that may have been created before the failure
+        try {
+          if (tx != null) {
+            tx.rollback();
+          }
+        } catch (Exception rbEx) {
+          log.debug("Rollback failed for {}: {}", assetPath, rbEx.getMessage());
+        }
         return false;
       }
       finally {
@@ -2256,7 +2277,13 @@ public class SyncService {
       }
     }
     catch (Exception e) {
-      log.warn("Failed to delete cached asset {} via internal API: {}", assetPath, e.getMessage());
+      // Handle InterruptedException specially - thread is being cancelled
+      if (e instanceof InterruptedException) {
+        log.warn("Cleanup interrupted while deleting cached asset {} - thread cancellation in progress", assetPath);
+        Thread.currentThread().interrupt(); // Restore interrupted status
+      } else {
+        log.warn("Failed to delete cached asset {} via internal API: {}", assetPath, e.getMessage());
+      }
       if (tx != null) {
         try { tx.rollback(); } catch (Exception ex) { /* ignore */ }
       }
