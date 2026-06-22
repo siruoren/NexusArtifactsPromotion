@@ -1688,6 +1688,23 @@ public class DockerService {
         ? new SubjectThreadState(subject) : null;
     final String preTaskId = "docker-sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
 
+    // Create initial task info record before submitting task
+    // This ensures the task appears in the queue immediately
+    SyncTaskInfo initialInfo = new SyncTaskInfo();
+    initialInfo.setTaskId(preTaskId);
+    initialInfo.setSourceRepository(request.getSourceRepository());
+    initialInfo.setTargetRepository(request.getSourceRepository()); // proxy syncs to itself
+    initialInfo.setPath(request.isAllImages() ? "v2/" :
+        (request.isPrefixMode() ? "v2/" + request.getImagePrefix() : "v2/" + request.getImage()));
+    initialInfo.setDirectory(request.isAllImages() || request.isPrefixMode());
+    initialInfo.setFormat(request.getFormat());
+    initialInfo.setUsername(username);
+    initialInfo.setStatus(TaskStatus.PENDING);
+    initialInfo.setStartTime(System.currentTimeMillis());
+    syncTaskInfos.put(preTaskId, initialInfo);
+
+    log.info("Docker sync task {} created for {} by {}", preTaskId, request.getSourceRepository(), username);
+
     return taskExecutor.submitSyncTask(() -> {
       if (threadState != null) { threadState.bind(); }
       try {
