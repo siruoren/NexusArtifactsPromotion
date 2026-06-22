@@ -583,7 +583,7 @@ public class PromotionService {
               log.info("Skipping promotion (MD5 match): {} -> {}/{}, MD5={}",
                   fullSourcePath, targetRepo, filePath, sourceMd5);
               PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(filePath, determineType(filePath));
-              skippedItem.setStatus("skipped");
+              skippedItem.setStatus("success");
               skippedItem.setSourceMd5(sourceMd5);
               skippedItem.setTargetMd5(targetMd5);
               return skippedItem;
@@ -1670,7 +1670,7 @@ public class PromotionService {
       if (initCode == 409 || initCode == 202) {
         log.info("Docker blob already exists in target, skipping: {}/{}", targetRepo, digest);
         PromotionTaskResult.FileItem item = new PromotionTaskResult.FileItem(filePath, "image");
-        item.setStatus("skipped");
+        item.setStatus("success");
         return item;
       }
       throw new IOException("Initiate blob upload to " + targetRepo + " failed: HTTP " + initCode + " - " + errorMsg);
