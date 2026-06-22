@@ -1587,7 +1587,7 @@ public class DockerService {
         return taskInfo;
       }
 
-      log.debug("Docker scheduled sync: syncing {} images in {} (path filter: {})",
+      log.info("Docker scheduled sync: syncing {} images in {} (path filter: {})",
           imageTagsMap.size(), repoName, isFullSync ? "none" : syncPath);
 
       boolean isReleaseProxy = isDockerReleaseProxyRepo(repoName);
@@ -1595,6 +1595,12 @@ public class DockerService {
 
       // Step 3: Sync each image:tag
       for (Map.Entry<String, List<String>> entry : imageTagsMap.entrySet()) {
+        // Check for task cancellation/interruption
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Docker scheduled sync task interrupted, stopping sync for {}", repoName);
+          throw new InterruptedException("Task cancelled during Docker sync");
+        }
+
         String imageName = entry.getKey();
         List<String> tags = entry.getValue();
 
@@ -1616,6 +1622,11 @@ public class DockerService {
         }
 
         for (String tag : tags) {
+          // Check for task cancellation/interruption before each tag
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Docker scheduled sync task interrupted, stopping sync for {}:{}", repoName, imageName);
+            throw new InterruptedException("Task cancelled during Docker sync");
+          }
           try {
             List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
             syncedFiles.addAll(tagFiles);
@@ -1642,14 +1653,17 @@ public class DockerService {
           (skippedCount > 0 ? ", skipped " + skippedCount : "") +
           (failedCount > 0 ? ", failed " + failedCount : ""));
 
-      log.debug("Docker scheduled sync completed: {} synced, {} skipped, {} failed for {}",
+      log.info("Docker scheduled sync completed: {} synced, {} skipped, {} failed for {}",
           syncedCount, skippedCount, failedCount, repoName);
     }
     catch (Exception e) {
-      log.error("Docker scheduled sync task failed: {}", e.getMessage(), e);
       boolean isCancelled = Thread.currentThread().isInterrupted()
           || (e instanceof InterruptedException)
           || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+      if (isCancelled) {
+        Thread.currentThread().interrupt();
+      }
+      log.error(isCancelled ? "Docker scheduled sync task cancelled: {}" : "Docker scheduled sync task failed: {}", e.getMessage(), isCancelled ? null : e);
       taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
       taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
@@ -1706,7 +1720,7 @@ public class DockerService {
             // Directory level: sync all images and all tags
             DockerImageListResponse imageList = listDockerImages(request.getSourceRepository());
             List<DockerImageInfo> images = imageList.getImages();
-            log.debug("Docker sync (all images): found {} images in {}", images.size(), request.getSourceRepository());
+            log.info("Docker sync (all images): found {} images in {}", images.size(), request.getSourceRepository());
 
             if (images.isEmpty()) {
               throw new IOException("No Docker images found in remote repository " + request.getSourceRepository());
@@ -1715,6 +1729,12 @@ public class DockerService {
             boolean isReleaseProxy = isDockerReleaseProxyRepo(request.getSourceRepository());
 
             for (DockerImageInfo img : images) {
+              // Check for task cancellation/interruption
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Docker sync task interrupted, stopping sync for {}", request.getSourceRepository());
+                throw new InterruptedException("Task cancelled during Docker sync");
+              }
+
               String imageName = img.getName();
               // Always list tags from remote first for sync operations
               List<String> tags = listDockerTagsRemote(repo, imageName);
@@ -1740,6 +1760,11 @@ public class DockerService {
               }
 
               for (String tag : tags) {
+                // Check for task cancellation/interruption
+                if (Thread.currentThread().isInterrupted()) {
+                  log.warn("Docker sync task interrupted, stopping sync for {}:{}", request.getSourceRepository(), imageName);
+                  throw new InterruptedException("Task cancelled during Docker sync");
+                }
                 try {
                   List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
                   syncedFiles.addAll(tagFiles);
@@ -1758,7 +1783,7 @@ public class DockerService {
             // Directory prefix mode: sync all images under the given prefix
             // Uses the same image discovery logic as promotion (listDockerImages + prefix filtering)
             Map<String, List<String>> prefixImages = listDockerImagesByPrefix(request.getSourceRepository(), request.getImagePrefix());
-            log.debug("Docker sync (prefix mode): found {} images under prefix '{}' in {}",
+            log.info("Docker sync (prefix mode): found {} images under prefix '{}' in {}",
                 prefixImages.size(), request.getImagePrefix(), request.getSourceRepository());
 
             if (prefixImages.isEmpty()) {
@@ -1769,6 +1794,12 @@ public class DockerService {
             boolean isReleaseProxy = isDockerReleaseProxyRepo(request.getSourceRepository());
 
             for (Map.Entry<String, List<String>> entry : prefixImages.entrySet()) {
+              // Check for task cancellation/interruption
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Docker sync task interrupted, stopping prefix sync for {}", request.getSourceRepository());
+                throw new InterruptedException("Task cancelled during Docker sync");
+              }
+
               String imageName = entry.getKey();
               List<String> tags = entry.getValue();
 
@@ -1795,6 +1826,11 @@ public class DockerService {
               }
 
               for (String tag : tags) {
+                // Check for task cancellation/interruption
+                if (Thread.currentThread().isInterrupted()) {
+                  log.warn("Docker sync task interrupted, stopping prefix sync for {}:{}", request.getSourceRepository(), imageName);
+                  throw new InterruptedException("Task cancelled during Docker sync");
+                }
                 try {
                   List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, request.isIncrementalSync());
                   syncedFiles.addAll(tagFiles);
@@ -1816,7 +1852,7 @@ public class DockerService {
             if (request.isAllTags()) {
               // List tags from remote first for sync operations - don't use local cache
               tags = listDockerTagsRemote(repo, request.getImage());
-              log.debug("Docker sync: found {} tags for image {} from remote {}", tags.size(), request.getImage(), request.getSourceRepository());
+              log.info("Docker sync: found {} tags for image {} from remote {}", tags.size(), request.getImage(), request.getSourceRepository());
             }
 
             // Filter tags for release proxy repository
@@ -1841,6 +1877,11 @@ public class DockerService {
             }
 
             for (String tag : tags) {
+              // Check for task cancellation/interruption
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Docker sync task interrupted, stopping sync for {}:{}", request.getSourceRepository(), request.getImage());
+                throw new InterruptedException("Task cancelled during Docker sync");
+              }
               try {
                 List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag, request.isIncrementalSync());
                 syncedFiles.addAll(tagFiles);
@@ -1865,14 +1906,17 @@ public class DockerService {
           taskInfo.setResult("Synced " + syncedCount + " items" +
               (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
 
-          log.debug("Docker sync task completed: {} items synced, {} skipped for {}",
+          log.info("Docker sync task completed: {} items synced, {} skipped for {}",
               syncedCount, skippedCount, request.getImage());
         }
         catch (Exception e) {
-          log.error("Docker sync task failed: {}", e.getMessage(), e);
           boolean isCancelled = Thread.currentThread().isInterrupted()
               || (e instanceof InterruptedException)
               || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          if (isCancelled) {
+            Thread.currentThread().interrupt();
+          }
+          log.error(isCancelled ? "Docker sync task cancelled: {}" : "Docker sync task failed: {}", e.getMessage(), isCancelled ? null : e);
           taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
           taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
@@ -1909,7 +1953,7 @@ public class DockerService {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
 
-    log.debug("[DOCKER-SYNC] Syncing {}:{} (manifest path: {}, incremental: {})", image, tag, manifestPath, incrementalSync);
+    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {}, incremental: {})", image, tag, manifestPath, incrementalSync);
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity
     writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
@@ -1977,6 +2021,11 @@ public class DockerService {
         Set<String> blobDigests = parseManifestBlobs(manifestContent);
         log.debug("[DOCKER-SYNC] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
         for (String digest : blobDigests) {
+          // Check for task cancellation/interruption
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("[DOCKER-SYNC] Task interrupted, stopping legacy blob sync for {}:{}", image, tag);
+            throw new RuntimeException(new InterruptedException("Task cancelled during Docker blob sync"));
+          }
           String blobPath = "v2/" + image + "/blobs/" + digest;
           try {
             SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
@@ -2005,10 +2054,16 @@ public class DockerService {
                                      final List<SyncTaskInfo.SyncFileDetail> details,
                                      final boolean incrementalSync) {
     Set<String> blobDigests = manifest.getAllBlobDigests();
-    log.debug("[DOCKER-SYNC] Syncing {} blobs for image {} (incremental: {})",
+    log.info("[DOCKER-SYNC] Syncing {} blobs for image {} (incremental: {})",
         blobDigests.size(), image, incrementalSync);
 
     for (String digest : blobDigests) {
+      // Check for task cancellation/interruption
+      if (Thread.currentThread().isInterrupted()) {
+        log.warn("[DOCKER-SYNC] Task interrupted, stopping blob sync for image {}", image);
+        throw new RuntimeException(new InterruptedException("Task cancelled during Docker blob sync"));
+      }
+
       String blobPath = "v2/" + image + "/blobs/" + digest;
 
       // Incremental sync: check if blob already exists locally
@@ -2054,7 +2109,7 @@ public class DockerService {
       Response response = viewFacet.dispatch(request);
 
       if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-        log.debug("Successfully synced Docker asset {} (HTTP {})", assetPath, response.getStatus().getCode());
+        log.info("Successfully synced Docker asset {} (HTTP {})", assetPath, response.getStatus().getCode());
         detail.setStatus("success");
       }
       else {
@@ -2456,7 +2511,7 @@ public class DockerService {
   public void cancelDockerSyncTask(final String taskId) {
     SyncTaskInfo info = syncTaskInfos.get(taskId);
     if (info != null && info.getStatus() != TaskStatus.CANCELLED) {
-      log.debug("Updating Docker sync task {} info status from {} to CANCELLED", taskId, info.getStatus());
+      log.info("Updating Docker sync task {} info status from {} to CANCELLED", taskId, info.getStatus());
       info.setStatus(TaskStatus.CANCELLED);
       info.setEndTime(System.currentTimeMillis());
       info.setResult("Task cancelled");
@@ -3089,10 +3144,6 @@ public class DockerService {
 
       // Check by asset name
       Asset asset = tx.findAssetWithProperty("name", manifestPath, bucket);
-      if (asset == null && !manifestPath.startsWith("/")) {
-        asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
-      }
-      // Also try with leading slash
       if (asset == null && !manifestPath.startsWith("/")) {
         asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
       }

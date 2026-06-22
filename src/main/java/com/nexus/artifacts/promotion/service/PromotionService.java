@@ -6,8 +6,10 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -1017,7 +1019,15 @@ public class PromotionService {
         if (code == 200) {
           String json = readStream(conn.getInputStream());
           List<String> pageResults = parseSearchItems(json, pathPrefix);
-          results.addAll(pageResults);
+          
+          // Deduplicate results to avoid duplicates across pages
+          Set<String> uniqueResults = new HashSet<>(results);
+          for (String item : pageResults) {
+            if (!uniqueResults.contains(item)) {
+              results.add(item);
+              uniqueResults.add(item);
+            }
+          }
 
           // Check for continuationToken in the response
           continuationToken = parseContinuationToken(json);
@@ -1070,7 +1080,15 @@ public class PromotionService {
         if (code == 200) {
           String json = readStream(conn.getInputStream());
           List<String> pageResults = parseComponentAssets(json, pathPrefix);
-          results.addAll(pageResults);
+          
+          // Deduplicate results to avoid duplicates across pages
+          Set<String> uniqueResults = new HashSet<>(results);
+          for (String item : pageResults) {
+            if (!uniqueResults.contains(item)) {
+              results.add(item);
+              uniqueResults.add(item);
+            }
+          }
 
           continuationToken = parseContinuationToken(json);
           if (continuationToken == null || continuationToken.isEmpty()) {

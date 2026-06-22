@@ -81,12 +81,27 @@ public class ProxySyncTask
     // Execute sync (synchronous, no permission check for scheduled tasks)
     SyncTaskInfo result = syncService.syncScheduled(request);
 
-    // Check result and throw if failed
-    if (result.getStatus() != null && result.getStatus().name().equals("FAILED")) {
-      throw new RuntimeException("Scheduled sync failed: " + result.getErrorMessage());
+    // Build result message based on task status
+    String message;
+    if (result.getStatus() != null && result.getStatus().name().equals("CANCELLED")) {
+      message = String.format("Scheduled sync cancelled for %s%s",
+          repositoryName, isFullSync ? " (full repository)" : ":" + syncPath);
+      log.warn(message);
+      return message;
     }
 
-    String message = String.format("Scheduled sync completed for %s%s - %s",
+    if (result.getStatus() != null && result.getStatus().name().equals("FAILED")) {
+      message = String.format("Scheduled sync failed for %s%s - %s",
+          repositoryName,
+          isFullSync ? " (full repository)" : ":" + syncPath,
+          result.getErrorMessage());
+      log.error(message);
+      // Return the message instead of throwing, so Nexus task shows warning instead of ERROR
+      // and the task properly transitions to a terminal state
+      return message;
+    }
+
+    message = String.format("Scheduled sync completed for %s%s - %s",
         repositoryName,
         isFullSync ? " (full repository)" : ":" + syncPath,
         result.getResult());

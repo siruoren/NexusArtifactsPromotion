@@ -321,11 +321,14 @@ public class SyncService {
 
         }
         catch (Exception e) {
-          log.error("Sync task failed: {}", e.getMessage(), e);
           // If the thread was interrupted (manual cancellation), use CANCELLED status
           boolean isCancelled = Thread.currentThread().isInterrupted()
               || (e instanceof InterruptedException)
               || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          if (isCancelled) {
+            Thread.currentThread().interrupt();
+          }
+          log.error(isCancelled ? "Sync task cancelled: {}" : "Sync task failed: {}", e.getMessage(), isCancelled ? null : e);
           taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
           taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
@@ -449,18 +452,22 @@ public class SyncService {
           isFullSync ? "/" : request.getPath());
     }
     catch (Exception e) {
-      log.error("Scheduled sync task failed: {}", e.getMessage(), e);
       boolean isCancelled = Thread.currentThread().isInterrupted()
           || (e instanceof InterruptedException)
           || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+      if (isCancelled) {
+        Thread.currentThread().interrupt();
+      }
+      log.error(isCancelled ? "Scheduled sync task cancelled: {}" : "Scheduled sync task failed: {}", e.getMessage(), isCancelled ? null : e);
       taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
       taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
       taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
     }
-
-    // Update stored info with final state
-    taskInfos.put(taskId, taskInfo);
+    finally {
+      // Update stored info with final state (ensure this happens even if exception occurs)
+      taskInfos.put(taskId, taskInfo);
+    }
 
     return taskInfo;
   }
@@ -626,13 +633,13 @@ public class SyncService {
         // For incremental sync, get assets with MD5 in one pass to avoid per-asset API calls
         remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
         remoteAssets = new ArrayList<>(remoteMd5Map.keySet());
-        log.debug("Found {} remote assets with MD5 for {}:{} (incremental: {})",
+        log.info("Found {} remote assets with MD5 for {}:{} (incremental: {})",
             remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
       }
       else {
         // For full sync, just get the file list (no need for MD5 comparison)
         remoteAssets = listRemoteAssets(repo, directoryPath);
-        log.debug("Found {} remote assets to sync in {}:{} (incremental: {})",
+        log.info("Found {} remote assets to sync in {}:{} (incremental: {})",
             remoteAssets.size(), repo.getName(), directoryPath, incrementalSync);
       }
 
@@ -640,12 +647,18 @@ public class SyncService {
       Map<String, String> localMd5Map = Collections.emptyMap();
       if (incrementalSync) {
         localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
-      log.debug("Incremental sync: found {} locally cached assets with MD5 in {}:{}",
+        log.info("Incremental sync: found {} locally cached assets with MD5 in {}:{}",
             localMd5Map.size(), repo.getName(), directoryPath);
       }
 
       // Step 3: Sync each asset using ContentFacet.get()
       for (String rawAssetPath : remoteAssets) {
+        // Check for task cancellation/interruption
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Sync task interrupted, stopping directory sync for {}:{}", repo.getName(), directoryPath);
+          throw new InterruptedException("Task cancelled during directory sync");
+        }
+
         // Normalize: strip leading slash for consistent path matching
         String assetPath = rawAssetPath.startsWith("/") ? rawAssetPath.substring(1) : rawAssetPath;
 
@@ -695,7 +708,7 @@ public class SyncService {
           }
 
           // Sync the asset (full sync or incremental with changes)
-          log.debug("Syncing asset: {}/{}", repo.getName(), assetPath);
+          log.info("Syncing asset: {}/{}", repo.getName(), assetPath);
           RetryableOperation.executeRun("sync asset " + assetPath,
               () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
               SYNC_RETRY_ATTEMPTS);
@@ -762,7 +775,7 @@ public class SyncService {
         }
 
         // Sync the file (full sync or incremental with changes)
-        log.debug("Syncing file: {}/{}", repo.getName(), filePath);
+        log.info("Syncing file: {}/{}", repo.getName(), filePath);
         syncAssetViaContentFacet(repo, filePath, repoAuth);
         detail.setStatus("success");
       }
@@ -865,7 +878,7 @@ public class SyncService {
           Response response = viewFacet.dispatch(request);
 
           if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-            log.debug("Successfully synced asset {} from remote (HTTP {})",
+            log.info("Successfully synced asset {} from remote (HTTP {})",
                 assetPath, response.getStatus().getCode());
           }
           else {
@@ -876,7 +889,7 @@ public class SyncService {
               log.warn("ViewFacet.dispatch() returned HTTP {} for {}, attempting direct HTTP download fallback", httpCode, assetPath);
               boolean fallbackResult = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
               if (fallbackResult) {
-                log.debug("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
+                log.info("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
                 return;
               }
               log.warn("Direct HTTP fallback also failed for {}", assetPath);
@@ -944,7 +957,7 @@ public class SyncService {
 
     // Download the file from remote via HTTP
     String fileUrl = remoteUrl + assetPath;
-    log.debug("Direct HTTP download: {}", fileUrl);
+    log.info("Direct HTTP download: {}", fileUrl);
 
     HttpURLConnection conn = null;
     java.nio.file.Path tempFile = null;
@@ -962,7 +975,7 @@ public class SyncService {
       }
 
       int responseCode = conn.getResponseCode();
-      log.debug("Direct HTTP download: {} returned HTTP {}", fileUrl, responseCode);
+      log.info("Direct HTTP download: {} returned HTTP {}", fileUrl, responseCode);
       if (responseCode != 200) {
         log.warn("Direct HTTP download returned HTTP {} for {}", responseCode, fileUrl);
         return false;
@@ -1009,7 +1022,7 @@ public class SyncService {
         }
       }
       long fileSize = java.nio.file.Files.size(tempFile);
-      log.debug("Direct HTTP download: saved {} bytes to temp file for {}", fileSize, assetPath);
+      log.info("Direct HTTP download: saved {} bytes to temp file for {}", fileSize, assetPath);
 
       if (fileSize == 0) {
         log.warn("Direct HTTP download: empty file for {}", assetPath);
@@ -1122,7 +1135,7 @@ public class SyncService {
         tx.setBlob(asset, assetName, streamSupplier, hashAlgos, headers, effectiveContentType, true);
         tx.saveAsset(asset);
         tx.commit();
-        log.debug("Direct HTTP sync: stored asset {} with content type {} ({} bytes)", assetPath, effectiveContentType, fileSize);
+        log.info("Direct HTTP sync: stored asset {} with content type {} ({} bytes)", assetPath, effectiveContentType, fileSize);
         return true;
       }
       catch (Exception e) {
@@ -1896,7 +1909,7 @@ public class SyncService {
     if (isFullSync) {
       String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
       List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
-      log.debug("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
+      log.info("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
       return allAssets;
     }
 
