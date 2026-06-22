@@ -201,7 +201,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.success": "\u6210\u529f",
     "promotion.progress.failed": "\u5931\u8d25",
     "promotion.progress.cancelled": "\u7ec8\u6b62",
-    "promotion.progress.skipped": "\u672a\u66f4\u65b0",
+    "promotion.progress.skipped": "\u6210\u529f",
     "promotion.result.title.success": "\u664b\u7ea7\u6210\u529f",
     "promotion.result.title.failed": "\u664b\u7ea7\u5931\u8d25",
     "promotion.result.title.cancelled": "\u664b\u7ea7\u7ec8\u6b62",
@@ -1792,7 +1792,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         case 'cancelled':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
-          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
+          // Display skipped files (MD5 match) as success in UI, but keep backend status unchanged
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         default:
           return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
       }
@@ -2360,7 +2361,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         case 'cancelled':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
-          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
+          // Display skipped files (MD5 match) as success in UI, but keep backend status unchanged
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         default:
           return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
       }
