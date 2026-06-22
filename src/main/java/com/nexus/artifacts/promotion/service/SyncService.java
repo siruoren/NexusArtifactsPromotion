@@ -1025,7 +1025,16 @@ public class SyncService {
           }
           
           if (forceDelete) {
-            tx.deleteAsset(existingAsset);
+            // When force deleting due to content type mismatch, also delete the component
+            // to avoid ORecordDuplicatedException when recreating the asset
+            // Find the component by group and name, then delete it
+            Component existingComponent = tx.findComponentWithProperty("name", componentName, bucket);
+            if (existingComponent != null && group.equals(existingComponent.group())) {
+              log.debug("Direct HTTP sync: deleting component {} along with asset {}", existingComponent.name(), assetPath);
+              tx.deleteComponent(existingComponent);
+            } else {
+              tx.deleteAsset(existingAsset);
+            }
             // Commit delete to ensure index is updated before creating new asset
             tx.commit();
             tx.begin();
