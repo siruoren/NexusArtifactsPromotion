@@ -1475,6 +1475,7 @@ public class DockerService {
     taskInfo.setUsername("system");
     taskInfo.setStartTime(System.currentTimeMillis());
     taskInfo.setStatus(TaskStatus.RUNNING);
+    taskInfo.setTaskType("sync");
 
     syncTaskInfos.put(taskId, taskInfo);
 
@@ -1701,6 +1702,7 @@ public class DockerService {
     initialInfo.setUsername(username);
     initialInfo.setStatus(TaskStatus.PENDING);
     initialInfo.setStartTime(System.currentTimeMillis());
+    initialInfo.setTaskType("sync");
     syncTaskInfos.put(preTaskId, initialInfo);
 
     log.info("Docker sync task {} created for {} by {}", preTaskId, request.getSourceRepository(), username);
@@ -1719,6 +1721,7 @@ public class DockerService {
         taskInfo.setUsername(username);
         taskInfo.setStartTime(System.currentTimeMillis());
         taskInfo.setStatus(TaskStatus.RUNNING);
+        taskInfo.setTaskType("sync");
 
         try {
           Repository repo = repositoryManager.get(request.getSourceRepository());
@@ -2558,6 +2561,9 @@ public class DockerService {
     List<SyncTaskInfo> tasks = new ArrayList<>();
     for (Map.Entry<String, SyncTaskInfo> entry : syncTaskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
+      if (info.getTaskType() == null) {
+        info.setTaskType("sync");
+      }
       TaskStatus status = taskExecutor.getSyncTaskStatus(entry.getKey());
       if (status != null) {
         info.setStatus(status);
