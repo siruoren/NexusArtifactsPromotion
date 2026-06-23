@@ -1022,8 +1022,8 @@ public class SyncService {
         }
         if (existingAsset != null) {
           // For zip-based extensions, check if the existing asset has mismatched content type
-          // If so, force delete it to fix the content type
-          boolean forceDelete = false;
+          // If so, force delete the component (which cascades to asset) to fix the content type
+          boolean forceDeleteComponent = false;
           if (isZipBasedExtension(assetPath)) {
             String existingContentType = existingAsset.contentType();
             if (existingContentType != null && !existingContentType.isEmpty()) {
@@ -1032,27 +1032,23 @@ public class SyncService {
               if (!isZipType) {
                 log.info("Direct HTTP sync: force deleting asset {} with mismatched content type {} (should be zip-based)", 
                     assetPath, existingContentType);
-                forceDelete = true;
+                forceDeleteComponent = true;
               }
             }
           }
           
-          if (forceDelete) {
-            // When force deleting due to content type mismatch, also delete the component
-            // to avoid ORecordDuplicatedException when recreating the asset
-            // Find the component by group and name, then delete it
+          if (forceDeleteComponent) {
+            // Delete the entire component (which cascades to assets) in the same transaction
+            // to ensure atomicity: either both delete and create succeed, or both roll back
             Component existingComponent = tx.findComponentWithProperty("name", componentName, bucket);
             if (existingComponent != null && group.equals(existingComponent.group())) {
-              log.debug("Direct HTTP sync: deleting component {} along with asset {}", existingComponent.name(), assetPath);
+              log.debug("Direct HTTP sync: deleting component {} along with asset {} in same transaction", existingComponent.name(), assetPath);
               tx.deleteComponent(existingComponent);
             } else {
               tx.deleteAsset(existingAsset);
             }
-            // Commit delete to ensure index is updated before creating new asset
-            tx.commit();
-            tx.begin();
-            // Re-find bucket after re-opening transaction
-            bucket = tx.findBucket(repo);
+            // Do NOT commit here - keep everything in the same transaction
+            // so that if asset creation fails, the delete is also rolled back
           } else {
             log.debug("Direct HTTP sync: deleting existing asset {} before re-sync", assetPath);
             tx.deleteAsset(existingAsset);
