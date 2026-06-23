@@ -72,6 +72,7 @@ public class SyncService {
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
   private final DockerService dockerService;
+  private final IncrementalSyncService incrementalSyncService;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -85,7 +86,8 @@ public class SyncService {
                       final PermissionChecker permissionChecker,
                       final SecurityHelper securityHelper,
                       final FileWriteLockManager writeLockManager,
-                      final DockerService dockerService)
+                      final DockerService dockerService,
+                      final IncrementalSyncService incrementalSyncService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -94,6 +96,7 @@ public class SyncService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.dockerService = dockerService;
+    this.incrementalSyncService = incrementalSyncService;
   }
 
   /**
@@ -713,112 +716,8 @@ public class SyncService {
       final String directoryPath,
       final com.nexus.artifacts.promotion.task.ProxySyncTask task)
   {
-    List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
-
-    try {
-      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
-      log.info("Starting incremental {} for {}:{}",
-          isFullSync ? "full repository sync" : "directory sync",
-          repo.getName(), isFullSync ? "/" : directoryPath);
-
-      // Step 1: Get remote assets with MD5 checksums
-      Map<String, String> remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
-      log.info("Incremental sync: found {} remote assets for {}:{}",
-          remoteMd5Map.size(), repo.getName(), isFullSync ? "/" : directoryPath);
-
-      if (remoteMd5Map.isEmpty()) {
-        log.warn("Incremental sync: no remote assets found for {}:{}", repo.getName(), directoryPath);
-        return details;
-      }
-
-      // Step 2: Build local MD5 map for comparison
-      Map<String, String> localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
-      log.info("Incremental sync: found {} local cached assets for {}:{}",
-          localMd5Map.size(), repo.getName(), isFullSync ? "/" : directoryPath);
-
-      // Step 3: Compare and sync only changed/missing assets
-      String[] repoAuth = extractAuthFromRepo(repo);
-      int syncedCount = 0;
-      int skippedCount = 0;
-
-      for (Map.Entry<String, String> entry : remoteMd5Map.entrySet()) {
-        // Check for task cancellation before each file
-        if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
-          log.warn("Incremental sync cancelled for {}:{}, {} files processed before cancellation",
-              repo.getName(), directoryPath, details.size());
-          return details;
-        }
-
-        String assetPath = entry.getKey();
-        String remoteMd5 = entry.getValue();
-
-        // Skip directory entries
-        if (assetPath.endsWith("/")) {
-          continue;
-        }
-
-        SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, determineType(assetPath));
-        detail.setRemoteMd5(remoteMd5);
-
-        try {
-          // Compare MD5: skip if local MD5 matches remote MD5
-          String localMd5 = localMd5Map.get(assetPath);
-          detail.setLocalMd5(localMd5);
-
-          log.debug("Incremental sync comparing {}: remoteMD5={}, localMD5={}", assetPath, 
-              remoteMd5 != null ? remoteMd5.substring(0, 8) + "..." : "null", 
-              localMd5 != null ? localMd5.substring(0, 8) + "..." : "null");
-
-          if (localMd5 != null && remoteMd5 != null && localMd5.equalsIgnoreCase(remoteMd5)) {
-            // MD5 matches - skip this asset
-            detail.setStatus("skipped");
-            skippedCount++;
-            log.debug("Incremental sync: skipping {} (MD5 match: {})", assetPath, localMd5);
-          }
-          else {
-            // MD5 mismatch or local asset missing - sync this asset
-            if (localMd5 == null) {
-              log.info("Incremental sync: syncing {} (not in local cache, remoteMD5={})", assetPath, 
-                  remoteMd5 != null ? remoteMd5.substring(0, 8) + "..." : "null");
-            }
-            else if (remoteMd5 == null) {
-              log.info("Incremental sync: syncing {} (remote MD5 not available, cannot compare)", assetPath);
-            }
-            else {
-              log.info("Incremental sync: syncing {} (MD5 mismatch: local={}, remote={})",
-                  assetPath, localMd5.substring(0, 8) + "...", remoteMd5.substring(0, 8) + "...");
-            }
-
-            RetryableOperation.executeRun("incremental sync asset " + assetPath,
-                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
-                SYNC_RETRY_ATTEMPTS);
-            detail.setStatus("success");
-            syncedCount++;
-          }
-        }
-        catch (Exception e) {
-          if (Thread.currentThread().isInterrupted()) {
-            log.warn("Incremental sync cancelled while syncing asset {}, stopping", assetPath);
-            return details;
-          }
-          log.error("Incremental sync: failed to sync asset {}: {}", assetPath, e.getMessage());
-          detail.setStatus("failed");
-          detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
-        }
-
-        details.add(detail);
-      }
-
-      log.info("Incremental sync completed for {}:{} - {} synced, {} skipped, {} failed",
-          repo.getName(), isFullSync ? "/" : directoryPath, syncedCount, skippedCount,
-          details.stream().filter(d -> "failed".equals(d.getStatus())).count());
-    }
-    catch (Exception e) {
-      log.error("Failed incremental sync for {}:{}: {}", repo.getName(), directoryPath, e.getMessage(), e);
-      throw new RuntimeException("Incremental sync failed", e);
-    }
-
-    return details;
+    // Delegate to IncrementalSyncService which handles all MD5 comparison logic
+    return incrementalSyncService.incrementalSyncDirectory(repo, directoryPath, task);
   }
 
   /**
@@ -1279,37 +1178,67 @@ public class SyncService {
 
         // Find or create Component (avoid ORecordDuplicatedException by reusing existing)
         Component component;
-        if (tx.componentExists(group, componentName, null, repo)) {
-          // Component already exists - find and reuse it
-          Component existingComp = tx.findComponentWithProperty("name", componentName, bucket);
-          if (existingComp != null && group.equals(existingComp.group())) {
-            component = existingComp;
-            log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
+        try {
+          if (tx.componentExists(group, componentName, null, repo)) {
+            // Component already exists - find and reuse it
+            Component existingComp = tx.findComponentWithProperty("name", componentName, bucket);
+            if (existingComp != null && group.equals(existingComp.group())) {
+              component = existingComp;
+              log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
+            } else {
+              // Fallback: browse and match
+              component = null;
+              for (Component c : tx.browseComponents(bucket)) {
+                if (group.equals(c.group()) && componentName.equals(c.name())) {
+                  component = c;
+                  break;
+                }
+              }
+              if (component == null) {
+                component = tx.createComponent(bucket, repo.getFormat())
+                    .group(group)
+                    .name(componentName);
+                tx.saveComponent(component);
+                log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
+              } else {
+                log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
+              }
+            }
           } else {
-            // Fallback: browse and match
+            component = tx.createComponent(bucket, repo.getFormat())
+                .group(group)
+                .name(componentName);
+            tx.saveComponent(component);
+            log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
+          }
+        }
+        catch (Exception e) {
+          // Handle ORecordDuplicatedException or similar "node already has a component" errors
+          // This can happen due to race conditions or stale componentExists check
+          if (e.getMessage() != null && e.getMessage().contains("already has a component")) {
+            log.warn("Direct HTTP sync: component already exists for group='{}' name='{}', attempting to reuse existing", group, componentName);
+            // Try to find and reuse the existing component
             component = null;
             for (Component c : tx.browseComponents(bucket)) {
               if (group.equals(c.group()) && componentName.equals(c.name())) {
                 component = c;
+                log.debug("Direct HTTP sync: found and reusing existing component after duplicate error");
                 break;
               }
             }
             if (component == null) {
-              component = tx.createComponent(bucket, repo.getFormat())
-                  .group(group)
-                  .name(componentName);
-              tx.saveComponent(component);
-              log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
-            } else {
-              log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
+              // If still not found, try with name only (group might differ)
+              Component existingComp = tx.findComponentWithProperty("name", componentName, bucket);
+              if (existingComp != null) {
+                component = existingComp;
+                log.debug("Direct HTTP sync: reusing existing component by name only after duplicate error");
+              } else {
+                throw new RuntimeException("Failed to find existing component after duplicate error for " + assetPath, e);
+              }
             }
+          } else {
+            throw e;
           }
-        } else {
-          component = tx.createComponent(bucket, repo.getFormat())
-              .group(group)
-              .name(componentName);
-          tx.saveComponent(component);
-          log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
         }
 
         // Create Asset under the Component
@@ -1642,6 +1571,21 @@ public class SyncService {
         catch (Exception e) {
           log.warn("listRemoteAssetsWithMd5: Strategy 2 failed: {}", e.getMessage());
         }
+
+        // Strategy 2b: Remote Nexus Components API with MD5 extraction
+        try {
+          log.debug("listRemoteAssetsWithMd5: Strategy 2b - remote Nexus Components API with MD5");
+          Map<String, String> componentsMd5Map = listAssetsWithMd5ViaComponentsApi(remoteBaseUrl, remoteRepoName,
+              isFullSync ? "" : directoryPath, effectiveAuth);
+          log.debug("listRemoteAssetsWithMd5: Strategy 2b returned {} assets", componentsMd5Map.size());
+          if (!componentsMd5Map.isEmpty()) {
+            assetMd5Map.putAll(componentsMd5Map);
+            return assetMd5Map;
+          }
+        }
+        catch (Exception e) {
+          log.warn("listRemoteAssetsWithMd5: Strategy 2b failed: {}", e.getMessage());
+        }
       }
 
       // Strategy 3: If Search API didn't return MD5s, fall back to getRemoteAssetMd5 per asset
@@ -1897,6 +1841,116 @@ public class SyncService {
       log.debug("Remote Nexus Components API failed: {}", e.getMessage());
     }
     return results;
+  }
+
+  /**
+   * List assets with MD5 from a remote Nexus instance via Components API.
+   * This is a fallback when Search API doesn't return checksums.
+   * Components API returns assets with checksum information in the asset object.
+   */
+  private Map<String, String> listAssetsWithMd5ViaComponentsApi(final String remoteBaseUrl, final String remoteRepoName,
+      final String directoryPath, final String effectiveAuth) {
+    Map<String, String> assetMap = new java.util.LinkedHashMap<>();
+    try {
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      String compUrlBase = remoteBaseUrl + "/service/rest/v1/components?repository=" + remoteRepoName;
+      String continuationToken = null;
+      int md5Found = 0;
+      int md5Missing = 0;
+
+      do {
+        String compUrl = compUrlBase;
+        if (continuationToken != null) {
+          compUrl += "&continuationToken=" + continuationToken;
+        }
+
+        log.debug("Calling remote Nexus Components API for MD5: {}", compUrl);
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(60_000);
+        conn.setRequestProperty("Accept", "application/json");
+
+        if (effectiveAuth != null) {
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
+        }
+
+        int code = conn.getResponseCode();
+        if (code != 200) {
+          log.warn("Components API returned HTTP {} for MD5 query: {}", code, compUrl);
+          conn.disconnect();
+          return assetMap;
+        }
+
+        String json = readResponse(conn);
+        conn.disconnect();
+
+        // Parse components and extract asset paths with MD5
+        String itemsSection = ServiceUtils.extractJsonArray(json, "items");
+        if (itemsSection != null) {
+          int pos = 0;
+          while (pos < itemsSection.length()) {
+            int objStart = itemsSection.indexOf('{', pos);
+            if (objStart < 0) break;
+            int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
+            if (objEnd < 0) break;
+
+            String component = itemsSection.substring(objStart, objEnd + 1);
+
+            // Extract assets array from component
+            String assetsSection = ServiceUtils.extractJsonArray(component, "assets");
+            if (assetsSection != null) {
+              int aPos = 0;
+              while (aPos < assetsSection.length()) {
+                int aObjStart = assetsSection.indexOf('{', aPos);
+                if (aObjStart < 0) break;
+                int aObjEnd = ServiceUtils.findMatchingBrace(assetsSection, aObjStart);
+                if (aObjEnd < 0) break;
+
+                String asset = assetsSection.substring(aObjStart, aObjEnd + 1);
+                String path = ServiceUtils.extractJsonValue(asset, "path");
+                if (path != null && !path.isEmpty()) {
+                  if (path.startsWith("/")) path = path.substring(1);
+                  
+                  // Filter by directory path if not full sync
+                  if (!isFullSync && directoryPath != null && !directoryPath.isEmpty()) {
+                    String normalizedDir = directoryPath.startsWith("/") ? directoryPath.substring(1) : directoryPath;
+                    if (normalizedDir.endsWith("/")) normalizedDir = normalizedDir.substring(0, normalizedDir.length() - 1);
+                    if (!path.equals(normalizedDir) && !path.startsWith(normalizedDir + "/")) {
+                      aPos = aObjEnd + 1;
+                      continue;
+                    }
+                  }
+
+                  // Extract MD5 from checksums in the asset object
+                  String md5 = extractChecksumValue(asset, "md5");
+                  assetMap.put(path, md5);
+                  if (md5 != null) {
+                    md5Found++;
+                  } else {
+                    md5Missing++;
+                  }
+                }
+                aPos = aObjEnd + 1;
+              }
+            }
+            pos = objEnd + 1;
+          }
+        }
+
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
+      }
+      while (continuationToken != null && !continuationToken.isEmpty());
+
+      log.debug("Components API MD5 extraction result: {} assets with MD5, {} assets without MD5 (total: {})",
+          md5Found, md5Missing, assetMap.size());
+    }
+    catch (Exception e) {
+      log.warn("Components API MD5 retrieval failed: {}", e.getMessage());
+    }
+    return assetMap;
   }
 
   /**

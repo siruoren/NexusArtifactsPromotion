@@ -376,6 +376,15 @@ public class SyncQueueResource implements Resource {
       log.warn("Failed to retrieve promotion tasks: {}", e.getMessage());
     }
 
+    // Get Docker promotion tasks
+    try {
+      List<SyncTaskInfo> dockerPromoTasks = dockerService.getAllPromotionTasksAsSyncTaskInfo();
+      tasks.addAll(dockerPromoTasks);
+    }
+    catch (Exception e) {
+      log.warn("Failed to retrieve Docker promotion tasks: {}", e.getMessage());
+    }
+
     // Sort by start time descending
     tasks.sort((a, b) -> Long.compare(b.getStartTime(), a.getStartTime()));
 

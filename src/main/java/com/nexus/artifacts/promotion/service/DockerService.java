@@ -873,6 +873,10 @@ public class DockerService {
         result.setStartTime(System.currentTimeMillis());
         result.setTaskId(taskId);
         result.setStatus(TaskStatus.RUNNING.getValue());
+        // Store the original requested path for queue display
+        String requestedPath = request.isAllImages() ? "v2/" :
+            (request.isPrefixMode() ? "v2/" + request.getImagePrefix() : "v2/" + request.getImage());
+        result.setRequestedPath(requestedPath);
         promotionTaskResults.put(taskId, copyPromotionResult(result));
 
         List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
@@ -2547,6 +2551,90 @@ public class DockerService {
   }
 
   /**
+   * Get all Docker promotion task infos (for queue display).
+   * Called by SyncQueueResource to merge Docker promotion tasks into the unified queue view.
+   */
+  public List<SyncTaskInfo> getAllPromotionTasksAsSyncTaskInfo() {
+    cleanupExpiredPromotionTaskResults();
+    List<SyncTaskInfo> tasks = new ArrayList<>();
+
+    // Get tasks from promotionTaskResults map (completed/failed)
+    for (Map.Entry<String, PromotionTaskResult> entry : promotionTaskResults.entrySet()) {
+      PromotionTaskResult result = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(result.getTaskId());
+      info.setTaskType("promotion");
+      info.setSourceRepository(result.getSourceRepository());
+      info.setTargetRepository(result.getTargetRepository());
+      // Display promotion path as "targetRepo: promoted path"
+      if (result.getTargetRepository() != null) {
+        String promotedPath = extractPromotedPath(result);
+        info.setPath(result.getTargetRepository() + ":" + promotedPath);
+      }
+      info.setStatus(TaskStatus.fromValue(result.getStatus()));
+      info.setStartTime(result.getStartTime());
+      info.setEndTime(result.getEndTime());
+      info.setUsername(result.getUsername());
+      info.setErrorMessage(result.getErrorMessage());
+      if (result.getItems() != null) {
+        info.setResult(result.getItems().size() + " items");
+      }
+      tasks.add(info);
+    }
+
+    // Get running tasks from TaskExecutorService
+    Map<String, TaskExecutorService.TaskHandle> promoTasks = taskExecutor.getPromotionTasks();
+    for (Map.Entry<String, TaskExecutorService.TaskHandle> entry : promoTasks.entrySet()) {
+      String taskId = entry.getKey();
+      // Skip if already in promotionTaskResults
+      if (promotionTaskResults.containsKey(taskId)) continue;
+
+      TaskExecutorService.TaskHandle handle = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(handle.taskId);
+      info.setTaskType("promotion");
+      info.setSourceRepository(handle.sourceRepository);
+      info.setTargetRepository(handle.targetRepository);
+      // Display promotion path as "targetRepo: filePath"
+      if (handle.targetRepository != null) {
+        String promotedPath = (handle.sourcePath != null && !handle.sourcePath.isEmpty())
+            ? handle.sourcePath : "";
+        info.setPath(handle.targetRepository + ":" + promotedPath);
+      }
+      info.setStatus(handle.status);
+      info.setStartTime(handle.startTime);
+      info.setEndTime(handle.endTime);
+      info.setUsername(handle.username);
+      tasks.add(info);
+    }
+
+    return tasks;
+  }
+
+  /**
+   * Extract the promoted path from a Docker PromotionTaskResult.
+   * Priority:
+   * 1. Use requestedPath if available (original path clicked by user)
+   * 2. Fallback to first item's path
+   * Returns empty string if no path is available.
+   */
+  private String extractPromotedPath(final PromotionTaskResult result) {
+    // First priority: use the original requested path
+    if (result.getRequestedPath() != null && !result.getRequestedPath().isEmpty()) {
+      return result.getRequestedPath();
+    }
+    
+    // Fallback: use the first item's path
+    if (result.getItems() != null && !result.getItems().isEmpty()) {
+      String firstPath = result.getItems().get(0).getPath();
+      if (firstPath != null && !firstPath.isEmpty()) {
+        return firstPath;
+      }
+    }
+    return "";
+  }
+
+  /**
    * List Docker tags for a specific image using Nexus internal StorageTx API.
    * This is the most reliable approach as it bypasses HTTP authentication issues.
    */
@@ -2927,6 +3015,7 @@ public class DockerService {
     copy.setStartTime(src.getStartTime());
     copy.setEndTime(src.getEndTime());
     copy.setErrorMessage(src.getErrorMessage());
+    copy.setRequestedPath(src.getRequestedPath());
     if (src.getItems() != null) {
       List<PromotionTaskResult.FileItem> itemsCopy = new ArrayList<>();
       for (PromotionTaskResult.FileItem item : src.getItems()) {
