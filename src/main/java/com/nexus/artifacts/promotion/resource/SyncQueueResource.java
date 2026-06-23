@@ -27,6 +27,7 @@ import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
 import com.nexus.artifacts.promotion.service.DockerService;
 import com.nexus.artifacts.promotion.service.PromotionService;
+import com.nexus.artifacts.promotion.service.ServiceUtils;
 import com.nexus.artifacts.promotion.service.SyncService;
 import com.nexus.artifacts.promotion.service.TaskExecutorService;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
@@ -207,7 +208,7 @@ public class SyncQueueResource implements Resource {
       return authError;
     }
     try {
-      SyncTaskInfo info = syncService.getTaskInfo(sanitize(taskId));
+      SyncTaskInfo info = syncService.getTaskInfo(ServiceUtils.sanitize(taskId));
       if (info == null) {
         return Response.status(Response.Status.NOT_FOUND)
             .entity("{\"error\":\"Task not found\"}")
@@ -237,7 +238,7 @@ public class SyncQueueResource implements Resource {
       return authError;
     }
     try {
-      String safeTaskId = sanitize(taskId);
+      String safeTaskId = ServiceUtils.sanitize(taskId);
 
       // Check if task exists and is cancellable
       if (!taskExecutor.isTaskCancellable(safeTaskId)) {
@@ -305,7 +306,7 @@ public class SyncQueueResource implements Resource {
         dockerService.cancelDockerSyncTask(safeTaskId);
 
         return Response.ok()
-            .entity("{\"taskId\":\"" + jsonEscape(safeTaskId) + "\",\"status\":\"cancelled\",\"message\":\"Task terminated successfully\"}")
+            .entity("{\"taskId\":\"" + ServiceUtils.jsonEscape(safeTaskId) + "\",\"status\":\"cancelled\",\"message\":\"Task terminated successfully\"}")
             .build();
       }
       else {
@@ -338,7 +339,7 @@ public class SyncQueueResource implements Resource {
       String username = permissionChecker.getCurrentUsername();
       boolean admin = isAdmin();
       return Response.ok()
-          .entity("{\"username\":\"" + jsonEscape(username) + "\",\"isAdmin\":" + admin + "}")
+          .entity("{\"username\":\"" + ServiceUtils.jsonEscape(username) + "\",\"isAdmin\":" + admin + "}")
           .build();
     }
     catch (Exception e) {
@@ -378,29 +379,4 @@ public class SyncQueueResource implements Resource {
     return tasks;
   }
 
-  private String sanitize(final String input) {
-    if (input == null) return "";
-    return input.replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&#x27;")
-        .replace("&", "&amp;");
-  }
-
-  private String jsonEscape(final String input) {
-    if (input == null) return "";
-    StringBuilder sb = new StringBuilder(input.length() + 16);
-    for (int i = 0; i < input.length(); i++) {
-      char c = input.charAt(i);
-      switch (c) {
-        case '"':  sb.append("\\\""); break;
-        case '\\': sb.append("\\\\"); break;
-        case '\n': sb.append("\\n"); break;
-        case '\r': sb.append("\\r"); break;
-        case '\t': sb.append("\\t"); break;
-        default:   sb.append(c); break;
-      }
-    }
-    return sb.toString();
-  }
 }

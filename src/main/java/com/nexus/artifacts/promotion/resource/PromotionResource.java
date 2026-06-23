@@ -28,6 +28,7 @@ import com.nexus.artifacts.promotion.model.TargetRepositoryList;
 import com.nexus.artifacts.promotion.model.TaskStatus;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
 import com.nexus.artifacts.promotion.service.PromotionService;
+import com.nexus.artifacts.promotion.service.ServiceUtils;
 
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
@@ -77,7 +78,7 @@ public class PromotionResource implements Resource {
       boolean hasPermission = permissionChecker.hasRepositoryWritePermission(repository, format);
       return Response.ok()
           .entity("{\"hasPermission\":" + hasPermission + ",\"repository\":\""
-              + jsonEscape(repository) + "\",\"format\":\"" + jsonEscape(format) + "\"}")
+              + ServiceUtils.jsonEscape(repository) + "\",\"format\":\"" + ServiceUtils.jsonEscape(format) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -110,8 +111,8 @@ public class PromotionResource implements Resource {
     catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
           .entity("{\"error\":\"Permission denied\",\"username\":\""
-              + jsonEscape(e.getUsername()) + "\",\"repository\":\""
-              + jsonEscape(e.getRepository()) + "\"}")
+              + ServiceUtils.jsonEscape(e.getUsername()) + "\",\"repository\":\""
+              + ServiceUtils.jsonEscape(e.getRepository()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -140,20 +141,20 @@ public class PromotionResource implements Resource {
   {
     try {
       request.validate();
-      String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
+      String nexusBaseUrl = ServiceUtils.extractNexusBaseUrl(httpRequest);
       FilePreviewResponse preview = promotionService.previewPromotion(request, nexusBaseUrl);
       return Response.ok(preview).build();
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
           .entity("{\"error\":\"Permission denied\",\"username\":\""
-              + jsonEscape(e.getUsername()) + "\",\"repository\":\""
-              + jsonEscape(e.getRepository()) + "\"}")
+              + ServiceUtils.jsonEscape(e.getUsername()) + "\",\"repository\":\""
+              + ServiceUtils.jsonEscape(e.getRepository()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -193,27 +194,27 @@ public class PromotionResource implements Resource {
         csrfToken = httpHeaders.getHeaderString("nx-anti-csrf-token");
       }
       // Extract Nexus base URL from incoming request
-      String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
+      String nexusBaseUrl = ServiceUtils.extractNexusBaseUrl(httpRequest);
       String taskId = promotionService.promote(request, cookieHeader, csrfToken, nexusBaseUrl);
       return Response.ok()
-          .entity("{\"taskId\":\"" + jsonEscape(taskId) + "\",\"status\":\"submitted\"}")
+          .entity("{\"taskId\":\"" + ServiceUtils.jsonEscape(taskId) + "\",\"status\":\"submitted\"}")
           .build();
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (PermissionDeniedException e) {
       return Response.status(Response.Status.FORBIDDEN)
           .entity("{\"error\":\"Permission denied\",\"username\":\""
-              + jsonEscape(e.getUsername()) + "\",\"repository\":\""
-              + jsonEscape(e.getRepository()) + "\"}")
+              + ServiceUtils.jsonEscape(e.getUsername()) + "\",\"repository\":\""
+              + ServiceUtils.jsonEscape(e.getRepository()) + "\"}")
           .build();
     }
     catch (SecurityException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -260,7 +261,7 @@ public class PromotionResource implements Resource {
           // Return a running status so frontend knows to keep polling
           log.debug("Task {} executor status={}, returning running", taskId, status.getValue());
           return Response.ok()
-              .entity("{\"status\":\"" + status.getValue() + "\",\"taskId\":\"" + jsonEscape(taskId) + "\"}")
+              .entity("{\"status\":\"" + status.getValue() + "\",\"taskId\":\"" + ServiceUtils.jsonEscape(taskId) + "\"}")
               .build();
         }
         log.warn("Task {} not found anywhere", taskId);
@@ -280,131 +281,4 @@ public class PromotionResource implements Resource {
     }
   }
 
-  /**
-   * Debug endpoint for collecting frontend instrumentation logs.
-   * Only active during debugging - remove before production release.
-   */
-  @GET
-  @Path("/_debug")
-  @Produces(MediaType.TEXT_PLAIN)
-  public Response debugLog(@QueryParam("event") final String event,
-                            @QueryParam("method") final String method,
-                            @QueryParam("path") final String path,
-                            @QueryParam("defaultHeaderKeys") final String defaultHeaderKeys,
-                            @QueryParam("csrfSource") final String csrfSource,
-                            @QueryParam("hasCsrf") final String hasCsrf,
-                            @QueryParam("cookieCount") final String cookieCount,
-                            @QueryParam("hasNXcoreui") final String hasNXcoreui,
-                            @QueryParam("hasNXview") final String hasNXview,
-                            @QueryParam("hasNXcomponent") final String hasNXcomponent,
-                            @QueryParam("hasFolderInfo") final String hasFolderInfo,
-                            @QueryParam("hasFolderProto") final String hasFolderProto,
-                            @QueryParam("xtype") final String xtype,
-                            @QueryParam("hasFolderModel") final String hasFolderModel,
-                            @QueryParam("overrideDone") final String overrideDone,
-                            @QueryParam("fmKeys") final String fmKeys,
-                            @QueryParam("folderKeys") final String folderKeys,
-                            @QueryParam("repoName") final String repoName,
-                            @QueryParam("path") final String pathVal)
-  {
-    log.info("[DEBUG-LOG] event={} method={} path={} headers={} csrf={} hasCsrf={} cookies={} " +
-             "coreui={} view={} component={} folderInfo={} folderProto={} " +
-             "xtype={} folderModel={} overrideDone={} fmKeys={} fKeys={} repoName={}",
-        event, method, path, defaultHeaderKeys, csrfSource, hasCsrf, cookieCount,
-        hasNXcoreui, hasNXview, hasNXcomponent, hasFolderInfo, hasFolderProto,
-        xtype, hasFolderModel, overrideDone, fmKeys, folderKeys, repoName);
-    return Response.ok().entity("ok").build();
-  }
-
-  /**
-   * Extract Nexus base URL from incoming HTTP request.
-   * Supports reverse proxies (X-Forwarded-Proto only) and HTTPS with self-signed certs.
-   *
-   * <p>Security: X-Forwarded-Host is NOT used for target host determination to prevent
-   * SSRF attacks. Only X-Forwarded-Proto is allowed (affects scheme only, not target host).
-   * The host is always derived from the request's own server info and validated as local.
-   */
-  private String extractNexusBaseUrl(final HttpServletRequest request) {
-    // Determine scheme - X-Forwarded-Proto is safe for scheme only (http vs https)
-    String scheme = request.getScheme();
-    String forwardedProto = request.getHeader("X-Forwarded-Proto");
-    if (forwardedProto == null || forwardedProto.isEmpty()) {
-      forwardedProto = request.getHeader("X-Forwarded-Scheme");
-    }
-    if (forwardedProto != null && !forwardedProto.isEmpty()) {
-      String proto = forwardedProto.toLowerCase();
-      if ("https".equals(proto) || "http".equals(proto)) {
-        scheme = proto;
-      }
-    }
-
-    // Security: use request's own server info for host, NOT X-Forwarded-Host (SSRF risk)
-    String host = request.getServerName();
-    int port = request.getServerPort();
-
-    // Validate host is local to prevent SSRF
-    if (!isLocalHost(host)) {
-      log.warn("Server host '{}' is not local, using localhost as fallback for internal API calls", host);
-      host = "localhost";
-    }
-
-    // Build URL
-    String baseUrl;
-    if ((scheme.equals("http") && port == 80) || (scheme.equals("https") && port == 443)) {
-      baseUrl = scheme + "://" + host;
-    }
-    else {
-      baseUrl = scheme + "://" + host + ":" + port;
-    }
-
-    log.debug("Extracted Nexus base URL: {}", baseUrl);
-    return baseUrl;
-  }
-
-  /**
-   * Check if a hostname refers to the local machine.
-   * Used to validate that internal API calls only target local addresses.
-   */
-  private boolean isLocalHost(final String host) {
-    if (host == null) return false;
-    return "localhost".equalsIgnoreCase(host)
-        || "127.0.0.1".equals(host)
-        || "[::1]".equals(host)
-        || "0:0:0:0:0:0:0:1".equals(host);
-  }
-
-  /**
-   * Escape a string for safe inclusion in a manually constructed JSON response.
-   * Handles quotes, backslashes, newlines, and other control characters.
-   */
-  private String jsonEscape(final String input) {
-    if (input == null) return "";
-    StringBuilder sb = new StringBuilder(input.length() + 16);
-    for (int i = 0; i < input.length(); i++) {
-      char c = input.charAt(i);
-      switch (c) {
-        case '"':  sb.append("\\\""); break;
-        case '\\': sb.append("\\\\"); break;
-        case '\n': sb.append("\\n"); break;
-        case '\r': sb.append("\\r"); break;
-        case '\t': sb.append("\\t"); break;
-        case '\b': sb.append("\\b"); break;
-        case '\f': sb.append("\\f"); break;
-        default:
-          if (c < ' ') {
-            // Control characters: output as \\uXXXX
-            sb.append("\\u");
-            String hex = Integer.toHexString(c);
-            for (int pad = 4 - hex.length(); pad > 0; pad--) {
-              sb.append('0');
-            }
-            sb.append(hex);
-          } else {
-            sb.append(c);
-          }
-          break;
-      }
-    }
-    return sb.toString();
-  }
 }

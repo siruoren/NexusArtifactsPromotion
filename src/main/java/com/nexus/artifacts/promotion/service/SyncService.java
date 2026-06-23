@@ -62,13 +62,6 @@ public class SyncService {
 
   private static final Logger log = LoggerFactory.getLogger(SyncService.class);
 
-  /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
-  private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
-  private static final String LOCAL_NEXUS_BASE_HTTP = "http://localhost:8081";
-
-  /** Cached working local base URL */
-  private volatile String cachedLocalNexusBase = null;
-
   /** Maximum retry attempts for individual asset sync operations */
   private static final int SYNC_RETRY_ATTEMPTS = 2;
 
@@ -98,57 +91,6 @@ public class SyncService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.dockerService = dockerService;
-  }
-
-  /**
-   * Get the working local Nexus base URL.
-   * Tries HTTPS first (for Nexus with SSL), then falls back to HTTP.
-   * Result is cached after first successful connection.
-   */
-  private String getLocalNexusBase() {
-    if (cachedLocalNexusBase != null) {
-      return cachedLocalNexusBase;
-    }
-
-    // Try HTTPS first
-    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
-      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
-      log.debug("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
-      return cachedLocalNexusBase;
-    }
-
-    // Fall back to HTTP
-    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
-      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-      log.debug("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
-      return cachedLocalNexusBase;
-    }
-
-    // Default to HTTP if both fail (Nexus might not be fully started yet)
-    log.warn("Could not determine local Nexus base URL, defaulting to HTTP");
-    cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-    return cachedLocalNexusBase;
-  }
-
-  /**
-   * Test if a local Nexus URL is reachable.
-   */
-  private boolean testLocalConnection(final String baseUrl) {
-    try {
-      URL url = new URL(baseUrl + "/service/rest/v1/status");
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      SslHelper.applyTrustAllSsl(conn);
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(3000);
-      conn.setReadTimeout(3000);
-      int code = conn.getResponseCode();
-      conn.disconnect();
-      return code < 500;
-    }
-    catch (Exception e) {
-      log.debug("Local connection test failed for {}: {}", baseUrl, e.getMessage());
-      return false;
-    }
   }
 
   /**
@@ -342,9 +284,9 @@ public class SyncService {
           }
           log.error(isCancelled ? "Sync task cancelled: {}" : "Sync task failed: {}", e.getMessage(), isCancelled ? null : e);
           taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
-          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
-          taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
+          taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           // Clean up task cache on cancellation
           if (isCancelled) {
             cacheManager.cleanupTask(taskInfo.getTaskId());
@@ -505,9 +447,9 @@ public class SyncService {
       }
       log.error(isCancelled ? "Scheduled sync task cancelled: {}" : "Scheduled sync task failed: {}", e.getMessage(), isCancelled ? null : e);
       taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
-      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
-      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       // Clean up task cache on cancellation
       if (isCancelled) {
         cacheManager.cleanupTask(taskId);
@@ -720,7 +662,7 @@ public class SyncService {
           }
           log.error("Failed to sync asset {}: {}", assetPath, e.getMessage());
           detail.setStatus("failed");
-          detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
         }
 
         details.add(detail);
@@ -762,7 +704,7 @@ public class SyncService {
       }
       catch (Exception e) {
         detail.setStatus("failed");
-        detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       }
 
       details.add(detail);
@@ -958,7 +900,7 @@ public class SyncService {
       conn.setReadTimeout(60_000);
 
       if (repoAuth != null && repoAuth[0] != null && repoAuth[1] != null) {
-        String auth = encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
+        String auth = ServiceUtils.encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
         conn.setRequestProperty("Authorization", "Basic " + auth);
       }
 
@@ -1478,7 +1420,7 @@ public class SyncService {
 
     boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
     if (isFullSync) {
-      String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
+      String allApiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
       return listAssetsWithMd5ViaApiUrl(allApiUrl, effectiveAuth);
     }
 
@@ -1488,7 +1430,7 @@ public class SyncService {
     }
 
     // Try with group filter first
-    String groupApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName
+    String groupApiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName
         + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
     Map<String, String> assetsWithGroup = listAssetsWithMd5ViaApiUrl(groupApiUrl, effectiveAuth);
 
@@ -1505,7 +1447,7 @@ public class SyncService {
     }
 
     // Fall back to listing all assets and filtering
-    String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
+    String allApiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + remoteRepoName;
     Map<String, String> allAssets = listAssetsWithMd5ViaApiUrl(allApiUrl, effectiveAuth);
     Map<String, String> filtered = new java.util.LinkedHashMap<>();
     for (Map.Entry<String, String> entry : allAssets.entrySet()) {
@@ -1589,7 +1531,7 @@ public class SyncService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -1625,7 +1567,7 @@ public class SyncService {
         results.addAll(pageResults);
 
         // Extract continuation token for next page
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -1675,7 +1617,7 @@ public class SyncService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -1693,7 +1635,7 @@ public class SyncService {
         List<String> pageResults = parseComponentsApiAssets(json, directoryPath);
         results.addAll(pageResults);
 
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -1712,7 +1654,7 @@ public class SyncService {
   private List<String> parseComponentsApiAssets(final String json, final String directoryPath) {
     List<String> results = new ArrayList<>();
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return results;
 
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
@@ -1728,23 +1670,23 @@ public class SyncService {
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String component = itemsSection.substring(objStart, objEnd + 1);
 
         // Extract assets array from component
-        String assetsSection = extractJsonArray(component, "assets");
+        String assetsSection = ServiceUtils.extractJsonArray(component, "assets");
         if (assetsSection != null) {
           int aPos = 0;
           while (aPos < assetsSection.length()) {
             int aObjStart = assetsSection.indexOf('{', aPos);
             if (aObjStart < 0) break;
-            int aObjEnd = findMatchingBrace(assetsSection, aObjStart);
+            int aObjEnd = ServiceUtils.findMatchingBrace(assetsSection, aObjStart);
             if (aObjEnd < 0) break;
 
             String asset = assetsSection.substring(aObjStart, aObjEnd + 1);
-            String path = extractJsonValue(asset, "path");
+            String path = ServiceUtils.extractJsonValue(asset, "path");
             if (path != null && !path.isEmpty()) {
               if (path.startsWith("/")) path = path.substring(1);
               if (!path.endsWith("/")) {
@@ -1777,7 +1719,7 @@ public class SyncService {
   private List<String> parseSearchApiAssets(final String json, final String directoryPath) {
     List<String> results = new ArrayList<>();
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return results;
 
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
@@ -1793,11 +1735,11 @@ public class SyncService {
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String item = itemsSection.substring(objStart, objEnd + 1);
-        String path = extractJsonValue(item, "path");
+        String path = ServiceUtils.extractJsonValue(item, "path");
         if (path != null && !path.isEmpty()) {
           // Normalize: strip leading slash
           if (path.startsWith("/")) path = path.substring(1);
@@ -1930,7 +1872,7 @@ public class SyncService {
     // Full repository sync — list all assets without any path filter
     boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
     if (isFullSync) {
-      String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
+      String allApiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
       List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
       log.info("Full repo sync: found {} total assets in repo {}", allAssets.size(), repoName);
       return allAssets;
@@ -1944,7 +1886,7 @@ public class SyncService {
     String pathPrefix = normalizedDir;
 
     // Step 1: Try with group filter first (efficient for Maven2 repos)
-    String groupApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName
+    String groupApiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName
         + "&group=" + java.net.URLEncoder.encode(normalizedDir, "UTF-8");
     List<String> assetsWithGroup = listAssetsViaApiUrl(groupApiUrl, effectiveAuth);
 
@@ -1961,7 +1903,7 @@ public class SyncService {
     // and filtering by path prefix. This handles raw/hosted repos where the Search API's
     // group parameter doesn't correspond to the file system directory path.
     log.debug("Group filter returned 0 results for '{}', falling back to path-prefix filter", normalizedDir);
-    String allApiUrl = getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
+    String allApiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/search/assets?repository=" + repoName;
     List<String> allAssets = listAssetsViaApiUrl(allApiUrl, effectiveAuth);
     List<String> filtered = filterByPathPrefix(allAssets, pathPrefix);
 
@@ -1992,7 +1934,7 @@ public class SyncService {
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
       conn.setRequestProperty("Accept", "application/json");
-      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+      conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
 
       if (conn.getResponseCode() != 200) {
         log.warn("Search API returned HTTP {} for {}", conn.getResponseCode(), url);
@@ -2003,17 +1945,17 @@ public class SyncService {
       String json = readResponse(conn);
 
       // Parse items array
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection != null) {
         int pos = 0;
         while (pos < itemsSection.length()) {
           int objStart = itemsSection.indexOf("{", pos);
           if (objStart < 0) break;
-          int objEnd = findMatchingBrace(itemsSection, objStart);
+          int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
           if (objEnd < 0) break;
 
           String item = itemsSection.substring(objStart, objEnd + 1);
-          String path = extractJsonValue(item, "path");
+          String path = ServiceUtils.extractJsonValue(item, "path");
 
           if (path != null) {
             // Normalize: strip leading slash for consistent path matching
@@ -2027,7 +1969,7 @@ public class SyncService {
         }
       }
 
-      continuationToken = extractJsonValue(json, "continuationToken");
+      continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
 
     } while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -2058,7 +2000,7 @@ public class SyncService {
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
       conn.setRequestProperty("Accept", "application/json");
-      conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+      conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
 
       if (conn.getResponseCode() != 200) {
         log.warn("Search API returned HTTP {} for MD5 query: {}", conn.getResponseCode(), url);
@@ -2069,17 +2011,17 @@ public class SyncService {
       String json = readResponse(conn);
 
       // Parse items array
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection != null) {
         int pos = 0;
         while (pos < itemsSection.length()) {
           int objStart = itemsSection.indexOf("{", pos);
           if (objStart < 0) break;
-          int objEnd = findMatchingBrace(itemsSection, objStart);
+          int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
           if (objEnd < 0) break;
 
           String item = itemsSection.substring(objStart, objEnd + 1);
-          String path = extractJsonValue(item, "path");
+          String path = ServiceUtils.extractJsonValue(item, "path");
 
           if (path != null) {
             // Normalize: strip leading slash for consistent path matching
@@ -2107,7 +2049,7 @@ public class SyncService {
         }
       }
 
-      continuationToken = extractJsonValue(json, "continuationToken");
+      continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
 
     } while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -2164,7 +2106,7 @@ public class SyncService {
       conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
 
       if (authUsername != null && authPassword != null) {
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
       }
 
       if (conn.getResponseCode() != 200) {
@@ -2235,7 +2177,7 @@ public class SyncService {
       conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
 
       if (authUsername != null && authPassword != null) {
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
       }
 
       int responseCode = conn.getResponseCode();
@@ -2384,16 +2326,8 @@ public class SyncService {
     return "file";
   }
 
-  private String sanitizeErrorMessage(final String message) {
-    return ServiceUtils.sanitizeErrorMessage(message);
-  }
-
   private String[] extractAuthFromRepo(final Repository repo) {
     return ServiceUtils.extractAuthFromRepo(repo);
-  }
-
-  private String encodeAuth(final String userPass) {
-    return ServiceUtils.encodeAuth(userPass);
   }
 
   private String readResponse(final HttpURLConnection conn) throws IOException {
@@ -2417,11 +2351,11 @@ public class SyncService {
       int objStart = json.indexOf('{', checksumsIdx + checksumsPattern.length());
       if (objStart >= 0) {
         // Find the matching closing brace
-        int objEnd = findMatchingBrace(json, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(json, objStart);
         if (objEnd >= 0) {
           // Extract the checksums object and find the algorithm value
           String checksumsObj = json.substring(objStart, objEnd + 1);
-          String value = extractJsonValue(checksumsObj, algo);
+          String value = ServiceUtils.extractJsonValue(checksumsObj, algo);
           if (value != null) return value;
         }
       }
@@ -2451,88 +2385,6 @@ public class SyncService {
     }
 
     return null;
-  }
-
-  private String extractJsonValue(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-
-    int valueStart = json.indexOf('"', colonIdx + 1);
-    if (valueStart < 0) return null;
-
-    int valueEnd = valueStart + 1;
-    while (valueEnd < json.length()) {
-      char c = json.charAt(valueEnd);
-      if (c == '"' && json.charAt(valueEnd - 1) != '\\') {
-        break;
-      }
-      valueEnd++;
-    }
-
-    if (valueEnd >= json.length()) return null;
-
-    return json.substring(valueStart + 1, valueEnd)
-        .replace("\\\"", "\"")
-        .replace("\\\\", "\\");
-  }
-
-  private String extractJsonArray(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-
-    int arrayStart = json.indexOf('[', colonIdx + 1);
-    if (arrayStart < 0) return null;
-
-    int arrayEnd = findMatchingBracket(json, arrayStart);
-    if (arrayEnd < 0) return null;
-
-    return json.substring(arrayStart + 1, arrayEnd);
-  }
-
-  private int findMatchingBracket(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) {
-        inString = !inString;
-      }
-      if (!inString) {
-        if (c == '[') depth++;
-        else if (c == ']') {
-          depth--;
-          if (depth == 0) return i;
-        }
-      }
-    }
-    return -1;
-  }
-
-  private int findMatchingBrace(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) {
-        inString = !inString;
-      }
-      if (!inString) {
-        if (c == '{') depth++;
-        else if (c == '}') {
-          depth--;
-          if (depth == 0) return i;
-        }
-      }
-    }
-    return -1;
   }
 
   // ========================================================================
@@ -2839,7 +2691,7 @@ public class SyncService {
       conn.setReadTimeout(10000);
 
       if (repoAuth != null) {
-        String auth = encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
+        String auth = ServiceUtils.encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
         conn.setRequestProperty("Authorization", "Basic " + auth);
       }
 
@@ -2916,7 +2768,7 @@ public class SyncService {
         conn.setReadTimeout(10000);
 
         if (repoAuth != null) {
-          String auth = encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
+          String auth = ServiceUtils.encodeAuth(repoAuth[0] + ":" + repoAuth[1]);
           conn.setRequestProperty("Authorization", "Basic " + auth);
         }
 
@@ -2933,7 +2785,7 @@ public class SyncService {
         }
 
         // Check next page
-        continuationToken = extractJsonValue(response, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(response, "continuationToken");
         conn.disconnect();
         conn = null;
       } while (continuationToken != null && !continuationToken.isEmpty());
@@ -3029,18 +2881,18 @@ public class SyncService {
    * so we match by path to find the correct one.
    */
   private String extractChecksumForPath(final String json, final String targetPath, final String algo) {
-    String itemsSection = extractJsonArray(json, "items");
+    String itemsSection = ServiceUtils.extractJsonArray(json, "items");
     if (itemsSection == null) return null;
 
     int pos = 0;
     while (pos < itemsSection.length()) {
       int objStart = itemsSection.indexOf("{", pos);
       if (objStart < 0) break;
-      int objEnd = findMatchingBrace(itemsSection, objStart);
+      int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
       if (objEnd < 0) break;
 
       String item = itemsSection.substring(objStart, objEnd + 1);
-      String itemPath = extractJsonValue(item, "path");
+      String itemPath = ServiceUtils.extractJsonValue(item, "path");
 
       if (itemPath != null && itemPath.equals(targetPath)) {
         return extractChecksumValue(item, algo);

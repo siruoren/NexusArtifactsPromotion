@@ -78,64 +78,6 @@ public class DockerService {
   /** Maximum retry attempts for individual blob/manifest operations */
   private static final int DOCKER_RETRY_ATTEMPTS = 3;
 
-  /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
-  private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
-  private static final String LOCAL_NEXUS_BASE_HTTP = "http://localhost:8081";
-
-  /** Cached working local base URL */
-  private volatile String cachedLocalNexusBase = null;
-
-  /**
-   * Get the working local Nexus base URL.
-   * Tries HTTPS first (for Nexus with SSL), then falls back to HTTP.
-   * Result is cached after first successful connection.
-   */
-  private String getLocalNexusBase() {
-    if (cachedLocalNexusBase != null) {
-      return cachedLocalNexusBase;
-    }
-
-    // Try HTTPS first
-    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
-      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
-      log.debug("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
-      return cachedLocalNexusBase;
-    }
-
-    // Fall back to HTTP
-    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
-      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-      log.debug("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
-      return cachedLocalNexusBase;
-    }
-
-    // Default to HTTP if both fail (Nexus might not be fully started yet)
-    log.warn("Could not determine local Nexus base URL, defaulting to HTTP");
-    cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-    return cachedLocalNexusBase;
-  }
-
-  /**
-   * Test if a local Nexus URL is reachable.
-   */
-  private boolean testLocalConnection(final String baseUrl) {
-    try {
-      URL url = new URL(baseUrl + "/service/rest/v1/status");
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      SslHelper.applyTrustAllSsl(conn);
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(3000);
-      conn.setReadTimeout(3000);
-      int code = conn.getResponseCode();
-      conn.disconnect();
-      return code < 500;
-    }
-    catch (Exception e) {
-      log.debug("Local connection test failed for {}: {}", baseUrl, e.getMessage());
-      return false;
-    }
-  }
-
   /** Set of Docker host repository names configured as release repositories (for promotion) */
   private volatile Set<String> dockerReleaseRepos = new HashSet<>();
 
@@ -327,7 +269,7 @@ public class DockerService {
   private Map<String, DockerImageInfo> listDockerImagesViaLocalApi(final String repositoryName) {
     Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
     try {
-      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
       String effectiveAuth = null;
 
@@ -343,7 +285,7 @@ public class DockerService {
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
         conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
 
         int code = conn.getResponseCode();
         if (code != 200) {
@@ -354,7 +296,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerComponents(json, imageMap);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
     }
@@ -417,7 +359,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -431,7 +373,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerSearchApiAssets(json, imageMap);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -472,7 +414,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -484,7 +426,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerComponents(json, imageMap);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -502,18 +444,18 @@ public class DockerService {
    */
   private void parseDockerSearchApiAssets(final String json, final Map<String, DockerImageInfo> imageMap) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       int pos = 0;
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String item = itemsSection.substring(objStart, objEnd + 1);
-        String path = extractJsonValue(item, "path");
+        String path = ServiceUtils.extractJsonValue(item, "path");
 
         if (path != null && path.contains("/manifests/")) {
           // Normalize path: strip leading slash
@@ -709,7 +651,7 @@ public class DockerService {
     List<String> tags = new ArrayList<>();
     try {
       String effectiveAuth = null;
-      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
 
       do {
@@ -724,7 +666,7 @@ public class DockerService {
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
         conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
 
         if (conn.getResponseCode() != 200) {
           conn.disconnect();
@@ -733,7 +675,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         extractTagsForImage(json, imageName, tags);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
     }
@@ -784,7 +726,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -821,7 +763,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -832,7 +774,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerTagsFromSearchApi(json, imageName, tags);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -849,7 +791,7 @@ public class DockerService {
    */
   private void parseDockerTagsFromSearchApi(final String json, final String imageName, final List<String> tags) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       String manifestPrefix = "v2/" + imageName + "/manifests/";
@@ -858,11 +800,11 @@ public class DockerService {
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String item = itemsSection.substring(objStart, objEnd + 1);
-        String path = extractJsonValue(item, "path");
+        String path = ServiceUtils.extractJsonValue(item, "path");
 
         if (path != null) {
           String normalizedPath = path.startsWith("/") ? path.substring(1) : path;
@@ -980,7 +922,7 @@ public class DockerService {
                   String manifestPath = "v2/" + imageName + "/manifests/" + tag;
                   PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
                   failedItem.setStatus("failed");
-                  failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                   promotedItems.add(failedItem);
                 }
                 updatePromotionTaskProgress(result, promotedItems);
@@ -1033,7 +975,7 @@ public class DockerService {
                 String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
                 PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
                 failedItem.setStatus("failed");
-                failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                 promotedItems.add(failedItem);
               }
               updatePromotionTaskProgress(result, promotedItems);
@@ -1055,7 +997,7 @@ public class DockerService {
               || (e instanceof InterruptedException)
               || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
           result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
-          result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+          result.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
         }
 
@@ -1135,7 +1077,7 @@ public class DockerService {
                 log.error("Failed to promote sub-manifest {} for {}:{}: {}", ref.getDigest(), image, tag, e.getMessage());
                 PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(subManifestPath, "image");
                 failedItem.setStatus("failed");
-                failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                 items.add(failedItem);
               }
             }
@@ -1162,7 +1104,7 @@ public class DockerService {
               log.error("Failed to promote blob {} for {}:{}: {}", digest, image, tag, ex.getMessage());
               PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
               failedItem.setStatus("failed");
-              failedItem.setErrorMessage(sanitizeErrorMessage(ex.getMessage()));
+              failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(ex.getMessage()));
               items.add(failedItem);
             }
           }
@@ -1178,7 +1120,7 @@ public class DockerService {
           log.error("Failed to upload manifest for {}:{}: {}", image, tag, e.getMessage());
           PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
           failedItem.setStatus("failed");
-          failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           items.add(failedItem);
         }
       });
@@ -1218,7 +1160,7 @@ public class DockerService {
         log.error("Failed to promote blob {} for image {}: {}", digest, image, e.getMessage());
         PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
         failedItem.setStatus("failed");
-        failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
         items.add(failedItem);
       }
     }
@@ -1276,7 +1218,7 @@ public class DockerService {
       log.error("Failed to upload sub-manifest {} for image {}: {}", ref.getDigest(), image, e.getMessage());
       PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(subManifestPath, "image");
       failedItem.setStatus("failed");
-      failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       items.add(failedItem);
     }
   }
@@ -1637,7 +1579,7 @@ public class DockerService {
             String manifestPath = "v2/" + imageName + "/manifests/" + tag;
             SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
             failedDetail.setStatus("failed");
-            failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+            failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
             syncedFiles.add(failedDetail);
           }
         }
@@ -1666,9 +1608,9 @@ public class DockerService {
       }
       log.error(isCancelled ? "Docker scheduled sync task cancelled: {}" : "Docker scheduled sync task failed: {}", e.getMessage(), isCancelled ? null : e);
       taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
-      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
-      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()));
     }
 
     syncTaskInfos.put(taskId, taskInfo);
@@ -1794,7 +1736,7 @@ public class DockerService {
                   String manifestPath = "v2/" + imageName + "/manifests/" + tag;
                   SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
                   failedDetail.setStatus("failed");
-                  failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                   syncedFiles.add(failedDetail);
                 }
               }
@@ -1860,7 +1802,7 @@ public class DockerService {
                   String manifestPath = "v2/" + imageName + "/manifests/" + tag;
                   SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
                   failedDetail.setStatus("failed");
-                  failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                   syncedFiles.add(failedDetail);
                 }
               }
@@ -1911,7 +1853,7 @@ public class DockerService {
                 String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
                 SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
                 failedDetail.setStatus("failed");
-                failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                 syncedFiles.add(failedDetail);
               }
             }
@@ -1938,7 +1880,7 @@ public class DockerService {
           }
           log.error(isCancelled ? "Docker sync task cancelled: {}" : "Docker sync task failed: {}", e.getMessage(), isCancelled ? null : e);
           taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
-          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
         }
 
@@ -2015,7 +1957,7 @@ public class DockerService {
               log.error("Failed to sync sub-manifest {} for {}:{}: {}", ref.getDigest(), image, tag, e.getMessage());
               SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(subManifestPath, "image");
               failedDetail.setStatus("failed");
-              failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+              failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
               details.add(failedDetail);
             }
           }
@@ -2046,7 +1988,7 @@ public class DockerService {
             log.error("Failed to sync blob {} for {}:{}: {}", digest, image, tag, ex.getMessage());
             SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
             failedDetail.setStatus("failed");
-            failedDetail.setErrorMessage(sanitizeErrorMessage(ex.getMessage()));
+            failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(ex.getMessage()));
             details.add(failedDetail);
           }
         }
@@ -2082,7 +2024,7 @@ public class DockerService {
         log.error("Failed to sync blob {} for image {}: {}", digest, image, e.getMessage());
         SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
         failedDetail.setStatus("failed");
-        failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
         details.add(failedDetail);
       }
     }
@@ -2147,7 +2089,7 @@ public class DockerService {
             InputStream is = blob.getInputStream();
             if (is != null) {
               try {
-                return readStream(is);
+                return ServiceUtils.readStream(is);
               }
               finally {
                 try { is.close(); } catch (Exception e) { /* ignore */ }
@@ -2198,7 +2140,7 @@ public class DockerService {
           conn.setRequestProperty("Accept", "application/json");
 
           if (authUsername != null && authPassword != null) {
-            conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+            conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
           }
 
           int code = conn.getResponseCode();
@@ -2268,7 +2210,7 @@ public class DockerService {
       conn.setRequestProperty("Accept", "application/json");
 
       if (authUsername != null && authPassword != null) {
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
       }
 
       try {
@@ -2344,11 +2286,11 @@ public class DockerService {
       // Find the object after the key
       int objStart = json.indexOf('{', keyIdx + searchKey.length());
       if (objStart < 0) return null;
-      int objEnd = findMatchingBrace(json, objStart);
+      int objEnd = ServiceUtils.findMatchingBrace(json, objStart);
       if (objEnd < 0) return null;
 
       String obj = json.substring(objStart, objEnd + 1);
-      return extractJsonValue(obj, "digest");
+      return ServiceUtils.extractJsonValue(obj, "digest");
     }
     catch (Exception e) {
       return null;
@@ -2361,18 +2303,18 @@ public class DockerService {
   private List<String> extractLayerDigests(final String json) {
     List<String> digests = new ArrayList<>();
     try {
-      String layersArray = extractJsonArray(json, "layers");
+      String layersArray = ServiceUtils.extractJsonArray(json, "layers");
       if (layersArray == null) return digests;
 
       int pos = 0;
       while (pos < layersArray.length()) {
         int objStart = layersArray.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(layersArray, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(layersArray, objStart);
         if (objEnd < 0) break;
 
         String obj = layersArray.substring(objStart, objEnd + 1);
-        String digest = extractJsonValue(obj, "digest");
+        String digest = ServiceUtils.extractJsonValue(obj, "digest");
         if (digest != null && !digest.isEmpty()) {
           digests.add(digest);
         }
@@ -2391,18 +2333,18 @@ public class DockerService {
   private List<String> extractManifestListDigests(final String json) {
     List<String> digests = new ArrayList<>();
     try {
-      String manifestsArray = extractJsonArray(json, "manifests");
+      String manifestsArray = ServiceUtils.extractJsonArray(json, "manifests");
       if (manifestsArray == null) return digests;
 
       int pos = 0;
       while (pos < manifestsArray.length()) {
         int objStart = manifestsArray.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(manifestsArray, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(manifestsArray, objStart);
         if (objEnd < 0) break;
 
         String obj = manifestsArray.substring(objStart, objEnd + 1);
-        String digest = extractJsonValue(obj, "digest");
+        String digest = ServiceUtils.extractJsonValue(obj, "digest");
         if (digest != null && !digest.isEmpty()) {
           digests.add(digest);
         }
@@ -2422,7 +2364,7 @@ public class DockerService {
   private List<String> parseDockerTagsList(final String json) {
     List<String> tags = new ArrayList<>();
     try {
-      String tagsArray = extractJsonArray(json, "tags");
+      String tagsArray = ServiceUtils.extractJsonArray(json, "tags");
       if (tagsArray == null) return tags;
 
       int pos = 0;
@@ -2696,22 +2638,22 @@ public class DockerService {
    */
   private void parseDockerComponents(final String json, final Map<String, DockerImageInfo> imageMap) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       int pos = 0;
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String componentObj = itemsSection.substring(objStart, objEnd + 1);
 
         // For Docker format: group = image name, version = tag
-        String group = extractJsonValue(componentObj, "group");
-        String name = extractJsonValue(componentObj, "name");
-        String version = extractJsonValue(componentObj, "version");
+        String group = ServiceUtils.extractJsonValue(componentObj, "group");
+        String name = ServiceUtils.extractJsonValue(componentObj, "name");
+        String version = ServiceUtils.extractJsonValue(componentObj, "version");
 
         // Docker images: group is the namespace/path, name is the image name
         // Full image name = group + "/" + name (or just name if group is empty)
@@ -2747,21 +2689,21 @@ public class DockerService {
    */
   private void extractTagsForImage(final String json, final String targetImage, final List<String> tags) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       int pos = 0;
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String componentObj = itemsSection.substring(objStart, objEnd + 1);
 
-        String group = extractJsonValue(componentObj, "group");
-        String name = extractJsonValue(componentObj, "name");
-        String version = extractJsonValue(componentObj, "version");
+        String group = ServiceUtils.extractJsonValue(componentObj, "group");
+        String name = ServiceUtils.extractJsonValue(componentObj, "name");
+        String version = ServiceUtils.extractJsonValue(componentObj, "version");
 
         String imageName;
         if (group != null && !group.isEmpty() && !group.equals(name)) {
@@ -2919,86 +2861,7 @@ public class DockerService {
     return headers;
   }
 
-  // ==================== JSON Parsing Helpers ====================
-
-  private String extractJsonValue(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-    int valueStart = json.indexOf('"', colonIdx + 1);
-    if (valueStart < 0) return null;
-    int valueEnd = valueStart + 1;
-    while (valueEnd < json.length()) {
-      char c = json.charAt(valueEnd);
-      if (c == '"' && json.charAt(valueEnd - 1) != '\\') break;
-      valueEnd++;
-    }
-    if (valueEnd >= json.length()) return null;
-    return json.substring(valueStart + 1, valueEnd).replace("\\\"", "\"").replace("\\\\", "\\");
-  }
-
-  private String extractJsonArray(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-    int arrayStart = json.indexOf('[', colonIdx + 1);
-    if (arrayStart < 0) return null;
-    int arrayEnd = findMatchingBracket(json, arrayStart);
-    if (arrayEnd < 0) return null;
-    return json.substring(arrayStart + 1, arrayEnd);
-  }
-
-  private int findMatchingBracket(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) inString = !inString;
-      if (!inString) {
-        if (c == '[') depth++;
-        else if (c == ']') { depth--; if (depth == 0) return i; }
-      }
-    }
-    return -1;
-  }
-
-  private int findMatchingBrace(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) inString = !inString;
-      if (!inString) {
-        if (c == '{') depth++;
-        else if (c == '}') { depth--; if (depth == 0) return i; }
-      }
-    }
-    return -1;
-  }
-
   // ==================== Utility ====================
-
-  private String readStream(final InputStream input) throws IOException {
-    StringBuilder sb = new StringBuilder();
-    byte[] buffer = new byte[BUFFER_SIZE];
-    int bytesRead;
-    while ((bytesRead = input.read(buffer)) != -1) {
-      sb.append(new String(buffer, 0, bytesRead, "UTF-8"));
-    }
-    return sb.toString();
-  }
-
-  private String readErrorResponse(final HttpURLConnection conn) throws IOException {
-    InputStream errStream = conn.getErrorStream();
-    if (errStream != null) {
-      try { return readStream(errStream); } finally { try { errStream.close(); } catch (Exception e) { /* ignore */ } }
-    }
-    return "";
-  }
 
   private String readResponse(final HttpURLConnection conn) throws IOException {
     StringBuilder sb = new StringBuilder();
@@ -3010,10 +2873,6 @@ public class DockerService {
     return sb.toString();
   }
 
-  private String encodeAuth(final String userPass) {
-    return java.util.Base64.getEncoder().encodeToString(userPass.getBytes());
-  }
-
   private String extractChecksumValue(final String json, final String algo) {
     String checksumsPattern = "\"checksums\"";
     int checksumsIdx = json.indexOf(checksumsPattern);
@@ -3022,15 +2881,11 @@ public class DockerService {
     int objStart = json.indexOf('{', checksumsIdx + checksumsPattern.length());
     if (objStart < 0) return null;
 
-    int objEnd = findMatchingBrace(json, objStart);
+    int objEnd = ServiceUtils.findMatchingBrace(json, objStart);
     if (objEnd < 0) return null;
 
     String checksumsObj = json.substring(objStart, objEnd + 1);
-    return extractJsonValue(checksumsObj, algo);
-  }
-
-  private String sanitizeErrorMessage(final String message) {
-    return ServiceUtils.sanitizeErrorMessage(message);
+    return ServiceUtils.extractJsonValue(checksumsObj, algo);
   }
 
   private PromotionTaskResult copyPromotionResult(final PromotionTaskResult src) {
