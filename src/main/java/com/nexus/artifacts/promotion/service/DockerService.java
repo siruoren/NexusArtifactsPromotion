@@ -111,6 +111,8 @@ public class DockerService {
 
   private final Map<String, PromotionTaskResult> promotionTaskResults = new ConcurrentHashMap<>();
   private final Map<String, SyncTaskInfo> syncTaskInfos = new ConcurrentHashMap<>();
+  /** Tracks running threads for scheduled Docker sync tasks, enabling cancellation via interrupt */
+  private final Map<String, Thread> scheduledTaskThreads = new ConcurrentHashMap<>();
 
   @Inject
   public DockerService(final RepositoryManager repositoryManager,
@@ -1393,6 +1395,18 @@ public class DockerService {
    * @return SyncTaskInfo with sync results
    */
   public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request) {
+    return syncDockerImageScheduled(request, null);
+  }
+
+  /**
+   * Execute a scheduled Docker sync task with support for Nexus task cancellation.
+   *
+   * @param request the sync request
+   * @param task the Nexus task instance (may be null for direct API calls)
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request,
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
     String repoName = request.getRepositoryName();
     String syncPath = request.getPath();
     boolean isFullSync = (syncPath == null || syncPath.trim().isEmpty());
@@ -1422,6 +1436,9 @@ public class DockerService {
     syncTaskInfos.put(taskId, taskInfo);
 
     try {
+      // Register thread for cancellation support
+      scheduledTaskThreads.put(taskId, Thread.currentThread());
+
       // Step 1: Parse sync path to determine image and optional tag filter
       String imageFilter = null;
       String tagFilter = null;
@@ -1539,8 +1556,8 @@ public class DockerService {
       // Step 3: Sync each image:tag
       for (Map.Entry<String, List<String>> entry : imageTagsMap.entrySet()) {
         // Check for task cancellation/interruption
-        if (Thread.currentThread().isInterrupted()) {
-          log.warn("Docker scheduled sync task interrupted, stopping sync for {}", repoName);
+        if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+          log.warn("Docker scheduled sync task cancelled, stopping sync for {}", repoName);
           throw new InterruptedException("Task cancelled during Docker sync");
         }
 
@@ -1566,8 +1583,8 @@ public class DockerService {
 
         for (String tag : tags) {
           // Check for task cancellation/interruption before each tag
-          if (Thread.currentThread().isInterrupted()) {
-            log.warn("Docker scheduled sync task interrupted, stopping sync for {}:{}", repoName, imageName);
+          if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+            log.warn("Docker scheduled sync task cancelled, stopping sync for {}:{}", repoName, imageName);
             throw new InterruptedException("Task cancelled during Docker sync");
           }
           try {
@@ -1602,7 +1619,8 @@ public class DockerService {
     catch (Exception e) {
       boolean isCancelled = Thread.currentThread().isInterrupted()
           || (e instanceof InterruptedException)
-          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException)
+          || (task != null && task.isCanceled());
       if (isCancelled) {
         Thread.currentThread().interrupt();
       }
@@ -1611,6 +1629,9 @@ public class DockerService {
       taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
       taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+    }
+    finally {
+      scheduledTaskThreads.remove(taskId);
     }
 
     syncTaskInfos.put(taskId, taskInfo);
@@ -2446,9 +2467,16 @@ public class DockerService {
   }
 
   /**
-   * Cancel a Docker sync task by updating its task info status to CANCELLED.
+   * Cancel a Docker sync task by interrupting its running thread and updating status.
    */
   public void cancelDockerSyncTask(final String taskId) {
+    // Interrupt the running thread first (for scheduled tasks)
+    Thread runningThread = scheduledTaskThreads.get(taskId);
+    if (runningThread != null) {
+      log.info("Interrupting Docker scheduled sync task thread for taskId: {}", taskId);
+      runningThread.interrupt();
+    }
+
     SyncTaskInfo info = syncTaskInfos.get(taskId);
     if (info != null && info.getStatus() != TaskStatus.CANCELLED) {
       log.info("Updating Docker sync task {} info status from {} to CANCELLED", taskId, info.getStatus());

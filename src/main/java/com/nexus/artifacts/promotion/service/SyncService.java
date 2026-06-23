@@ -75,6 +75,9 @@ public class SyncService {
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
+  /** Tracks running threads for scheduled sync tasks, enabling cancellation via interrupt */
+  private final Map<String, Thread> scheduledTaskThreads = new ConcurrentHashMap<>();
+
   @Inject
   public SyncService(final RepositoryManager repositoryManager,
                       final TaskExecutorService taskExecutor,
@@ -359,7 +362,7 @@ public class SyncService {
     // Delegate Docker format syncs to DockerService (synchronous, asset-based approach)
     if ("docker".equalsIgnoreCase(request.getFormat())) {
       log.info("Delegating Docker scheduled sync to DockerService for repository: {}", request.getRepositoryName());
-      return dockerService.syncDockerImageScheduled(request);
+      return dockerService.syncDockerImageScheduled(request, task);
     }
 
     // No permission check for scheduled tasks — tasks are created by administrators
@@ -378,6 +381,7 @@ public class SyncService {
 
     SyncTaskInfo taskInfo = new SyncTaskInfo();
     taskInfo.setTaskId(taskId);
+    taskInfo.setTaskType("sync");
     taskInfo.setSourceRepository(request.getRepositoryName());
     taskInfo.setPath(request.getPath());
     taskInfo.setDirectory(request.isDirectory());
@@ -391,6 +395,9 @@ public class SyncService {
     taskInfos.put(taskId, taskInfo);
 
     try {
+      // Register current thread so it can be interrupted for cancellation
+      scheduledTaskThreads.put(taskId, Thread.currentThread());
+
       cacheManager.createTaskCache(taskId);
 
       boolean isFullSync = (request.getPath() == null || request.getPath().trim().isEmpty());
@@ -457,7 +464,122 @@ public class SyncService {
       }
     }
     finally {
+      // Unregister thread
+      scheduledTaskThreads.remove(taskId);
       // Update stored info with final state (ensure this happens even if exception occurs)
+      taskInfos.put(taskId, taskInfo);
+    }
+
+    return taskInfo;
+  }
+
+  /**
+   * Execute a scheduled sync task with support for incremental sync mode.
+   *
+   * @param request the sync request
+   * @param task the Nexus task instance (may be null for direct API calls)
+   * @param incremental if true, only sync assets whose MD5 differs from local cache
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncScheduled(final SyncRequest request,
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task,
+      final boolean incremental) {
+    if (!incremental) {
+      return syncScheduled(request, task);
+    }
+
+    request.validate();
+
+    // Delegate Docker format syncs to DockerService (synchronous, asset-based approach)
+    if ("docker".equalsIgnoreCase(request.getFormat())) {
+      log.info("Delegating Docker scheduled sync to DockerService for repository: {}", request.getRepositoryName());
+      return dockerService.syncDockerImageScheduled(request, task);
+    }
+
+    Repository repo = repositoryManager.get(request.getRepositoryName());
+    if (repo == null) {
+      throw new IllegalArgumentException("Repository not found: " + request.getRepositoryName());
+    }
+    if (!"proxy".equals(repo.getType().getValue())) {
+      throw new IllegalArgumentException("Repository is not a proxy type: " + request.getRepositoryName());
+    }
+
+    String taskId = "scheduled-sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
+
+    SyncTaskInfo taskInfo = new SyncTaskInfo();
+    taskInfo.setTaskId(taskId);
+    taskInfo.setTaskType("sync");
+    taskInfo.setSourceRepository(request.getRepositoryName());
+    taskInfo.setPath(request.getPath());
+    taskInfo.setDirectory(request.isDirectory());
+    taskInfo.setFormat(request.getFormat());
+    taskInfo.setUsername("system");
+    taskInfo.setStartTime(System.currentTimeMillis());
+    taskInfo.setStatus(TaskStatus.RUNNING);
+    taskInfo.setTargetRepository(repo.getName());
+
+    taskInfos.put(taskId, taskInfo);
+
+    try {
+      scheduledTaskThreads.put(taskId, Thread.currentThread());
+      cacheManager.createTaskCache(taskId);
+
+      boolean isFullSync = (request.getPath() == null || request.getPath().trim().isEmpty());
+      log.info("Starting scheduled incremental {} for {}:{}",
+          isFullSync ? "full repository sync" : "directory sync",
+          request.getRepositoryName(),
+          isFullSync ? "/" : request.getPath());
+
+      List<SyncTaskInfo.SyncFileDetail> syncedFiles = incrementalSyncDirectory(repo, request.getPath(), task);
+
+      boolean taskCancelled = Thread.currentThread().isInterrupted() || (task != null && task.isCanceled());
+
+      taskInfo.setFileDetails(syncedFiles);
+
+      if (taskCancelled) {
+        taskInfo.setStatus(TaskStatus.CANCELLED);
+        taskInfo.setEndTime(System.currentTimeMillis());
+        long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+        long syncedCount = syncedFiles.size() - skippedCount;
+        taskInfo.setResult("Cancelled (incremental): " + syncedCount + " items synced");
+        cacheManager.cleanupTask(taskId);
+        log.info("Scheduled incremental sync task cancelled, cache cleaned up: {}", taskId);
+      }
+      else {
+        taskInfo.setStatus(TaskStatus.COMPLETED);
+        taskInfo.setEndTime(System.currentTimeMillis());
+        long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+        long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
+        long failedCount = syncedFiles.stream().filter(f -> "failed".equals(f.getStatus())).count();
+        taskInfo.setResult("Incremental: synced " + syncedCount + " items" +
+            (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : "") +
+            (failedCount > 0 ? ", failed " + failedCount : ""));
+      }
+
+      log.info("Scheduled incremental sync task {}: {} items processed from {}:{}",
+          taskCancelled ? "cancelled" : "completed", syncedFiles.size(), request.getRepositoryName(),
+          isFullSync ? "/" : request.getPath());
+    }
+    catch (Exception e) {
+      boolean isCancelled = Thread.currentThread().isInterrupted()
+          || (e instanceof InterruptedException)
+          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+      if (isCancelled) {
+        Thread.currentThread().interrupt();
+      }
+      log.error(isCancelled ? "Scheduled incremental sync task cancelled: {}" : "Scheduled incremental sync task failed: {}",
+          e.getMessage(), isCancelled ? null : e);
+      taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
+      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setEndTime(System.currentTimeMillis());
+      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+      if (isCancelled) {
+        cacheManager.cleanupTask(taskId);
+        log.info("Scheduled incremental sync task cancelled (exception), cache cleaned up: {}", taskId);
+      }
+    }
+    finally {
+      scheduledTaskThreads.remove(taskId);
       taskInfos.put(taskId, taskInfo);
     }
 
@@ -484,8 +606,8 @@ public class SyncService {
       return info;
     }
 
-    // Also check Docker sync tasks
-    if (taskId != null && taskId.startsWith("docker-sync-")) {
+    // Also check Docker sync tasks (both API-initiated and scheduled)
+    if (taskId != null && (taskId.startsWith("docker-sync-") || taskId.startsWith("docker-scheduled-sync-"))) {
       try {
         info = dockerService.getSyncTaskInfo(taskId);
         if (info != null) {
@@ -506,11 +628,19 @@ public class SyncService {
    */
   public void cancelSyncTask(final String taskId) {
     SyncTaskInfo info = taskInfos.get(taskId);
-    if (info != null && info.getStatus() != TaskStatus.CANCELLED) {
+    if (info != null && info.getStatus() != TaskStatus.CANCELLED
+        && info.getStatus() != TaskStatus.COMPLETED
+        && info.getStatus() != TaskStatus.FAILED) {
       log.info("Updating sync task {} info status from {} to CANCELLED", taskId, info.getStatus());
       info.setStatus(TaskStatus.CANCELLED);
       info.setEndTime(System.currentTimeMillis());
       info.setResult("Task cancelled");
+    }
+    // Interrupt the running thread for scheduled sync tasks
+    Thread worker = scheduledTaskThreads.get(taskId);
+    if (worker != null) {
+      log.info("Interrupting scheduled sync task thread {}", taskId);
+      worker.interrupt();
     }
     // Clean up task cache
     cacheManager.cleanupTask(taskId);
@@ -567,6 +697,120 @@ public class SyncService {
       }
     }
     return active;
+  }
+
+  /**
+   * Execute incremental sync of a proxy repository path.
+   * Only syncs assets whose MD5 differs from the locally cached version.
+   *
+   * @param repo the proxy repository
+   * @param directoryPath the path to sync (empty for full repository)
+   * @param task the Nexus task instance for cancellation support (may be null)
+   * @return list of file details showing what was synced/skipped
+   */
+  public List<SyncTaskInfo.SyncFileDetail> incrementalSyncDirectory(
+      final Repository repo,
+      final String directoryPath,
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task)
+  {
+    List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
+
+    try {
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      log.info("Starting incremental {} for {}:{}",
+          isFullSync ? "full repository sync" : "directory sync",
+          repo.getName(), isFullSync ? "/" : directoryPath);
+
+      // Step 1: Get remote assets with MD5 checksums
+      Map<String, String> remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
+      log.info("Incremental sync: found {} remote assets for {}:{}",
+          remoteMd5Map.size(), repo.getName(), isFullSync ? "/" : directoryPath);
+
+      if (remoteMd5Map.isEmpty()) {
+        log.warn("Incremental sync: no remote assets found for {}:{}", repo.getName(), directoryPath);
+        return details;
+      }
+
+      // Step 2: Build local MD5 map for comparison
+      Map<String, String> localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
+      log.info("Incremental sync: found {} local cached assets for {}:{}",
+          localMd5Map.size(), repo.getName(), isFullSync ? "/" : directoryPath);
+
+      // Step 3: Compare and sync only changed/missing assets
+      String[] repoAuth = extractAuthFromRepo(repo);
+      int syncedCount = 0;
+      int skippedCount = 0;
+
+      for (Map.Entry<String, String> entry : remoteMd5Map.entrySet()) {
+        // Check for task cancellation before each file
+        if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+          log.warn("Incremental sync cancelled for {}:{}, {} files processed before cancellation",
+              repo.getName(), directoryPath, details.size());
+          return details;
+        }
+
+        String assetPath = entry.getKey();
+        String remoteMd5 = entry.getValue();
+
+        // Skip directory entries
+        if (assetPath.endsWith("/")) {
+          continue;
+        }
+
+        SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, determineType(assetPath));
+        detail.setRemoteMd5(remoteMd5);
+
+        try {
+          // Compare MD5: skip if local MD5 matches remote MD5
+          String localMd5 = localMd5Map.get(assetPath);
+          detail.setLocalMd5(localMd5);
+
+          if (localMd5 != null && remoteMd5 != null && localMd5.equalsIgnoreCase(remoteMd5)) {
+            // MD5 matches - skip this asset
+            detail.setStatus("skipped");
+            skippedCount++;
+            log.debug("Incremental sync: skipping {} (MD5 match: {})", assetPath, localMd5);
+          }
+          else {
+            // MD5 mismatch or local asset missing - sync this asset
+            if (localMd5 == null) {
+              log.debug("Incremental sync: syncing {} (not in local cache)", assetPath);
+            }
+            else {
+              log.debug("Incremental sync: syncing {} (MD5 mismatch: local={}, remote={})",
+                  assetPath, localMd5, remoteMd5);
+            }
+
+            RetryableOperation.executeRun("incremental sync asset " + assetPath,
+                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
+                SYNC_RETRY_ATTEMPTS);
+            detail.setStatus("success");
+            syncedCount++;
+          }
+        }
+        catch (Exception e) {
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Incremental sync cancelled while syncing asset {}, stopping", assetPath);
+            return details;
+          }
+          log.error("Incremental sync: failed to sync asset {}: {}", assetPath, e.getMessage());
+          detail.setStatus("failed");
+          detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+        }
+
+        details.add(detail);
+      }
+
+      log.info("Incremental sync completed for {}:{} - {} synced, {} skipped, {} failed",
+          repo.getName(), isFullSync ? "/" : directoryPath, syncedCount, skippedCount,
+          details.stream().filter(d -> "failed".equals(d.getStatus())).count());
+    }
+    catch (Exception e) {
+      log.error("Failed incremental sync for {}:{}: {}", repo.getName(), directoryPath, e.getMessage(), e);
+      throw new RuntimeException("Incremental sync failed", e);
+    }
+
+    return details;
   }
 
   /**

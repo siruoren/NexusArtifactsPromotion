@@ -288,6 +288,10 @@ public class PromotionService {
       info.setTaskType("promotion");
       info.setSourceRepository(result.getSourceRepository());
       info.setTargetRepository(result.getTargetRepository());
+      // Display promotion path as source -> target
+      if (result.getSourceRepository() != null && result.getTargetRepository() != null) {
+        info.setPath(result.getSourceRepository() + " -> " + result.getTargetRepository());
+      }
       info.setStatus(TaskStatus.fromValue(result.getStatus()));
       info.setStartTime(result.getStartTime());
       info.setEndTime(result.getEndTime());
@@ -312,7 +316,13 @@ public class PromotionService {
       info.setTaskType("promotion");
       info.setSourceRepository(handle.sourceRepository);
       info.setTargetRepository(handle.targetRepository);
-      info.setPath(handle.sourcePath);
+      // Display promotion path as source -> target
+      if (handle.sourceRepository != null && handle.targetRepository != null) {
+        info.setPath(handle.sourceRepository + " -> " + handle.targetRepository);
+      }
+      else if (handle.sourcePath != null) {
+        info.setPath(handle.sourcePath);
+      }
       info.setStatus(handle.status);
       info.setStartTime(handle.startTime);
       info.setEndTime(handle.endTime);

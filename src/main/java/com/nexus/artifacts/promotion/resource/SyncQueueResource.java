@@ -240,10 +240,16 @@ public class SyncQueueResource implements Resource {
     try {
       String safeTaskId = ServiceUtils.sanitize(taskId);
 
-      // Check if task exists and is cancellable
-      if (!taskExecutor.isTaskCancellable(safeTaskId)) {
-        // Also check sync/promotion task info maps for tasks that might have finished
-        SyncTaskInfo syncInfo = syncService.getTaskInfo(safeTaskId);
+      // Check if task exists and is cancellable via TaskExecutorService
+      boolean executorCancellable = taskExecutor.isTaskCancellable(safeTaskId);
+
+      // Also check if it's a scheduled sync task (running in SyncService.taskInfos)
+      SyncTaskInfo syncInfo = syncService.getTaskInfo(safeTaskId);
+      boolean scheduledSyncRunning = (syncInfo != null
+          && (syncInfo.getStatus() == TaskStatus.PENDING || syncInfo.getStatus() == TaskStatus.RUNNING));
+
+      if (!executorCancellable && !scheduledSyncRunning) {
+        // Task not found in executor or not running in sync service
         if (syncInfo != null && (syncInfo.getStatus() == TaskStatus.COMPLETED
             || syncInfo.getStatus() == TaskStatus.FAILED
             || syncInfo.getStatus() == TaskStatus.CANCELLED
@@ -269,11 +275,8 @@ public class SyncQueueResource implements Resource {
       // Check permission: only task creator or admin can terminate
       String taskUsername = taskExecutor.getTaskUsername(safeTaskId);
       // Also check from sync task info
-      if (taskUsername == null) {
-        SyncTaskInfo syncInfo = syncService.getTaskInfo(safeTaskId);
-        if (syncInfo != null) {
-          taskUsername = syncInfo.getUsername();
-        }
+      if (taskUsername == null && syncInfo != null) {
+        taskUsername = syncInfo.getUsername();
       }
       // Also check from promotion task result
       if (taskUsername == null) {
@@ -292,18 +295,18 @@ public class SyncQueueResource implements Resource {
             .build();
       }
 
+      // Cancel via executor (for tasks submitted to thread pool)
       boolean cancelled = taskExecutor.cancelTask(safeTaskId);
-      // Also disconnect any active HTTP connections for this task
+      // Also disconnect any active HTTP connections for promotion tasks
       promotionService.cancelPromotionTask(safeTaskId);
-      if (cancelled) {
+      // Cancel scheduled sync tasks (interrupts the running thread)
+      syncService.cancelSyncTask(safeTaskId);
+      // Cancel Docker tasks
+      dockerService.cancelDockerPromotionTask(safeTaskId);
+      dockerService.cancelDockerSyncTask(safeTaskId);
+
+      if (cancelled || scheduledSyncRunning) {
         log.info("Task {} terminated by user {}", safeTaskId, permissionChecker.getCurrentUsername());
-
-        // Update sync task info if it exists
-        syncService.cancelSyncTask(safeTaskId);
-
-        // Update Docker task results if they exist
-        dockerService.cancelDockerPromotionTask(safeTaskId);
-        dockerService.cancelDockerSyncTask(safeTaskId);
 
         return Response.ok()
             .entity("{\"taskId\":\"" + ServiceUtils.jsonEscape(safeTaskId) + "\",\"status\":\"cancelled\",\"message\":\"Task terminated successfully\"}")
