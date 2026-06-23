@@ -211,6 +211,7 @@ public class PromotionService {
         result.setStartTime(System.currentTimeMillis());
         result.setTaskId(taskId);
         result.setStatus(TaskStatus.RUNNING.getValue());
+        result.setRequestedPath(request.getPath()); // Store the original requested path
 
         // Put initial result so frontend can poll immediately
         taskResults.put(taskId, copyResult(result));
@@ -288,9 +289,10 @@ public class PromotionService {
       info.setTaskType("promotion");
       info.setSourceRepository(result.getSourceRepository());
       info.setTargetRepository(result.getTargetRepository());
-      // Display promotion path as source -> target
-      if (result.getSourceRepository() != null && result.getTargetRepository() != null) {
-        info.setPath(result.getSourceRepository() + " -> " + result.getTargetRepository());
+      // Display promotion path as "targetRepo: promoted path"
+      if (result.getTargetRepository() != null) {
+        String promotedPath = extractPromotedPath(result);
+        info.setPath(result.getTargetRepository() + ":" + promotedPath);
       }
       info.setStatus(TaskStatus.fromValue(result.getStatus()));
       info.setStartTime(result.getStartTime());
@@ -316,12 +318,11 @@ public class PromotionService {
       info.setTaskType("promotion");
       info.setSourceRepository(handle.sourceRepository);
       info.setTargetRepository(handle.targetRepository);
-      // Display promotion path as source -> target
-      if (handle.sourceRepository != null && handle.targetRepository != null) {
-        info.setPath(handle.sourceRepository + " -> " + handle.targetRepository);
-      }
-      else if (handle.sourcePath != null) {
-        info.setPath(handle.sourcePath);
+      // Display promotion path as "targetRepo: filePath"
+      if (handle.targetRepository != null) {
+        String promotedPath = (handle.sourcePath != null && !handle.sourcePath.isEmpty())
+            ? handle.sourcePath : "";
+        info.setPath(handle.targetRepository + ":" + promotedPath);
       }
       info.setStatus(handle.status);
       info.setStartTime(handle.startTime);
@@ -331,6 +332,29 @@ public class PromotionService {
     }
 
     return tasks;
+  }
+
+  /**
+   * Extract the promoted path from a PromotionTaskResult.
+   * Priority:
+   * 1. Use requestedPath if available (original path clicked by user)
+   * 2. Fallback to first item's path
+   * Returns empty string if no path is available.
+   */
+  private String extractPromotedPath(final PromotionTaskResult result) {
+    // First priority: use the original requested path
+    if (result.getRequestedPath() != null && !result.getRequestedPath().isEmpty()) {
+      return result.getRequestedPath();
+    }
+    
+    // Fallback: use the first item's path
+    if (result.getItems() != null && !result.getItems().isEmpty()) {
+      String firstPath = result.getItems().get(0).getPath();
+      if (firstPath != null && !firstPath.isEmpty()) {
+        return firstPath;
+      }
+    }
+    return "";
   }
 
   /**

@@ -765,6 +765,10 @@ public class SyncService {
           String localMd5 = localMd5Map.get(assetPath);
           detail.setLocalMd5(localMd5);
 
+          log.debug("Incremental sync comparing {}: remoteMD5={}, localMD5={}", assetPath, 
+              remoteMd5 != null ? remoteMd5.substring(0, 8) + "..." : "null", 
+              localMd5 != null ? localMd5.substring(0, 8) + "..." : "null");
+
           if (localMd5 != null && remoteMd5 != null && localMd5.equalsIgnoreCase(remoteMd5)) {
             // MD5 matches - skip this asset
             detail.setStatus("skipped");
@@ -774,11 +778,15 @@ public class SyncService {
           else {
             // MD5 mismatch or local asset missing - sync this asset
             if (localMd5 == null) {
-              log.debug("Incremental sync: syncing {} (not in local cache)", assetPath);
+              log.info("Incremental sync: syncing {} (not in local cache, remoteMD5={})", assetPath, 
+                  remoteMd5 != null ? remoteMd5.substring(0, 8) + "..." : "null");
+            }
+            else if (remoteMd5 == null) {
+              log.info("Incremental sync: syncing {} (remote MD5 not available, cannot compare)", assetPath);
             }
             else {
-              log.debug("Incremental sync: syncing {} (MD5 mismatch: local={}, remote={})",
-                  assetPath, localMd5, remoteMd5);
+              log.info("Incremental sync: syncing {} (MD5 mismatch: local={}, remote={})",
+                  assetPath, localMd5.substring(0, 8) + "...", remoteMd5.substring(0, 8) + "...");
             }
 
             RetryableOperation.executeRun("incremental sync asset " + assetPath,
@@ -2328,69 +2336,73 @@ public class SyncService {
   }
 
   /**
-   * Recursively list all remote assets via HTTP directory listing.
-   * Used for full-repository sync when the remote is not a local Nexus repo.
-   * Crawls subdirectories recursively to find all files.
+   * Iteratively list all remote assets via HTTP directory listing.
+   * Uses a queue instead of recursion to avoid StackOverflowError on deep directory trees.
    */
-  private List<String> listRemoteAssetsViaHttpRecursive(final String currentPath,
+  private List<String> listRemoteAssetsViaHttpRecursive(final String startPath,
       final String remoteUrl, final String authUsername, final String authPassword) {
     List<String> allAssets = new ArrayList<>();
+    java.util.Queue<String> dirQueue = new java.util.LinkedList<>();
+    dirQueue.add(startPath);
 
-    try {
-      String dirUrl = remoteUrl + currentPath;
-      if (!dirUrl.endsWith("/")) {
-        dirUrl += "/";
-      }
+    Pattern linkPattern = Pattern.compile(
+        "<a[^>]+href\\s*=\\s*[\"'](?!(?:mailto:|javascript:|\\?|/|#))([^\"']+)[\"']",
+        Pattern.CASE_INSENSITIVE);
 
-      HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
-      SslHelper.applyTrustAllSsl(conn);
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(15_000);
-      conn.setReadTimeout(30_000);
-      conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
+    while (!dirQueue.isEmpty()) {
+      String currentPath = dirQueue.poll();
 
-      if (authUsername != null && authPassword != null) {
-        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
-      }
-
-      if (conn.getResponseCode() != 200) {
-        conn.disconnect();
-        return allAssets;
-      }
-
-      String html = readResponse(conn);
-
-      Pattern linkPattern = Pattern.compile(
-          "<a[^>]+href\\s*=\\s*[\"'](?!(?:mailto:|javascript:|\\?|/|#))([^\"']+)[\"']",
-          Pattern.CASE_INSENSITIVE);
-      Matcher matcher = linkPattern.matcher(html);
-
-      while (matcher.find()) {
-        String href = matcher.group(1);
-        if (href.startsWith("./")) {
-          href = href.substring(2);
+      try {
+        String dirUrl = remoteUrl + currentPath;
+        if (!dirUrl.endsWith("/")) {
+          dirUrl += "/";
         }
-        if (href.equals("../") || href.equals("/") || href.equals(".")) {
-          continue;
+
+        HttpURLConnection conn = (HttpURLConnection) new URL(dirUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
+        conn.setRequestMethod("GET");
+        conn.setConnectTimeout(15_000);
+        conn.setReadTimeout(30_000);
+        conn.setRequestProperty("Accept", "text/html,application/xhtml+xml,*/*");
+
+        if (authUsername != null && authPassword != null) {
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
         }
-        if (href.contains("?") || href.contains("#")) {
+
+        if (conn.getResponseCode() != 200) {
+          conn.disconnect();
           continue;
         }
 
-        String assetPath = currentPath + (currentPath.endsWith("/") || currentPath.isEmpty() ? "" : "/") + href;
+        String html = readResponse(conn);
+        Matcher matcher = linkPattern.matcher(html);
 
-        if (href.endsWith("/")) {
-          // Subdirectory — recurse into it
-          List<String> subAssets = listRemoteAssetsViaHttpRecursive(assetPath, remoteUrl, authUsername, authPassword);
-          allAssets.addAll(subAssets);
-        }
-        else {
-          allAssets.add(assetPath);
+        while (matcher.find()) {
+          String href = matcher.group(1);
+          if (href.startsWith("./")) {
+            href = href.substring(2);
+          }
+          if (href.equals("../") || href.equals("/") || href.equals(".")) {
+            continue;
+          }
+          if (href.contains("?") || href.contains("#")) {
+            continue;
+          }
+
+          String assetPath = currentPath + (currentPath.endsWith("/") || currentPath.isEmpty() ? "" : "/") + href;
+
+          if (href.endsWith("/")) {
+            // Subdirectory — enqueue for later processing
+            dirQueue.add(assetPath);
+          }
+          else {
+            allAssets.add(assetPath);
+          }
         }
       }
-    }
-    catch (Exception e) {
-      log.warn("Failed to list remote directory via HTTP for {}: {}", currentPath, e.getMessage());
+      catch (Exception e) {
+        log.warn("Failed to list remote directory via HTTP for {}: {}", currentPath, e.getMessage());
+      }
     }
 
     return allAssets;
@@ -2755,23 +2767,9 @@ public class SyncService {
       String[] repoAuth = extractAuthFromRepo(repo);
       String normalizedPath = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
 
-      // Strategy A: Try listRemoteAssetsWithMd5 (same method used by directory sync, proven to work)
-      // Extract the directory path from the asset path
-      String dirPath = "";
-      int lastSlash = normalizedPath.lastIndexOf('/');
-      if (lastSlash > 0) {
-        dirPath = normalizedPath.substring(0, lastSlash);
-      }
-      Map<String, String> md5Map = listRemoteAssetsWithMd5(repo, dirPath);
-      if (md5Map != null && md5Map.containsKey(normalizedPath)) {
-        String md5 = md5Map.get(normalizedPath);
-        if (md5 != null) {
-          log.debug("getRemoteAssetMd5: got MD5 {} for {}/{} via listRemoteAssetsWithMd5", md5, repo.getName(), assetPath);
-          return md5;
-        }
-      }
-
-      // Strategy B: Check if remote URL points to a Nexus instance, use Search API
+      // Strategy A: Check if remote URL points to a Nexus instance, use Search API
+      // NOTE: Do NOT call listRemoteAssetsWithMd5 here — it would cause infinite recursion
+      // (listRemoteAssetsWithMd5 Strategy 3 → getRemoteAssetMd5 → listRemoteAssetsWithMd5 → ...)
       String remoteRepoName = extractRepoNameFromUrl(remoteUrl);
       if (remoteRepoName != null) {
         String nexusBaseUrl = remoteUrl.substring(0, remoteUrl.indexOf("/repository/"));
@@ -2786,12 +2784,13 @@ public class SyncService {
 
       // Fallback for non-Nexus remotes or when Search API fails:
       // Try HTTP HEAD request to get Content-MD5 header or ETag
+      log.debug("getRemoteAssetMd5: trying HTTP HEAD for {}/{}", repo.getName(), assetPath);
       String headMd5 = getRemoteMd5ViaHttpHead(remoteUrl, assetPath, repoAuth);
       if (headMd5 != null) {
         log.debug("getRemoteAssetMd5: got MD5 {} for {}/{} via HTTP HEAD", headMd5, repo.getName(), assetPath);
       }
       else {
-        log.debug("getRemoteAssetMd5: all methods failed for {}/{}", repo.getName(), assetPath);
+        log.warn("getRemoteAssetMd5: all methods failed for {}/{} - will sync regardless of local cache", repo.getName(), assetPath);
       }
       return headMd5;
     }
