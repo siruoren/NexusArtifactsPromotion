@@ -311,12 +311,18 @@ public class TaskExecutorService {
       finally {
         currentThread.setName(originalName);
 
-        // Update task status
+        // Update task status - only set to COMPLETED if still RUNNING
+        // (cancelTask may have already set it to CANCELLED)
         TaskHandle handle = "promotion".equals(type)
             ? promotionTasks.get(taskId)
             : syncTasks.get(taskId);
         if (handle != null && handle.status == TaskStatus.RUNNING) {
-          handle.status = TaskStatus.COMPLETED;
+          // Check if the task was actually cancelled/interrupted
+          if (Thread.currentThread().isInterrupted()) {
+            handle.status = TaskStatus.CANCELLED;
+          } else {
+            handle.status = TaskStatus.COMPLETED;
+          }
           handle.endTime = System.currentTimeMillis();
         }
 
@@ -341,9 +347,12 @@ public class TaskExecutorService {
         handle.future.get();
         handle.status = TaskStatus.COMPLETED;
       }
-      catch (Exception e) {
-        // Cancellation means the task was terminated, not failed
+      catch (java.util.concurrent.CancellationException e) {
         handle.status = TaskStatus.CANCELLED;
+      }
+      catch (Exception e) {
+        // ExecutionException means the task failed; only CancellationException means cancelled
+        handle.status = TaskStatus.FAILED;
       }
     }
     return handle.status;
@@ -362,9 +371,12 @@ public class TaskExecutorService {
         handle.future.get();
         handle.status = TaskStatus.COMPLETED;
       }
-      catch (Exception e) {
-        // Cancellation means the task was terminated, not failed
+      catch (java.util.concurrent.CancellationException e) {
         handle.status = TaskStatus.CANCELLED;
+      }
+      catch (Exception e) {
+        // ExecutionException means the task failed; only CancellationException means cancelled
+        handle.status = TaskStatus.FAILED;
       }
     }
     return handle.status;

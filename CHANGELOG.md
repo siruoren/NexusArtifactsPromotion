@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] - 2026-06-20
+
+### Fixed
+
+- **SSL Certificate Validation (HIGH)**: removed JVM-global `setDefaultSSLSocketFactory()` / `setDefaultHostnameVerifier()` calls that disabled SSL certificate verification for the entire Nexus process
+  - Previous: `DockerService`, `PromotionService`, `SyncService` each had `static {}` blocks calling `HttpsURLConnection.setDefaultSSLSocketFactory(trustAll)` and `setDefaultHostnameVerifier((h, s) -> true)`, which disabled certificate validation for ALL HTTPS connections in the JVM (including Nexus core and other plugins)
+  - Fix: created `SslHelper` utility class with `applyTrustAllSsl(HttpURLConnection conn)` that applies trust-all SSL only to individual connections via `conn.setSSLSocketFactory()` / `conn.setHostnameVerifier()`, without affecting JVM-global defaults
+  - All `openConnection()` calls in `DockerService`, `PromotionService`, `SyncService`, and `HttpClientPool` now call `SslHelper.applyTrustAllSsl(conn)` after opening the connection
+  - Compliance: satisfies GB/T 22239-2019 §8.1.3.4 (communication integrity/confidentiality) and ISO 27001 Annex A.10.1.1 (encryption controls)
+- **SSRF via X-Forwarded-Host (HIGH)**: removed `X-Forwarded-Host` header usage in `extractNexusBaseUrl()` that allowed attackers to control server-side request targets
+  - Previous: `PromotionResource.extractNexusBaseUrl()` and `DockerResource.extractNexusBaseUrl()` read `X-Forwarded-Host` header to construct internal API URLs, allowing attackers to redirect requests to arbitrary servers (Cookie + CSRF token leakage)
+  - Fix: host is now derived from `request.getServerName()` + `request.getServerPort()` only; `X-Forwarded-Proto` is still allowed (affects scheme only, http vs https); added `isLocalHost()` validation that restricts hosts to `localhost` / `127.0.0.1` / `[::1]`
+  - Compliance: satisfies GB/T 22239-2019 §8.1.3.3 (access control) and ISO 27001 Annex A.9.4.2 (secure logon procedures)
+
 ## [2.0.0] - 2026-06-18
 
 ### Added

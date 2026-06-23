@@ -6,8 +6,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -20,10 +18,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,31 +69,6 @@ public class DockerService {
 
   private static final Logger log = LoggerFactory.getLogger(DockerService.class);
 
-  /**
-   * Trust-all-SSL manager for self-signed certificates.
-   * Ensures HTTPS connections to remote storage with self-signed certs work correctly.
-   */
-  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
-      new X509TrustManager() {
-        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-      }
-  };
-
-  static {
-    try {
-      SSLContext sc = SSLContext.getInstance("TLS");
-      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
-      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
-      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
-      log.info("DockerService SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
-    }
-    catch (Exception e) {
-      log.warn("Failed to initialize SSL trust manager for DockerService: {}", e.getMessage(), e);
-    }
-  }
-
   /** Connection/read timeout in milliseconds */
   private static final int TIMEOUT_MS = 300_000;
 
@@ -129,14 +98,14 @@ public class DockerService {
     // Try HTTPS first
     if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
       cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
-      log.info("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
+      log.debug("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
       return cachedLocalNexusBase;
     }
 
     // Fall back to HTTP
     if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
       cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-      log.info("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
+      log.debug("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
       return cachedLocalNexusBase;
     }
 
@@ -153,6 +122,7 @@ public class DockerService {
     try {
       URL url = new URL(baseUrl + "/service/rest/v1/status");
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(3000);
       conn.setReadTimeout(3000);
@@ -234,7 +204,7 @@ public class DockerService {
       }
     }
     this.dockerReleaseRepos = newRepos;
-    log.info("Docker release repositories updated: {}", newRepos);
+    log.debug("Docker release repositories updated: {}", newRepos);
   }
 
   /**
@@ -260,7 +230,7 @@ public class DockerService {
       }
     }
     this.dockerReleaseProxyRepos = newRepos;
-    log.info("Docker release proxy repositories updated: {}", newRepos);
+    log.debug("Docker release proxy repositories updated: {}", newRepos);
   }
 
   /**
@@ -342,7 +312,7 @@ public class DockerService {
         }
       }
       catch (Exception e) {
-        log.info("Remote Nexus API listing failed for Docker images in {}: {}", repositoryName, e.getMessage());
+        log.debug("Remote Nexus API listing failed for Docker images in {}: {}", repositoryName, e.getMessage());
       }
     }
 
@@ -368,6 +338,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -376,7 +347,7 @@ public class DockerService {
 
         int code = conn.getResponseCode();
         if (code != 200) {
-          log.info("Local Components API returned HTTP {} for {}", code, url);
+          log.debug("Local Components API returned HTTP {} for {}", code, url);
           conn.disconnect();
           break;
         }
@@ -388,7 +359,7 @@ public class DockerService {
       while (continuationToken != null && !continuationToken.isEmpty());
     }
     catch (Exception e) {
-      log.info("Local REST API listing failed for Docker images: {}", e.getMessage());
+      log.debug("Local REST API listing failed for Docker images: {}", e.getMessage());
     }
     return imageMap;
   }
@@ -424,7 +395,7 @@ public class DockerService {
       String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
           ? repoAuth[0] + ":" + repoAuth[1] : null;
 
-      log.info("Trying remote Nexus API for Docker images: baseUrl={}, repo={}, auth={}",
+      log.debug("Trying remote Nexus API for Docker images: baseUrl={}, repo={}, auth={}",
           remoteBaseUrl, remoteRepoName, effectiveAuth != null ? "yes" : "none");
 
       // Use Search API with docker format filter
@@ -439,6 +410,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -449,7 +421,7 @@ public class DockerService {
         }
 
         int code = conn.getResponseCode();
-        log.info("Remote Nexus Search API response: HTTP {} for Docker images", code);
+        log.debug("Remote Nexus Search API response: HTTP {} for Docker images", code);
 
         if (code != 200) {
           conn.disconnect();
@@ -463,7 +435,7 @@ public class DockerService {
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
-      log.info("Remote Nexus Search API found {} Docker images", imageMap.size());
+      log.debug("Remote Nexus Search API found {} Docker images", imageMap.size());
 
       // If Search API found nothing, try Components API
       if (imageMap.isEmpty()) {
@@ -471,7 +443,7 @@ public class DockerService {
       }
     }
     catch (Exception e) {
-      log.info("Remote Nexus API failed for Docker images: {}", e.getMessage());
+      log.debug("Remote Nexus API failed for Docker images: {}", e.getMessage());
     }
     return imageMap;
   }
@@ -493,6 +465,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(compUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -503,7 +476,7 @@ public class DockerService {
         }
 
         int code = conn.getResponseCode();
-        log.info("Remote Nexus Components API response: HTTP {} for Docker images", code);
+        log.debug("Remote Nexus Components API response: HTTP {} for Docker images", code);
         if (code != 200) {
           conn.disconnect();
           break;
@@ -515,10 +488,10 @@ public class DockerService {
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
-      log.info("Remote Nexus Components API found {} Docker images", imageMap.size());
+      log.debug("Remote Nexus Components API found {} Docker images", imageMap.size());
     }
     catch (Exception e) {
-      log.info("Remote Nexus Components API failed for Docker images: {}", e.getMessage());
+      log.debug("Remote Nexus Components API failed for Docker images: {}", e.getMessage());
     }
     return imageMap;
   }
@@ -567,7 +540,7 @@ public class DockerService {
       }
     }
     catch (Exception e) {
-      log.info("Failed to parse Docker Search API assets: {}", e.getMessage());
+      log.debug("Failed to parse Docker Search API assets: {}", e.getMessage());
     }
   }
 
@@ -631,7 +604,7 @@ public class DockerService {
           }
         }
         catch (Exception e) {
-          log.info("Remote API listing failed for prefix search in {}: {}", repositoryName, e.getMessage());
+          log.debug("Remote API listing failed for prefix search in {}: {}", repositoryName, e.getMessage());
         }
       }
 
@@ -649,7 +622,7 @@ public class DockerService {
           }
         }
       }
-      log.info("listDockerImagesByPrefix: found {} images matching prefix '{}' in {}",
+      log.debug("listDockerImagesByPrefix: found {} images matching prefix '{}' in {}",
           result.size(), prefix, repositoryName);
     }
     catch (Exception e) {
@@ -672,7 +645,7 @@ public class DockerService {
         try {
           List<String> registryTags = listDockerTagsViaRegistryApi(repo, imageName);
           if (!registryTags.isEmpty()) {
-            log.info("Found {} tags for image {} via Docker Registry V2 API", registryTags.size(), imageName);
+            log.debug("Found {} tags for image {} via Docker Registry V2 API", registryTags.size(), imageName);
             return registryTags;
           }
         }
@@ -746,6 +719,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -764,7 +738,7 @@ public class DockerService {
       while (continuationToken != null && !continuationToken.isEmpty());
     }
     catch (Exception e) {
-      log.info("Local REST API listing failed for Docker tags: {}", e.getMessage());
+      log.debug("Local REST API listing failed for Docker tags: {}", e.getMessage());
     }
     return tags;
   }
@@ -803,6 +777,7 @@ public class DockerService {
       try {
         String tagsUrl = remoteUrl + (remoteUrl.endsWith("/") ? "" : "/") + "v2/" + imageName + "/tags/list";
         HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(30_000);
@@ -817,7 +792,7 @@ public class DockerService {
           String json = readResponse(conn);
           tags = parseDockerTagsList(json);
           if (!tags.isEmpty()) {
-            log.info("Found {} tags for image {} via Docker Registry V2 API", tags.size(), imageName);
+            log.debug("Found {} tags for image {} via Docker Registry V2 API", tags.size(), imageName);
             return tags;
           }
         }
@@ -839,6 +814,7 @@ public class DockerService {
         }
 
         HttpURLConnection conn = (HttpURLConnection) new URL(searchUrl).openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
@@ -860,10 +836,10 @@ public class DockerService {
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
-      log.info("Remote Nexus API found {} tags for image {}", tags.size(), imageName);
+      log.debug("Remote Nexus API found {} tags for image {}", tags.size(), imageName);
     }
     catch (Exception e) {
-      log.info("Remote API listing failed for Docker tags: {}", e.getMessage());
+      log.debug("Remote API listing failed for Docker tags: {}", e.getMessage());
     }
     return tags;
   }
@@ -904,7 +880,7 @@ public class DockerService {
       }
     }
     catch (Exception e) {
-      log.info("Failed to parse Docker tags from Search API: {}", e.getMessage());
+      log.debug("Failed to parse Docker tags from Search API: {}", e.getMessage());
     }
   }
 
@@ -962,7 +938,7 @@ public class DockerService {
             // Directory level: promote all images and all tags
             DockerImageListResponse imageList = listDockerImages(request.getSourceRepository());
             List<DockerImageInfo> images = imageList.getImages();
-            log.info("Docker promotion (all images): found {} images in {}", images.size(), request.getSourceRepository());
+            log.debug("Docker promotion (all images): found {} images in {}", images.size(), request.getSourceRepository());
 
             if (images.isEmpty()) {
               throw new IOException("No Docker images found in repository " + request.getSourceRepository());
@@ -1016,7 +992,7 @@ public class DockerService {
             List<String> tags = request.getTags();
             if (request.isAllTags()) {
               tags = listDockerTags(request.getSourceRepository(), request.getImage());
-              log.info("Docker promotion: found {} tags for image {} in {}", tags.size(), request.getImage(), request.getSourceRepository());
+              log.debug("Docker promotion: found {} tags for image {} in {}", tags.size(), request.getImage(), request.getSourceRepository());
             }
 
             // Filter tags if target repository is a release repository
@@ -1028,7 +1004,7 @@ public class DockerService {
                   tags.add(tag);
                 }
                 else {
-                  log.info("Docker promotion: skipping non-release tag {} for release repository {}", tag, request.getTargetRepository());
+                  log.debug("Docker promotion: skipping non-release tag {} for release repository {}", tag, request.getTargetRepository());
                   String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
                   PromotionTaskResult.FileItem skippedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
                   skippedItem.setStatus("skipped");
@@ -1036,7 +1012,7 @@ public class DockerService {
                   promotedItems.add(skippedItem);
                 }
               }
-              log.info("Docker promotion: filtered {} tags to {} release tags for release repository {}",
+              log.debug("Docker promotion: filtered {} tags to {} release tags for release repository {}",
                   originalTags.size(), tags.size(), request.getTargetRepository());
             }
 
@@ -1070,7 +1046,7 @@ public class DockerService {
 
           long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
           long promotedCount = promotedItems.size() - skippedCount;
-          log.info("Docker promotion task {} completed: {} items promoted, {} skipped, image={}",
+          log.debug("Docker promotion task {} completed: {} items promoted, {} skipped, image={}",
               taskId, promotedCount, skippedCount, request.getImage());
         }
         catch (Exception e) {
@@ -1118,7 +1094,7 @@ public class DockerService {
     List<PromotionTaskResult.FileItem> items = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
 
-    log.info("[DOCKER-PROMO] Promoting {}:{} (manifest path: {})", image, tag, manifestPath);
+    log.debug("[DOCKER-PROMO] Promoting {}:{} (manifest path: {})", image, tag, manifestPath);
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity for promotion
     try {
@@ -1146,7 +1122,7 @@ public class DockerService {
 
           if (parsed.isFatManifest()) {
             // Fat Manifest (multi-arch): promote each platform sub-manifest and its blobs
-            log.info("[DOCKER-PROMO] {}:{} is a fat manifest with {} platform references",
+            log.debug("[DOCKER-PROMO] {}:{} is a fat manifest with {} platform references",
                 image, tag, parsed.getManifestReferences().size());
 
             for (DockerManifestParser.ManifestReference ref : parsed.getManifestReferences()) {
@@ -1174,7 +1150,7 @@ public class DockerService {
               image, tag, e.getMessage());
           // Fallback to legacy parser
           Set<String> blobDigests = parseManifestBlobs(manifestContent);
-          log.info("[DOCKER-PROMO] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
+          log.debug("[DOCKER-PROMO] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
           for (String digest : blobDigests) {
             String blobPath = "v2/" + image + "/blobs/" + digest;
             try {
@@ -1229,7 +1205,7 @@ public class DockerService {
       final List<PromotionTaskResult.FileItem> items) {
 
     Set<String> blobDigests = parsed.getAllBlobDigests();
-    log.info("[DOCKER-PROMO] Promoting {} blobs for image {}", blobDigests.size(), image);
+    log.debug("[DOCKER-PROMO] Promoting {} blobs for image {}", blobDigests.size(), image);
 
     for (String digest : blobDigests) {
       String blobPath = "v2/" + image + "/blobs/" + digest;
@@ -1261,7 +1237,7 @@ public class DockerService {
       final List<PromotionTaskResult.FileItem> items) throws IOException {
 
     String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
-    log.info("[DOCKER-PROMO] Promoting sub-manifest {} for platform {}", ref.getDigest(), ref);
+    log.debug("[DOCKER-PROMO] Promoting sub-manifest {} for platform {}", ref.getDigest(), ref);
 
     // Download sub-manifest from source (using connection pool)
     String subManifestUrl = nexusBaseUrl + "/repository/" + sourceRepo + "/" + subManifestPath;
@@ -1533,13 +1509,13 @@ public class DockerService {
                 if (prefixImages.size() == 1 && prefixImages.containsKey(normalizedPath)) {
                   // Only one match and it's the exact path -> single image with tags
                   imageFilter = normalizedPath;
-                  log.info("Parsed Docker scheduled path '{}' as image='{}' (found {} tags), will sync all tags from remote",
+                  log.debug("Parsed Docker scheduled path '{}' as image='{}' (found {} tags), will sync all tags from remote",
                       normalizedPath, imageFilter, prefixImages.get(normalizedPath).size());
                 }
                 else {
                   // Multiple sub-images or the path is a directory prefix
                   prefixFilter = normalizedPath;
-                  log.info("Parsed Docker scheduled path '{}' as directory prefix (found {} images), will sync all from remote",
+                  log.debug("Parsed Docker scheduled path '{}' as directory prefix (found {} images), will sync all from remote",
                       normalizedPath, prefixImages.size());
                 }
               }
@@ -1547,14 +1523,14 @@ public class DockerService {
                 // No images found for the full path - try splitting as image:tag
                 imageFilter = normalizedPath.substring(0, lastSlash);
                 tagFilter = normalizedPath.substring(lastSlash + 1);
-                log.info("Parsed Docker scheduled path '{}' as image='{}', tag='{}' (no images found for full path)",
+                log.debug("Parsed Docker scheduled path '{}' as image='{}', tag='{}' (no images found for full path)",
                     normalizedPath, imageFilter, tagFilter);
               }
             }
             else {
               // No slash - just an image name, sync all tags
               imageFilter = normalizedPath;
-              log.info("Parsed Docker scheduled path '{}' as image name, will sync all tags from remote", normalizedPath);
+              log.debug("Parsed Docker scheduled path '{}' as image name, will sync all tags from remote", normalizedPath);
             }
           }
         }
@@ -1568,14 +1544,14 @@ public class DockerService {
         List<String> tags = new ArrayList<>();
         tags.add(tagFilter);
         imageTagsMap.put(imageFilter, tags);
-        log.info("Docker scheduled sync: specific image:tag {}:{} in {}", imageFilter, tagFilter, repoName);
+        log.debug("Docker scheduled sync: specific image:tag {}:{} in {}", imageFilter, tagFilter, repoName);
       }
       else if (prefixFilter != null) {
         // Directory prefix mode: list all images under the prefix
         // Uses the same image discovery logic as promotion (listDockerImages + prefix filtering)
         Map<String, List<String>> prefixImages = listDockerImagesByPrefix(repoName, prefixFilter);
         imageTagsMap.putAll(prefixImages);
-        log.info("Docker scheduled sync: found {} images under prefix '{}' in {}", imageTagsMap.size(), prefixFilter, repoName);
+        log.debug("Docker scheduled sync: found {} images under prefix '{}' in {}", imageTagsMap.size(), prefixFilter, repoName);
       }
       else if (imageFilter != null) {
         // Specific image requested - list tags using remote API first
@@ -1583,7 +1559,7 @@ public class DockerService {
         if (!tags.isEmpty()) {
           imageTagsMap.put(imageFilter, tags);
         }
-        log.info("Docker scheduled sync: found {} tags for image {} from remote {}", tags.size(), imageFilter, repoName);
+        log.debug("Docker scheduled sync: found {} tags for image {} from remote {}", tags.size(), imageFilter, repoName);
       }
       else {
         // Full sync: list all images using remote API first
@@ -1599,7 +1575,7 @@ public class DockerService {
             imageTagsMap.put(img.getName(), tags);
           }
         }
-        log.info("Docker scheduled sync: found {} images in {} (full sync)", imageTagsMap.size(), repoName);
+        log.debug("Docker scheduled sync: found {} images in {} (full sync)", imageTagsMap.size(), repoName);
       }
 
       if (imageTagsMap.isEmpty()) {
@@ -1619,6 +1595,12 @@ public class DockerService {
 
       // Step 3: Sync each image:tag
       for (Map.Entry<String, List<String>> entry : imageTagsMap.entrySet()) {
+        // Check for task cancellation/interruption
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("Docker scheduled sync task interrupted, stopping sync for {}", repoName);
+          throw new InterruptedException("Task cancelled during Docker sync");
+        }
+
         String imageName = entry.getKey();
         List<String> tags = entry.getValue();
 
@@ -1640,6 +1622,11 @@ public class DockerService {
         }
 
         for (String tag : tags) {
+          // Check for task cancellation/interruption before each tag
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Docker scheduled sync task interrupted, stopping sync for {}:{}", repoName, imageName);
+            throw new InterruptedException("Task cancelled during Docker sync");
+          }
           try {
             List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
             syncedFiles.addAll(tagFiles);
@@ -1670,10 +1657,13 @@ public class DockerService {
           syncedCount, skippedCount, failedCount, repoName);
     }
     catch (Exception e) {
-      log.error("Docker scheduled sync task failed: {}", e.getMessage(), e);
       boolean isCancelled = Thread.currentThread().isInterrupted()
           || (e instanceof InterruptedException)
           || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+      if (isCancelled) {
+        Thread.currentThread().interrupt();
+      }
+      log.error(isCancelled ? "Docker scheduled sync task cancelled: {}" : "Docker scheduled sync task failed: {}", e.getMessage(), isCancelled ? null : e);
       taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
       taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
@@ -1697,6 +1687,23 @@ public class DockerService {
     final SubjectThreadState threadState = (subject != null && subject.isAuthenticated())
         ? new SubjectThreadState(subject) : null;
     final String preTaskId = "docker-sync-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
+
+    // Create initial task info record before submitting task
+    // This ensures the task appears in the queue immediately
+    SyncTaskInfo initialInfo = new SyncTaskInfo();
+    initialInfo.setTaskId(preTaskId);
+    initialInfo.setSourceRepository(request.getSourceRepository());
+    initialInfo.setTargetRepository(request.getSourceRepository()); // proxy syncs to itself
+    initialInfo.setPath(request.isAllImages() ? "v2/" :
+        (request.isPrefixMode() ? "v2/" + request.getImagePrefix() : "v2/" + request.getImage()));
+    initialInfo.setDirectory(request.isAllImages() || request.isPrefixMode());
+    initialInfo.setFormat(request.getFormat());
+    initialInfo.setUsername(username);
+    initialInfo.setStatus(TaskStatus.PENDING);
+    initialInfo.setStartTime(System.currentTimeMillis());
+    syncTaskInfos.put(preTaskId, initialInfo);
+
+    log.info("Docker sync task {} created for {} by {}", preTaskId, request.getSourceRepository(), username);
 
     return taskExecutor.submitSyncTask(() -> {
       if (threadState != null) { threadState.bind(); }
@@ -1739,6 +1746,12 @@ public class DockerService {
             boolean isReleaseProxy = isDockerReleaseProxyRepo(request.getSourceRepository());
 
             for (DockerImageInfo img : images) {
+              // Check for task cancellation/interruption
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Docker sync task interrupted, stopping sync for {}", request.getSourceRepository());
+                throw new InterruptedException("Task cancelled during Docker sync");
+              }
+
               String imageName = img.getName();
               // Always list tags from remote first for sync operations
               List<String> tags = listDockerTagsRemote(repo, imageName);
@@ -1764,6 +1777,11 @@ public class DockerService {
               }
 
               for (String tag : tags) {
+                // Check for task cancellation/interruption
+                if (Thread.currentThread().isInterrupted()) {
+                  log.warn("Docker sync task interrupted, stopping sync for {}:{}", request.getSourceRepository(), imageName);
+                  throw new InterruptedException("Task cancelled during Docker sync");
+                }
                 try {
                   List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
                   syncedFiles.addAll(tagFiles);
@@ -1793,6 +1811,12 @@ public class DockerService {
             boolean isReleaseProxy = isDockerReleaseProxyRepo(request.getSourceRepository());
 
             for (Map.Entry<String, List<String>> entry : prefixImages.entrySet()) {
+              // Check for task cancellation/interruption
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Docker sync task interrupted, stopping prefix sync for {}", request.getSourceRepository());
+                throw new InterruptedException("Task cancelled during Docker sync");
+              }
+
               String imageName = entry.getKey();
               List<String> tags = entry.getValue();
 
@@ -1819,6 +1843,11 @@ public class DockerService {
               }
 
               for (String tag : tags) {
+                // Check for task cancellation/interruption
+                if (Thread.currentThread().isInterrupted()) {
+                  log.warn("Docker sync task interrupted, stopping prefix sync for {}:{}", request.getSourceRepository(), imageName);
+                  throw new InterruptedException("Task cancelled during Docker sync");
+                }
                 try {
                   List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
                   syncedFiles.addAll(tagFiles);
@@ -1865,6 +1894,11 @@ public class DockerService {
             }
 
             for (String tag : tags) {
+              // Check for task cancellation/interruption
+              if (Thread.currentThread().isInterrupted()) {
+                log.warn("Docker sync task interrupted, stopping sync for {}:{}", request.getSourceRepository(), request.getImage());
+                throw new InterruptedException("Task cancelled during Docker sync");
+              }
               try {
                 List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, request.getImage(), tag);
                 syncedFiles.addAll(tagFiles);
@@ -1893,10 +1927,13 @@ public class DockerService {
               syncedCount, skippedCount, request.getImage());
         }
         catch (Exception e) {
-          log.error("Docker sync task failed: {}", e.getMessage(), e);
           boolean isCancelled = Thread.currentThread().isInterrupted()
               || (e instanceof InterruptedException)
               || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          if (isCancelled) {
+            Thread.currentThread().interrupt();
+          }
+          log.error(isCancelled ? "Docker sync task cancelled: {}" : "Docker sync task failed: {}", e.getMessage(), isCancelled ? null : e);
           taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
           taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
@@ -1936,7 +1973,7 @@ public class DockerService {
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity
     writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
-      // Step 1: Sync manifest - delete cached, invalidate neg cache, dispatch
+      // Step 1: Sync manifest
       SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath);
       details.add(manifestDetail);
 
@@ -1954,7 +1991,7 @@ public class DockerService {
 
         if (parsed.isFatManifest()) {
           // Fat Manifest (multi-arch): sync each platform sub-manifest and its blobs
-          log.info("[DOCKER-SYNC] {}:{} is a fat manifest with {} platform references",
+          log.debug("[DOCKER-SYNC] {}:{} is a fat manifest with {} platform references",
               image, tag, parsed.getManifestReferences().size());
 
           for (DockerManifestParser.ManifestReference ref : parsed.getManifestReferences()) {
@@ -1990,8 +2027,13 @@ public class DockerService {
             image, tag, e.getMessage());
         // Fallback to legacy parser
         Set<String> blobDigests = parseManifestBlobs(manifestContent);
-        log.info("[DOCKER-SYNC] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
+        log.debug("[DOCKER-SYNC] Manifest for {}:{} references {} blobs (legacy)", image, tag, blobDigests.size());
         for (String digest : blobDigests) {
+          // Check for task cancellation/interruption
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("[DOCKER-SYNC] Task interrupted, stopping legacy blob sync for {}:{}", image, tag);
+            throw new RuntimeException(new InterruptedException("Task cancelled during Docker blob sync"));
+          }
           String blobPath = "v2/" + image + "/blobs/" + digest;
           try {
             SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
@@ -2021,7 +2063,14 @@ public class DockerService {
     log.info("[DOCKER-SYNC] Syncing {} blobs for image {}", blobDigests.size(), image);
 
     for (String digest : blobDigests) {
+      // Check for task cancellation/interruption
+      if (Thread.currentThread().isInterrupted()) {
+        log.warn("[DOCKER-SYNC] Task interrupted, stopping blob sync for image {}", image);
+        throw new RuntimeException(new InterruptedException("Task cancelled during Docker blob sync"));
+      }
+
       String blobPath = "v2/" + image + "/blobs/" + digest;
+
       try {
         SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
         details.add(blobDetail);
@@ -2055,7 +2104,7 @@ public class DockerService {
       Response response = viewFacet.dispatch(request);
 
       if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-        log.debug("Successfully synced Docker asset {} (HTTP {})", assetPath, response.getStatus().getCode());
+        log.info("Successfully synced Docker asset {} (HTTP {})", assetPath, response.getStatus().getCode());
         detail.setStatus("success");
       }
       else {
@@ -2139,6 +2188,7 @@ public class DockerService {
           // Try Docker Registry V2 tags/list API
           String tagsUrl = remoteUrl + "v2/" + imageName + "/tags/list";
           HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+          SslHelper.applyTrustAllSsl(conn);
           conn.setRequestMethod("GET");
           conn.setConnectTimeout(15_000);
           conn.setReadTimeout(30_000);
@@ -2152,18 +2202,18 @@ public class DockerService {
           if (code == 200) {
             String json = readResponse(conn);
             tags = parseDockerTagsList(json);
-            log.info("Found {} tags for image {} via Docker Registry API", tags.size(), imageName);
+            log.debug("Found {} tags for image {} via Docker Registry API", tags.size(), imageName);
             return tags;
           }
           else {
-            log.info("Docker Registry API returned HTTP {} for image {}, trying remote Nexus API", code, imageName);
+            log.debug("Docker Registry API returned HTTP {} for image {}, trying remote Nexus API", code, imageName);
           }
           conn.disconnect();
 
           // Try remote Nexus Search API
           List<String> remoteTags = listDockerTagsViaRemoteApi(repo, imageName);
           if (!remoteTags.isEmpty()) {
-            log.info("Found {} tags for image {} via remote Nexus API", remoteTags.size(), imageName);
+            log.debug("Found {} tags for image {} via remote Nexus API", remoteTags.size(), imageName);
             return remoteTags;
           }
         }
@@ -2174,7 +2224,7 @@ public class DockerService {
     }
 
     // Return empty list - do not fall back to local cache for sync operations
-    log.info("No tags found for image {} from remote, returning empty list (not using local cache)", imageName);
+    log.debug("No tags found for image {} from remote, returning empty list (not using local cache)", imageName);
     return tags;
   }
 
@@ -2208,6 +2258,7 @@ public class DockerService {
       // Try Docker Registry V2 tags/list API
       String tagsUrl = remoteUrl + "v2/" + imageName + "/tags/list";
       HttpURLConnection conn = (HttpURLConnection) new URL(tagsUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("GET");
       conn.setConnectTimeout(15_000);
       conn.setReadTimeout(30_000);
@@ -2222,7 +2273,7 @@ public class DockerService {
         if (code == 200) {
           String json = readResponse(conn);
           tags = parseDockerTagsList(json);
-          log.info("Docker Registry V2 API found {} tags for image {}", tags.size(), imageName);
+          log.debug("Docker Registry V2 API found {} tags for image {}", tags.size(), imageName);
         }
         else {
           log.debug("Docker Registry V2 API returned HTTP {} for image {}", code, imageName);
@@ -2441,7 +2492,7 @@ public class DockerService {
   public void cancelDockerPromotionTask(final String taskId) {
     PromotionTaskResult result = promotionTaskResults.get(taskId);
     if (result != null && !"cancelled".equalsIgnoreCase(result.getStatus())) {
-      log.info("Updating Docker promotion task {} result status from {} to CANCELLED", taskId, result.getStatus());
+      log.debug("Updating Docker promotion task {} result status from {} to CANCELLED", taskId, result.getStatus());
       result.setStatus(TaskStatus.CANCELLED.getValue());
       result.setErrorMessage("Task cancelled");
       result.setEndTime(System.currentTimeMillis());
@@ -3031,5 +3082,86 @@ public class DockerService {
         promotionTaskResults.put(tid, copyPromotionResult(taskResult));
       }
     }
+  }
+
+  /**
+   * Check if a Docker blob is already cached locally with the given digest.
+   * Used for incremental sync to skip already-cached blobs.
+   */
+  private boolean isDockerBlobCached(final Repository repo, final String blobPath, final String digest) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return false;
+
+      // Check by asset name
+      Asset asset = tx.findAssetWithProperty("name", blobPath, bucket);
+      if (asset == null && !blobPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + blobPath, bucket);
+      }
+
+      if (asset != null) {
+        // Verify the blob exists and has content
+        if (asset.requireBlobRef() != null) {
+          Blob blob = tx.requireBlob(asset.requireBlobRef());
+          if (blob != null) {
+            log.debug("Docker blob {} already cached locally", blobPath);
+            return true;
+          }
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to check if Docker blob {} is cached: {}", blobPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Check if a Docker manifest is already cached locally.
+   * Used for incremental sync to skip already-cached manifests.
+   * A manifest is considered cached if the asset exists and has a non-empty blob.
+   */
+  private boolean isDockerManifestCached(final Repository repo, final String manifestPath, final String tag) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return false;
+
+      // Check by asset name
+      Asset asset = tx.findAssetWithProperty("name", manifestPath, bucket);
+      if (asset == null && !manifestPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
+      }
+
+      if (asset != null) {
+        // Verify the blob exists and has content
+        if (asset.requireBlobRef() != null) {
+          Blob blob = tx.requireBlob(asset.requireBlobRef());
+          if (blob != null) {
+            log.debug("Docker manifest {} already cached locally", manifestPath);
+            return true;
+          }
+        }
+      }
+    }
+    catch (Exception e) {
+      log.debug("Failed to check if Docker manifest {} is cached: {}", manifestPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) {
+        try { tx.close(); } catch (Exception ignored) { }
+      }
+    }
+    return false;
   }
 }

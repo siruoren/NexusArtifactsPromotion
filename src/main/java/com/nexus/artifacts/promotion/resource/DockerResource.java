@@ -330,16 +330,61 @@ public class DockerResource implements Resource {
 
   // ==================== Helpers ====================
 
+  /**
+   * Extract Nexus base URL from incoming HTTP request.
+   * Supports reverse proxies (X-Forwarded-Proto only) and HTTPS with self-signed certs.
+   *
+   * <p>Security: X-Forwarded-Host is NOT used for target host determination to prevent
+   * SSRF attacks. Only X-Forwarded-Proto is allowed (affects scheme only, not target host).
+   * The host is always derived from the request's own server info and validated as local.
+   */
   private String extractNexusBaseUrl(final HttpServletRequest request) {
-    String proto = request.getHeader("X-Forwarded-Proto");
-    if (proto == null || proto.isEmpty()) proto = request.getHeader("X-Forwarded-Scheme");
-    if (proto == null || proto.isEmpty()) proto = request.getScheme();
+    // Determine scheme - X-Forwarded-Proto is safe for scheme only (http vs https)
+    String scheme = request.getScheme();
+    String forwardedProto = request.getHeader("X-Forwarded-Proto");
+    if (forwardedProto == null || forwardedProto.isEmpty()) {
+      forwardedProto = request.getHeader("X-Forwarded-Scheme");
+    }
+    if (forwardedProto != null && !forwardedProto.isEmpty()) {
+      String proto = forwardedProto.toLowerCase();
+      if ("https".equals(proto) || "http".equals(proto)) {
+        scheme = proto;
+      }
+    }
 
-    String host = request.getHeader("X-Forwarded-Host");
-    if (host == null || host.isEmpty()) host = request.getHeader("Host");
-    if (host == null || host.isEmpty()) host = request.getServerName() + ":" + request.getServerPort();
+    // Security: use request's own server info for host, NOT X-Forwarded-Host (SSRF risk)
+    String host = request.getServerName();
+    int port = request.getServerPort();
 
-    return proto + "://" + host;
+    // Validate host is local to prevent SSRF
+    if (!isLocalHost(host)) {
+      log.warn("Server host '{}' is not local, using localhost as fallback for internal API calls", host);
+      host = "localhost";
+    }
+
+    // Build URL
+    String baseUrl;
+    if ((scheme.equals("http") && port == 80) || (scheme.equals("https") && port == 443)) {
+      baseUrl = scheme + "://" + host;
+    }
+    else {
+      baseUrl = scheme + "://" + host + ":" + port;
+    }
+
+    log.debug("Extracted Nexus base URL: {}", baseUrl);
+    return baseUrl;
+  }
+
+  /**
+   * Check if a hostname refers to the local machine.
+   * Used to validate that internal API calls only target local addresses.
+   */
+  private boolean isLocalHost(final String host) {
+    if (host == null) return false;
+    return "localhost".equalsIgnoreCase(host)
+        || "127.0.0.1".equals(host)
+        || "[::1]".equals(host)
+        || "0:0:0:0:0:0:0:1".equals(host);
   }
 
   private String jsonEscape(final String input) {

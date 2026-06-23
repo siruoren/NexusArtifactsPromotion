@@ -78,6 +78,12 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
     "sync.button.text": "Sync",
     "sync.button.text.directory": "Sync Directory",
+    "sync.incremental.title": "Sync Mode",
+    "sync.incremental.message": "Choose sync mode for this operation:",
+    "sync.incremental.full": "Full Sync",
+    "sync.incremental.full.desc": "Re-download all files from remote",
+    "sync.incremental.incremental": "Incremental Sync",
+    "sync.incremental.incremental.desc": "Only sync files with different MD5 checksums (skips unchanged files)",
     "sync.permission.denied": "You do not have sync permission for this repository.",
     "sync.permission.denied.admin": "You do not have sync permission. Please contact your administrator.",
     "sync.permission.disabled.tooltip": "You do not have delete permission for this repository. Sync requires delete permission.",
@@ -195,7 +201,7 @@ Ext.define('NX.artifactsPromotion.I18n', {
     "promotion.progress.success": "\u6210\u529f",
     "promotion.progress.failed": "\u5931\u8d25",
     "promotion.progress.cancelled": "\u7ec8\u6b62",
-    "promotion.progress.skipped": "\u672a\u66f4\u65b0",
+    "promotion.progress.skipped": "\u6210\u529f",
     "promotion.result.title.success": "\u664b\u7ea7\u6210\u529f",
     "promotion.result.title.failed": "\u664b\u7ea7\u5931\u8d25",
     "promotion.result.title.cancelled": "\u664b\u7ea7\u7ec8\u6b62",
@@ -214,6 +220,12 @@ Ext.define('NX.artifactsPromotion.I18n', {
 
     "sync.button.text": "\u540c\u6b65",
     "sync.button.text.directory": "\u540c\u6b65\u76ee\u5f55",
+    "sync.incremental.title": "\u540c\u6b65\u6a21\u5f0f",
+    "sync.incremental.message": "\u8bf7\u9009\u62e9\u540c\u6b65\u6a21\u5f0f\uff1a",
+    "sync.incremental.full": "\u5168\u91cf\u540c\u6b65",
+    "sync.incremental.full.desc": "\u91cd\u65b0\u4e0b\u8f7d\u8fdc\u7a0b\u4ed3\u5e93\u7684\u6240\u6709\u6587\u4ef6",
+    "sync.incremental.incremental": "\u589e\u91cf\u540c\u6b65",
+    "sync.incremental.incremental.desc": "\u4ec5\u540c\u6b65MD5\u4e0d\u4e00\u81f4\u7684\u6587\u4ef6\uff08\u8df3\u8fc7\u672a\u53d8\u66f4\u7684\u6587\u4ef6\uff09",
     "sync.permission.denied": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u540c\u6b65\u6743\u9650\u3002",
     "sync.permission.denied.admin": "\u60a8\u6ca1\u6709\u540c\u6b65\u6743\u9650\uff0c\u8bf7\u8054\u7cfb\u7ba1\u7406\u5458\u3002",
     "sync.permission.disabled.tooltip": "\u60a8\u6ca1\u6709\u8be5\u4ed3\u5e93\u7684\u5220\u9664\u6743\u9650\uff0c\u540c\u6b65\u9700\u8981\u5220\u9664\u6743\u9650\u624d\u80fd\u6267\u884c\u3002",
@@ -1315,17 +1327,26 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
     // Quick synchronous check first
     if (me.isProxyRepository(repoName)) {
-      // Always show sync button for proxy repos, check delete permission via API
+      // Always show sync button for proxy repos, check permissions via API
       apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
       .then(function (result) {
         if (panel.destroyed || panel.query('button[cls=sync-btn]').length > 0) return;
+        var hasPermission = result.hasPermission === true;
         var hasDeletePerm = result.hasDeletePermission === true;
-        me.addSyncButton(panel, repoName, path, format, isDirectory, !hasDeletePerm);
+        // Disable if no sync permission; also disable if no delete permission
+        var disabled = !hasPermission || !hasDeletePerm;
+        var tooltip = '';
+        if (!hasPermission) {
+          tooltip = _t('sync.permission.denied');
+        } else if (!hasDeletePerm) {
+          tooltip = _t('sync.permission.disabled.tooltip');
+        }
+        me.addSyncButton(panel, repoName, path, format, isDirectory, disabled, tooltip);
       })
       .catch(function () {
-        // API failed - add button disabled
+        // API failed (not logged in or error) - add disabled button
         if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
-          me.addSyncButton(panel, repoName, path, format, isDirectory, true);
+          me.addSyncButton(panel, repoName, path, format, isDirectory, true, _t('sync.permission.denied.admin'));
         }
       });
       return;
@@ -1338,13 +1359,21 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (isProxy) {
         // Check panel still exists and no sync button already
         if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
+          var hasPermission = result.hasPermission === true;
           var hasDeletePerm = result.hasDeletePermission === true;
-          me.addSyncButton(panel, repoName, path, format, isDirectory, !hasDeletePerm);
+          var disabled = !hasPermission || !hasDeletePerm;
+          var tooltip = '';
+          if (!hasPermission) {
+            tooltip = _t('sync.permission.denied');
+          } else if (!hasDeletePerm) {
+            tooltip = _t('sync.permission.disabled.tooltip');
+          }
+          me.addSyncButton(panel, repoName, path, format, isDirectory, disabled, tooltip);
         }
       }
     })
     .catch(function () {
-      // API failed, don't add sync button
+      // API failed (not logged in or error) - don't add sync button for non-proxy
     });
   },
 
@@ -1360,29 +1389,61 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       btnText = _t('docker.promote.button');
     }
 
-    var btn = Ext.create('Ext.button.Button', {
-      text: btnText,
-      iconCls: 'x-fa fa-arrow-up',
-      cls: 'promotion-btn',
-      handler: function () {
-        me.handlePromotionClick(repoName, path, isDirectory, format);
+    // Check promotion permission via API first
+    apiRequest('GET', '/promotion/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
+    .then(function (result) {
+      var hasPermission = result.hasPermission === true;
+      var btn = Ext.create('Ext.button.Button', {
+        text: btnText,
+        iconCls: 'x-fa fa-arrow-up',
+        cls: 'promotion-btn',
+        disabled: !hasPermission,
+        tooltip: !hasPermission ? _t('promotion.permission.denied') : '',
+        handler: function () {
+          me.handlePromotionClick(repoName, path, isDirectory, format);
+        }
+      });
+
+      if (panel.destroyed) return;
+
+      // Add button to existing nx-actions toolbar (dockedItems)
+      var actions = panel.down('nx-actions');
+      if (actions) {
+        actions.add(btn);
+      } else {
+        panel.addDocked({
+          xtype: 'toolbar',
+          dock: 'top',
+          items: [btn]
+        });
+      }
+    })
+    .catch(function () {
+      // API failed (not logged in or error) - add disabled button
+      if (panel.destroyed) return;
+      var btn = Ext.create('Ext.button.Button', {
+        text: btnText,
+        iconCls: 'x-fa fa-arrow-up',
+        cls: 'promotion-btn',
+        disabled: true,
+        tooltip: _t('promotion.permission.denied.admin'),
+        handler: function () {}
+      });
+
+      var actions = panel.down('nx-actions');
+      if (actions) {
+        actions.add(btn);
+      } else {
+        panel.addDocked({
+          xtype: 'toolbar',
+          dock: 'top',
+          items: [btn]
+        });
       }
     });
-
-    // Add button to existing nx-actions toolbar (dockedItems)
-    var actions = panel.down('nx-actions');
-    if (actions) {
-      actions.add(btn);
-    } else {
-      panel.addDocked({
-        xtype: 'toolbar',
-        dock: 'top',
-        items: [btn]
-      });
-    }
   },
 
-  addSyncButton: function (panel, repoName, path, format, isDirectory, disabled) {
+  addSyncButton: function (panel, repoName, path, format, isDirectory, disabled, tooltip) {
     var me = this;
     if (typeof isDirectory === 'undefined') {
       isDirectory = path && path.endsWith('/');
@@ -1394,12 +1455,13 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       btnText = _t('docker.sync.button');
     }
 
+    var btnTooltip = tooltip || (disabled ? _t('sync.permission.disabled.tooltip') : '');
     var btn = Ext.create('Ext.button.Button', {
       text: btnText,
       iconCls: 'x-fa fa-sync',
       cls: 'sync-btn',
       disabled: !!disabled,
-      tooltip: disabled ? _t('sync.permission.disabled.tooltip') : '',
+      tooltip: btnTooltip,
       handler: function () {
         me.handleSyncClick(repoName, path, isDirectory, format);
       }
@@ -1435,6 +1497,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   },
 
   handleSyncClick: function (repoName, path, isDirectory, format) {
+    var me = this;
+    // Execute sync directly
+    me.executeSync(repoName, path, isDirectory, format);
+  },
+
+  executeSync: function (repoName, path, isDirectory, format) {
     var me = this;
     // Docker format: use the same sync mechanism as other formats
     if (format === 'docker') {
@@ -1669,10 +1737,15 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     });
 
     // Status map to track all file statuses across pages (store.each/findExact only works on current page)
+    // Also used for deduplication
     var statusMap = {};
+    var seenPaths = {};
     if (preview && preview.files) {
       Ext.each(preview.files, function (f) {
-        if (f.path) { statusMap[f.path] = 'pending'; }
+        if (f.path && !seenPaths[f.path]) {
+          seenPaths[f.path] = true;
+          statusMap[f.path] = 'pending';
+        }
       });
     }
 
@@ -1685,8 +1758,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       },
       data: preview && preview.files ? (function () {
         var arr = [];
+        var seen = {};
         Ext.each(preview.files, function (f) {
-          arr.push({ path: f.path, type: f.type, size: f.size, status: 'pending' });
+          if (f.path && !seen[f.path]) {
+            seen[f.path] = true;
+            arr.push({ path: f.path, type: f.type, size: f.size, status: 'pending' });
+          }
         });
         return arr;
       })() : []
@@ -1715,7 +1792,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         case 'cancelled':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
-          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
+          // Display skipped files (MD5 match) as success in UI, but keep backend status unchanged
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         default:
           return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
       }
@@ -2283,7 +2361,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         case 'cancelled':
           return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.cancelled') + '</span>';
         case 'skipped':
-          return '<span style="color:#f0ad4e;font-weight:bold;">' + _t('promotion.progress.skipped') + '</span>';
+          // Display skipped files (MD5 match) as success in UI, but keep backend status unchanged
+          return '<span style="color:#5cb85c;font-weight:bold;">' + _t('promotion.progress.success') + '</span>';
         default:
           return '<span style="color:#999;">' + _t('promotion.progress.pending') + '</span>';
       }

@@ -5,21 +5,17 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
-import java.security.SecureRandom;
-import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.TrustManager;
-import javax.net.ssl.X509TrustManager;
 import javax.ws.rs.core.HttpHeaders;
 
 import org.slf4j.Logger;
@@ -66,31 +62,6 @@ public class PromotionService {
 
   /** Maximum retry attempts for individual file operations */
   private static final int FILE_RETRY_ATTEMPTS = 3;
-
-  /**
-   * Trust-all-SSL manager for self-signed certificates.
-   * Initialized once at class load time.
-   */
-  private static final TrustManager[] TRUST_ALL_CERTS = new TrustManager[]{
-      new X509TrustManager() {
-        public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
-        public void checkClientTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-        public void checkServerTrusted(X509Certificate[] chain, String authType) { /* trust all */ }
-      }
-  };
-
-  static {
-    try {
-      SSLContext sc = SSLContext.getInstance("TLS");
-      sc.init(null, TRUST_ALL_CERTS, new SecureRandom());
-      HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
-      HttpsURLConnection.setDefaultHostnameVerifier((hostname, session) -> true);
-      log.info("SSL context initialized: trusting all certificates (supports self-signed HTTPS)");
-    }
-    catch (Exception e) {
-      log.warn("Failed to initialize SSL trust manager: {}", e.getMessage(), e);
-    }
-  }
 
   private final RepositoryManager repositoryManager;
   private final TaskExecutorService taskExecutor;
@@ -457,8 +428,8 @@ public class PromotionService {
       List<String> assetNames;
 
       if (providedFiles != null && !providedFiles.isEmpty()) {
-        // Use files from frontend preview - filter out any non-file entries
-        assetNames = new ArrayList<>();
+        // Use files from frontend preview - filter out any non-file entries and deduplicate
+        java.util.LinkedHashSet<String> assetSet = new java.util.LinkedHashSet<>();
         for (String f : providedFiles) {
           if (f == null || f.isEmpty()) continue;
           if (f.equals(directoryPath)) {
@@ -469,8 +440,9 @@ public class PromotionService {
             log.warn("Frontend sent directory entry, skipping: {}", f);
             continue;
           }
-          assetNames.add(f);
+          assetSet.add(f);
         }
+        assetNames = new ArrayList<>(assetSet);
         log.info("After filtering providedFiles: {} valid files", assetNames.size());
       } else {
         // No files from frontend - try search API
@@ -919,29 +891,31 @@ public class PromotionService {
    * Tries multiple approaches: search API → components API fallback.
    */
   private List<String> searchAssets(final String repository, final String pathPrefix, final String nexusBaseUrl) throws IOException {
-    List<String> results = new ArrayList<>();
+    java.util.LinkedHashSet<String> resultsSet = new java.util.LinkedHashSet<>();
 
     // Normalize path: strip trailing slash
     String normalizedPrefix = (pathPrefix != null && pathPrefix.endsWith("/"))
         ? pathPrefix.substring(0, pathPrefix.length() - 1) : pathPrefix;
 
     // Approach 0: Internal Java API (most reliable, no auth issues)
-    results = searchAssetsViaInternalApi(repository, normalizedPrefix);
-    if (!results.isEmpty()) {
-      log.debug("Internal API found {} items for {}/{}", results.size(), repository, normalizedPrefix);
-      return results;
+    List<String> internalResults = searchAssetsViaInternalApi(repository, normalizedPrefix);
+    if (!internalResults.isEmpty()) {
+      resultsSet.addAll(internalResults);
+      log.debug("Internal API found {} items for {}/{}", internalResults.size(), repository, normalizedPrefix);
     }
 
     // Approach 1: Search API with wildcard
-    results = trySearchApi(repository, normalizedPrefix, nexusBaseUrl);
+    List<String> searchResults = trySearchApi(repository, normalizedPrefix, nexusBaseUrl);
+    resultsSet.addAll(searchResults);
 
     // Approach 2: Components API fallback if search returned nothing
-    if (results.isEmpty() && normalizedPrefix != null && !normalizedPrefix.isEmpty()) {
+    if (resultsSet.isEmpty() && normalizedPrefix != null && !normalizedPrefix.isEmpty()) {
       log.debug("Search API returned empty for {}/{}, trying components API", repository, normalizedPrefix);
-      results = tryComponentsApi(repository, normalizedPrefix, nexusBaseUrl);
+      List<String> componentResults = tryComponentsApi(repository, normalizedPrefix, nexusBaseUrl);
+      resultsSet.addAll(componentResults);
     }
 
-    return results;
+    return new ArrayList<>(resultsSet);
   }
 
   /**
@@ -1033,6 +1007,7 @@ public class PromotionService {
 
         URL url = new URL(searchUrlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(30_000);
         conn.setReadTimeout(60_000);
@@ -1047,7 +1022,15 @@ public class PromotionService {
         if (code == 200) {
           String json = readStream(conn.getInputStream());
           List<String> pageResults = parseSearchItems(json, pathPrefix);
-          results.addAll(pageResults);
+          
+          // Deduplicate results to avoid duplicates across pages
+          Set<String> uniqueResults = new HashSet<>(results);
+          for (String item : pageResults) {
+            if (!uniqueResults.contains(item)) {
+              results.add(item);
+              uniqueResults.add(item);
+            }
+          }
 
           // Check for continuationToken in the response
           continuationToken = parseContinuationToken(json);
@@ -1090,6 +1073,7 @@ public class PromotionService {
 
         URL url = new URL(urlStr);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        SslHelper.applyTrustAllSsl(conn);
         conn.setRequestMethod("GET");
         conn.setConnectTimeout(30_000);
         conn.setReadTimeout(120_000);
@@ -1099,7 +1083,15 @@ public class PromotionService {
         if (code == 200) {
           String json = readStream(conn.getInputStream());
           List<String> pageResults = parseComponentAssets(json, pathPrefix);
-          results.addAll(pageResults);
+          
+          // Deduplicate results to avoid duplicates across pages
+          Set<String> uniqueResults = new HashSet<>(results);
+          for (String item : pageResults) {
+            if (!uniqueResults.contains(item)) {
+              results.add(item);
+              uniqueResults.add(item);
+            }
+          }
 
           continuationToken = parseContinuationToken(json);
           if (continuationToken == null || continuationToken.isEmpty()) {
@@ -1354,6 +1346,7 @@ public class PromotionService {
     try {
       URL url = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/" + assetName);
       HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+      SslHelper.applyTrustAllSsl(conn);
       conn.setRequestMethod("HEAD");
       conn.setConnectTimeout(10_000);
       conn.setReadTimeout(10_000);
@@ -1545,6 +1538,7 @@ public class PromotionService {
     // Step 1: Download manifest from source with proper Accept headers
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + filePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    SslHelper.applyTrustAllSsl(downloadConn);
     downloadConn.setRequestMethod("GET");
     downloadConn.setConnectTimeout(TIMEOUT_MS);
     downloadConn.setReadTimeout(TIMEOUT_MS);
@@ -1599,6 +1593,7 @@ public class PromotionService {
     // Step 3: Push manifest to target via Docker v2 API
     URL pushUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/manifests/" + tag);
     HttpURLConnection pushConn = (HttpURLConnection) pushUrl.openConnection();
+    SslHelper.applyTrustAllSsl(pushConn);
     pushConn.setRequestMethod("PUT");
     pushConn.setDoOutput(true);
     pushConn.setConnectTimeout(TIMEOUT_MS);
@@ -1660,6 +1655,7 @@ public class PromotionService {
     // Step 1: Initiate blob upload - POST /v2/<name>/blobs/uploads/
     URL initUrl = new URL(nexusBaseUrl + "/repository/" + targetRepo + "/v2/" + imageName + "/blobs/uploads/");
     HttpURLConnection initConn = (HttpURLConnection) initUrl.openConnection();
+    SslHelper.applyTrustAllSsl(initConn);
     initConn.setRequestMethod("POST");
     initConn.setConnectTimeout(TIMEOUT_MS);
     initConn.setReadTimeout(TIMEOUT_MS);
@@ -1696,6 +1692,7 @@ public class PromotionService {
     // Step 2: Download blob from source
     URL sourceUrl = new URL(nexusBaseUrl + "/repository/" + sourceRepo + "/" + filePath);
     HttpURLConnection downloadConn = (HttpURLConnection) sourceUrl.openConnection();
+    SslHelper.applyTrustAllSsl(downloadConn);
     downloadConn.setRequestMethod("GET");
     downloadConn.setConnectTimeout(TIMEOUT_MS);
     downloadConn.setReadTimeout(TIMEOUT_MS);
@@ -1719,6 +1716,7 @@ public class PromotionService {
     }
 
     HttpURLConnection putConn = (HttpURLConnection) new URL(putUrl).openConnection();
+    SslHelper.applyTrustAllSsl(putConn);
     putConn.setRequestMethod("PUT");
     putConn.setDoOutput(true);
     putConn.setConnectTimeout(TIMEOUT_MS);
