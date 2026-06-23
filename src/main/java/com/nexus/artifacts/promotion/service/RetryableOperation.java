@@ -85,6 +85,15 @@ public class RetryableOperation {
       catch (Exception e) {
         lastException = e;
 
+        // Check for task cancellation/interruption immediately after catching exception
+        // This ensures that cancelled tasks stop retrying even if the exception is retryable
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("[RETRY] {} cancelled after exception (attempt {}/{})", 
+              operationName, attempt + 1, maxRetries + 1);
+          Thread.currentThread().interrupt(); // Restore interrupted status
+          throw new InterruptedException("Operation cancelled: " + operationName);
+        }
+
         if (!isRetryable(e) || attempt >= maxRetries) {
           if (attempt > 0) {
             log.warn("[RETRY] {} failed after {} attempts, giving up: {}",

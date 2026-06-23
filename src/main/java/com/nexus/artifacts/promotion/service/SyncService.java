@@ -1007,6 +1007,12 @@ public class SyncService {
         int bytesRead;
         while ((bytesRead = is.read(buffer)) != -1) {
           os.write(buffer, 0, bytesRead);
+          // Check for task cancellation during download
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Sync task cancelled during download of {}", assetPath);
+            Thread.currentThread().interrupt(); // Restore interrupted status
+            throw new InterruptedException("Task cancelled during download");
+          }
         }
       }
       long fileSize = java.nio.file.Files.size(tempFile);
@@ -1136,6 +1142,12 @@ public class SyncService {
         return true;
       }
       catch (Exception e) {
+        // Check for task cancellation/interruption
+        if (e instanceof InterruptedException) {
+          Thread.currentThread().interrupt(); // Restore interrupted status
+          log.warn("Direct HTTP sync: task cancelled for {}", assetPath);
+          throw e;
+        }
         log.error("Direct HTTP sync: StorageTx failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
         // Roll back any partial asset that may have been created before the failure
         try {
@@ -1154,6 +1166,12 @@ public class SyncService {
       }
     }
     catch (Exception e) {
+      // Check for task cancellation/interruption
+      if (e instanceof InterruptedException) {
+        Thread.currentThread().interrupt(); // Restore interrupted status
+        log.warn("Direct HTTP sync: task cancelled during download for {}", assetPath);
+        throw e;
+      }
       log.error("Direct HTTP sync: download/store failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
       return false;
     }
