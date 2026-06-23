@@ -315,9 +315,12 @@ public class SyncService {
           boolean taskCancelled = Thread.currentThread().isInterrupted();
           
           if (taskCancelled) {
-            Thread.currentThread().interrupt(); // Reset interrupted flag
             taskInfo.setStatus(TaskStatus.CANCELLED);
-            taskInfo.setResult("Cancelled: " + syncedFiles.size() + " items synced");
+            taskInfo.setEndTime(System.currentTimeMillis());
+            taskInfo.setResult("Cancelled: " + syncedCount + " items synced");
+            // Clean up task cache on cancellation
+            cacheManager.cleanupTask(taskInfo.getTaskId());
+            log.info("Sync task cancelled, cache cleaned up: {}", taskInfo.getTaskId());
           } else {
             taskInfo.setStatus(TaskStatus.COMPLETED);
             taskInfo.setEndTime(System.currentTimeMillis());
@@ -342,6 +345,11 @@ public class SyncService {
           taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
           taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
+          // Clean up task cache on cancellation
+          if (isCancelled) {
+            cacheManager.cleanupTask(taskInfo.getTaskId());
+            log.info("Sync task cancelled (exception), cache cleaned up: {}", taskInfo.getTaskId());
+          }
         }
 
         taskInfos.put(taskInfo.getTaskId(), taskInfo);
@@ -465,9 +473,14 @@ public class SyncService {
       
       // Set status based on whether task was cancelled
       if (taskCancelled) {
-        Thread.currentThread().interrupt(); // Reset interrupted flag
         taskInfo.setStatus(TaskStatus.CANCELLED);
-        taskInfo.setResult("Cancelled: " + syncedFiles.size() + " items synced");
+        taskInfo.setEndTime(System.currentTimeMillis());
+        long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
+        long syncedCount = syncedFiles.size() - skippedCount;
+        taskInfo.setResult("Cancelled: " + syncedCount + " items synced");
+        // Clean up task cache on cancellation
+        cacheManager.cleanupTask(taskId);
+        log.info("Scheduled sync task cancelled, cache cleaned up: {}", taskId);
       } else {
         taskInfo.setStatus(TaskStatus.COMPLETED);
         taskInfo.setEndTime(System.currentTimeMillis());
@@ -495,6 +508,11 @@ public class SyncService {
       taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
       taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
+      // Clean up task cache on cancellation
+      if (isCancelled) {
+        cacheManager.cleanupTask(taskId);
+        log.info("Scheduled sync task cancelled (exception), cache cleaned up: {}", taskId);
+      }
     }
     finally {
       // Update stored info with final state (ensure this happens even if exception occurs)
@@ -541,7 +559,8 @@ public class SyncService {
   }
 
   /**
-   * Cancel a sync task by updating its task info status to CANCELLED.
+   * Cancel a sync task by updating its task info status to CANCELLED
+   * and cleaning up task cache.
    */
   public void cancelSyncTask(final String taskId) {
     SyncTaskInfo info = taskInfos.get(taskId);
@@ -551,6 +570,9 @@ public class SyncService {
       info.setEndTime(System.currentTimeMillis());
       info.setResult("Task cancelled");
     }
+    // Clean up task cache
+    cacheManager.cleanupTask(taskId);
+    log.info("Sync task {} cache cleaned up on cancellation", taskId);
   }
 
   /**
@@ -665,11 +687,9 @@ public class SyncService {
       // Step 2: Sync each asset using ContentFacet.get()
       for (String rawAssetPath : remoteAssets) {
         // Check for task cancellation/interruption before starting next file
-        // Support both Nexus task cancellation (task.isCanceled()) and thread interruption
-        // Wait for current file to complete, then stop syncing subsequent files
         if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
-          log.warn("Sync task cancelled, stopping directory sync for {}:{}, current file completed", repo.getName(), directoryPath);
-          log.info("Sync task cancelled, {} files successfully synced out of {}", details.size(), remoteAssets.size());
+          log.warn("Sync task cancelled, stopping directory sync for {}:{}, {} files synced before cancellation", 
+              repo.getName(), directoryPath, details.size());
           return details;
         }
 
@@ -693,6 +713,11 @@ public class SyncService {
           detail.setStatus("success");
         }
         catch (Exception e) {
+          // If task was cancelled, stop immediately
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Sync task cancelled while syncing asset {}, stopping", assetPath);
+            return details;
+          }
           log.error("Failed to sync asset {}: {}", assetPath, e.getMessage());
           detail.setStatus("failed");
           detail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
@@ -861,11 +886,8 @@ public class SyncService {
         // Check if the exception is caused by thread interruption (task cancellation)
         if (e instanceof java.nio.channels.ClosedByInterruptException || 
             (e.getCause() instanceof java.nio.channels.ClosedByInterruptException)) {
-          // Restore interrupted status but don't throw - let current file sync complete
           Thread.currentThread().interrupt();
-          log.warn("Thread interrupted during sync of {} - will complete current file then stop", assetPath);
-          // Don't throw, allow method to return normally so current file can be marked as completed
-          return;
+          throw new RuntimeException("Task cancelled during sync of " + assetPath, e);
         }
         
         // Check if the exception is caused by Content-Type mismatch
@@ -2345,33 +2367,15 @@ public class SyncService {
   }
 
   private String sanitizeErrorMessage(final String message) {
-    if (message == null) return "Unknown error";
-    return message.replaceAll("(?i)(password|token|secret|credential)\\s*[:=]\\s*\\S+", "$1:***");
+    return ServiceUtils.sanitizeErrorMessage(message);
   }
 
   private String[] extractAuthFromRepo(final Repository repo) {
-    try {
-      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
-      if (config == null) return null;
-      Map<String, Map<String, Object>> attributes = config.getAttributes();
-      if (attributes == null || !attributes.containsKey("httpclient")) return null;
-      @SuppressWarnings("unchecked")
-      Map<String, Object> httpClientAttrs = attributes.get("httpclient");
-      @SuppressWarnings("unchecked")
-      Map<String, Object> authAttrs = (Map<String, Object>) httpClientAttrs.get("authentication");
-      if (authAttrs == null) return null;
-      String username = (String) authAttrs.get("username");
-      String password = (String) authAttrs.get("password");
-      if (username != null && password != null) return new String[]{username, password};
-    }
-    catch (Exception e) {
-      log.debug("Failed to extract auth from repo {}: {}", repo.getName(), e.getMessage());
-    }
-    return null;
+    return ServiceUtils.extractAuthFromRepo(repo);
   }
 
   private String encodeAuth(final String userPass) {
-    return java.util.Base64.getEncoder().encodeToString(userPass.getBytes());
+    return ServiceUtils.encodeAuth(userPass);
   }
 
   private String readResponse(final HttpURLConnection conn) throws IOException {

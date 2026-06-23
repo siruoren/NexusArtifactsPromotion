@@ -249,6 +249,11 @@ public class PromotionService {
           result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
           result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
+          // Clean up task cache on cancellation
+          if (isCancelled) {
+            cacheManager.cleanupTask(taskId);
+            log.info("Promotion task cancelled (exception), cache cleaned up: {}", taskId);
+          }
         }
 
         taskResults.put(taskId, copyResult(result));
@@ -336,7 +341,8 @@ public class PromotionService {
   }
 
   /**
-   * Cancel a running promotion task by disconnecting its active HTTP connections.
+   * Cancel a running promotion task by disconnecting its active HTTP connections
+   * and cleaning up task cache.
    * This is needed because HttpURLConnection blocking I/O does not respond to Thread.interrupt().
    */
   public void cancelPromotionTask(final String taskId) {
@@ -356,6 +362,10 @@ public class PromotionService {
       result.setEndTime(System.currentTimeMillis());
       taskResults.put(taskId, copyResult(result));
     }
+
+    // Clean up task cache
+    cacheManager.cleanupTask(taskId);
+    log.info("Promotion task {} cache cleaned up on cancellation", taskId);
   }
 
   /**
@@ -486,15 +496,7 @@ public class PromotionService {
       for (int i = 0; i < total; i++) {
         // Check for thread interruption (task cancellation)
         if (Thread.currentThread().isInterrupted()) {
-          log.info("Promotion task interrupted after {}/{} files, marking remaining as failed", i, total);
-          // Mark remaining files as failed
-          for (int j = i; j < total; j++) {
-            PromotionTaskResult.FileItem cancelledItem = new PromotionTaskResult.FileItem(
-                assetNames.get(j), determineType(assetNames.get(j)));
-            cancelledItem.setStatus("failed");
-            cancelledItem.setErrorMessage("Task cancelled");
-            items.add(cancelledItem);
-          }
+          log.info("Promotion task interrupted after {}/{} files, stopping", i, total);
           updateTaskProgress(taskResult, items);
           throw new RuntimeException("Promotion task cancelled");
         }
@@ -1897,7 +1899,6 @@ public class PromotionService {
   }
 
   private String sanitizeErrorMessage(final String message) {
-    if (message == null) return "Unknown error";
-    return message.replaceAll("(?i)(password|token|secret|credential)\\s*[:=]\\s*\\S+", "$1:***");
+    return ServiceUtils.sanitizeErrorMessage(message);
   }
 }

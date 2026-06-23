@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.2] - 2026-06-22
+
+### Changed
+
+- **Task Cancellation Logic**: simplified task termination to immediately stop all file operations and return task status
+  - Sync: when task is cancelled, current file sync is allowed to complete, then subsequent files are skipped (no longer marked as "failed")
+  - Promotion: when task is cancelled, remaining files are no longer marked as "failed", task stops immediately
+  - Task cache is cleaned up on cancellation (`cacheManager.cleanupTask()`)
+  - Task status is correctly set to CANCELLED (not COMPLETED) after cancellation
+- **Transactional Metadata Updates**: `syncAssetViaDirectHttp` now performs asset deletion and creation in a single StorageTx transaction
+  - Previously, force-delete (content-type mismatch) committed the delete in a separate transaction before creating the new asset
+  - If asset creation failed after the delete was committed, the old asset was lost
+  - Now both operations are in the same transaction: either both succeed, or both roll back
+
+### Fixed
+
+- **Task Status Shows "Completed" After Cancellation**: cancelled tasks incorrectly displayed as "completed" because `InterruptedException` from `ClosedByInterruptException` was not properly handled
+  - `syncAssetViaContentFacet` now catches `ClosedByInterruptException` and returns normally instead of throwing
+  - `sync` and `syncScheduled` methods now check `Thread.currentThread().isInterrupted()` to detect cancellation
+  - Task status is correctly set to CANCELLED with proper result message
+- **Current File Fails on Task Cancellation**: when a task was cancelled, the currently syncing file would fail with `ClosedByInterruptException`, causing the file to be marked as "failed" and potentially corrupted
+  - `RetryableOperation` no longer throws `InterruptedException` during operation execution, only during retry delay
+  - `syncAssetViaContentFacet` catches `ClosedByInterruptException` and returns normally, allowing the current file to complete
+
+### Removed
+
+- **Redundant Utility Methods**: extracted shared utility methods from `SyncService`, `PromotionService`, and `DockerService` into `ServiceUtils`
+  - `sanitizeErrorMessage()`: masks sensitive information (passwords, tokens, secrets) in error messages
+  - `extractAuthFromRepo()`: extracts HTTP authentication credentials from repository configuration
+  - `encodeAuth()`: Base64-encodes credentials for HTTP Basic authentication
+- **Incomplete Asset Cleanup Code**: removed all code related to cleaning up incomplete/partially-uploaded assets after task cancellation (no longer needed since current file completes before cancellation)
+
 ## [2.0.1] - 2026-06-20
 
 ### Fixed
