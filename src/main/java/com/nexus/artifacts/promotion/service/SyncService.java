@@ -1243,51 +1243,48 @@ public class SyncService {
       }
 
       // Store the downloaded content directly via StorageTx
-      // This bypasses the ViewFacet pipeline and Content-Type validation
-      StorageTx tx = null;
-      try {
-        tx = repo.facet(StorageFacet.class).txSupplier().get();
-        tx.begin();
+      // Two-phase approach to avoid BrowseNodeCollisionException:
+      //   Phase 1: Delete existing asset + component in one transaction and commit
+      //   Phase 2: Create new component + asset in a separate transaction
+      // This ensures browse nodes are fully cleaned up before re-creation.
 
-        Bucket bucket = tx.findBucket(repo);
+      String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
+      String group = extractGroupFromPath(assetPath, format);
+      String componentName = extractComponentNameFromPath(assetPath);
+
+      // Phase 1: Delete existing asset and component
+      StorageTx deleteTx = null;
+      try {
+        deleteTx = repo.facet(StorageFacet.class).txSupplier().get();
+        deleteTx.begin();
+
+        Bucket bucket = deleteTx.findBucket(repo);
         if (bucket == null) {
           log.warn("Bucket not found for repository: {}", repo.getName());
           return false;
         }
 
         String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
-
-        // Determine group and component name first
-        String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
-        String group = extractGroupFromPath(assetPath, format);
-        String componentName = extractComponentNameFromPath(assetPath);
-
-        // Delete existing asset if present
-        Asset existingAsset = tx.findAssetWithProperty("name", assetName, bucket);
+        Asset existingAsset = deleteTx.findAssetWithProperty("name", assetName, bucket);
         if (existingAsset == null && !assetPath.startsWith("/")) {
-          existingAsset = tx.findAssetWithProperty("name", assetPath, bucket);
+          existingAsset = deleteTx.findAssetWithProperty("name", assetPath, bucket);
         }
+
         if (existingAsset != null) {
-          // Determine whether to delete the entire component (cascades to assets) or just the asset.
-          // If this is the last asset under the component, delete the component to prevent
-          // "component already exists" errors when re-creating. All in the same transaction
-          // to ensure atomicity: either both delete and create succeed, or both roll back.
           boolean shouldDeleteComponent = false;
           Component existingComponent = null;
 
           try {
             org.sonatype.nexus.common.entity.EntityId componentId = existingAsset.componentId();
             if (componentId != null) {
-              existingComponent = tx.findComponentInBucket(componentId, bucket);
+              existingComponent = deleteTx.findComponentInBucket(componentId, bucket);
               if (existingComponent != null) {
                 int assetCount = 0;
-                for (Asset a : tx.browseAssets(existingComponent)) {
+                for (Asset a : deleteTx.browseAssets(existingComponent)) {
                   assetCount++;
                 }
                 if (assetCount <= 1) {
                   shouldDeleteComponent = true;
-                  log.debug("Direct HTTP sync: will delete component {} (group={}) along with its last asset {}",
-                      existingComponent.name(), existingComponent.group(), assetPath);
                 }
               }
             }
@@ -1305,7 +1302,7 @@ public class SyncService {
                 log.info("Direct HTTP sync: force deleting asset {} with mismatched content type {} (should be zip-based)",
                     assetPath, existingContentType);
                 if (existingComponent == null) {
-                  existingComponent = tx.findComponentWithProperty("name", componentName, bucket);
+                  existingComponent = deleteTx.findComponentWithProperty("name", componentName, bucket);
                 }
                 if (existingComponent != null && group.equals(existingComponent.group())) {
                   shouldDeleteComponent = true;
@@ -1315,84 +1312,67 @@ public class SyncService {
           }
 
           if (shouldDeleteComponent && existingComponent != null) {
-            tx.deleteComponent(existingComponent);
+            log.debug("Direct HTTP sync: deleting component {} (group={}) along with asset {}",
+                existingComponent.name(), existingComponent.group(), assetPath);
+            deleteTx.deleteComponent(existingComponent);
           } else {
             log.debug("Direct HTTP sync: deleting existing asset {} before re-sync", assetPath);
-            tx.deleteAsset(existingAsset);
+            deleteTx.deleteAsset(existingAsset);
           }
         }
 
-        // Find or create Component (avoid ORecordDuplicatedException by reusing existing)
-        Component component;
+        deleteTx.commit();
+        log.debug("Direct HTTP sync: phase 1 (cleanup) completed for {}", assetPath);
+      } catch (Exception e) {
+        if (e instanceof InterruptedException) {
+          Thread.currentThread().interrupt();
+          throw e;
+        }
+        log.error("Direct HTTP sync: phase 1 (cleanup) failed for {}: {}", assetPath, e.getMessage());
+        try { if (deleteTx != null) deleteTx.rollback(); } catch (Exception ignored) {}
+        return false;
+      } finally {
+        if (deleteTx != null) {
+          try { deleteTx.close(); } catch (Exception ignored) {}
+        }
+      }
+
+      // Phase 2: Create new component and asset
+      StorageTx createTx = null;
+      try {
+        createTx = repo.facet(StorageFacet.class).txSupplier().get();
+        createTx.begin();
+
+        Bucket bucket = createTx.findBucket(repo);
+        String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
+
+        // Find or create Component
+        Component component = null;
         try {
-          if (tx.componentExists(group, componentName, null, repo)) {
-            // Component already exists - find and reuse it
-            Component existingComp = tx.findComponentWithProperty("name", componentName, bucket);
+          if (createTx.componentExists(group, componentName, null, repo)) {
+            Component existingComp = createTx.findComponentWithProperty("name", componentName, bucket);
             if (existingComp != null && group.equals(existingComp.group())) {
               component = existingComp;
-              log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
-            } else {
-              // Fallback: browse and match
-              component = null;
-              for (Component c : tx.browseComponents(bucket)) {
-                if (group.equals(c.group()) && componentName.equals(c.name())) {
-                  component = c;
-                  break;
-                }
-              }
-              if (component == null) {
-                component = tx.createComponent(bucket, repo.getFormat())
-                    .group(group)
-                    .name(componentName);
-                tx.saveComponent(component);
-                log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
-              } else {
-                log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}' for {}", group, componentName, assetPath);
-              }
+              log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}'", group, componentName);
             }
-          } else {
-            component = tx.createComponent(bucket, repo.getFormat())
-                .group(group)
-                .name(componentName);
-            tx.saveComponent(component);
-            log.debug("Direct HTTP sync: created component group='{}' name='{}' for {}", group, componentName, assetPath);
           }
+        } catch (Exception e) {
+          log.debug("componentExists check failed, will create new: {}", e.getMessage());
         }
-        catch (Exception e) {
-          // Handle ORecordDuplicatedException or similar "node already has a component" errors
-          // This can happen due to race conditions or stale componentExists check
-          if (e.getMessage() != null && e.getMessage().contains("already has a component")) {
-            log.warn("Direct HTTP sync: component already exists for group='{}' name='{}', attempting to reuse existing", group, componentName);
-            // Try to find and reuse the existing component
-            component = null;
-            for (Component c : tx.browseComponents(bucket)) {
-              if (group.equals(c.group()) && componentName.equals(c.name())) {
-                component = c;
-                log.debug("Direct HTTP sync: found and reusing existing component after duplicate error");
-                break;
-              }
-            }
-            if (component == null) {
-              // If still not found, try with name only (group might differ)
-              Component existingComp = tx.findComponentWithProperty("name", componentName, bucket);
-              if (existingComp != null) {
-                component = existingComp;
-                log.debug("Direct HTTP sync: reusing existing component by name only after duplicate error");
-              } else {
-                throw new RuntimeException("Failed to find existing component after duplicate error for " + assetPath, e);
-              }
-            }
-          } else {
-            throw e;
-          }
+
+        if (component == null) {
+          component = createTx.createComponent(bucket, repo.getFormat())
+              .group(group)
+              .name(componentName);
+          createTx.saveComponent(component);
+          log.debug("Direct HTTP sync: created component group='{}' name='{}'", group, componentName);
         }
 
         // Create Asset under the Component
-        Asset asset = tx.createAsset(bucket, component);
+        Asset asset = createTx.createAsset(bucket, component);
         asset.name(assetName);
 
-        // Set blob using InputStreamSupplier-based setBlob (avoids NPE in Path-based setBlob)
-        // Signature: setBlob(Asset, String, InputStreamSupplier, Iterable<HashAlgorithm>, Map<String,String>, String, boolean)
+        // Set blob using InputStreamSupplier-based setBlob
         final java.nio.file.Path blobTempFile = tempFile;
         org.sonatype.nexus.common.io.InputStreamSupplier streamSupplier = () -> java.nio.file.Files.newInputStream(blobTempFile);
 
@@ -1404,24 +1384,21 @@ public class SyncService {
 
         java.util.Map<String, String> headers = new java.util.LinkedHashMap<>();
 
-        tx.setBlob(asset, assetName, streamSupplier, hashAlgos, headers, effectiveContentType, true);
-        tx.saveAsset(asset);
-        tx.commit();
+        createTx.setBlob(asset, assetName, streamSupplier, hashAlgos, headers, effectiveContentType, true);
+        createTx.saveAsset(asset);
+        createTx.commit();
         log.info("Direct HTTP sync: stored asset {} with content type {} ({} bytes)", assetPath, effectiveContentType, fileSize);
         return true;
       }
       catch (Exception e) {
-        // Check for task cancellation/interruption
         if (e instanceof InterruptedException) {
-          Thread.currentThread().interrupt(); // Restore interrupted status
-          log.warn("Direct HTTP sync: task cancelled for {}", assetPath);
+          Thread.currentThread().interrupt();
           throw e;
         }
-        log.error("Direct HTTP sync: StorageTx failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
-        // Roll back any partial asset that may have been created before the failure
+        log.error("Direct HTTP sync: phase 2 (create) failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
         try {
-          if (tx != null) {
-            tx.rollback();
+          if (createTx != null) {
+            createTx.rollback();
           }
         } catch (Exception rbEx) {
           log.debug("Rollback failed for {}: {}", assetPath, rbEx.getMessage());
@@ -1429,8 +1406,8 @@ public class SyncService {
         return false;
       }
       finally {
-        if (tx != null) {
-          try { tx.close(); } catch (Exception ignored) { }
+        if (createTx != null) {
+          try { createTx.close(); } catch (Exception ignored) {}
         }
       }
     }
