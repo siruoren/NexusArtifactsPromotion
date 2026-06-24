@@ -27,6 +27,7 @@ import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
 import org.sonatype.nexus.repository.storage.Asset;
 import org.sonatype.nexus.repository.storage.Bucket;
+import org.sonatype.nexus.repository.storage.Component;
 import org.sonatype.nexus.repository.storage.StorageFacet;
 import org.sonatype.nexus.repository.storage.StorageTx;
 import org.sonatype.nexus.repository.view.Request;
@@ -1411,6 +1412,20 @@ public class DockerService {
    */
   public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request,
       final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
+    return syncDockerImageScheduled(request, task, false);
+  }
+
+  /**
+   * Execute a scheduled Docker sync task with support for incremental mode.
+   *
+   * @param request the sync request
+   * @param task the Nexus task instance (may be null for direct API calls)
+   * @param incremental if true, skip images/tags whose manifest digest matches local cache
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request,
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task,
+      final boolean incremental) {
     String repoName = request.getRepositoryName();
     String syncPath = request.getPath();
     boolean isFullSync = (syncPath == null || syncPath.trim().isEmpty());
@@ -1592,7 +1607,7 @@ public class DockerService {
             throw new InterruptedException("Task cancelled during Docker sync");
           }
           try {
-            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, incremental);
             syncedFiles.addAll(tagFiles);
           }
           catch (Exception e) {
@@ -1936,15 +1951,53 @@ public class DockerService {
   private List<SyncTaskInfo.SyncFileDetail> syncDockerTag(
       final Repository repo, final String image, final String tag) throws Exception
   {
+    return syncDockerTag(repo, image, tag, false);
+  }
+
+  /**
+   * Sync a single Docker image:tag with optional incremental mode.
+   *
+   * Incremental mode: compare remote manifest digest with local cached manifest digest.
+   * If digests match, skip the entire image:tag (manifest + blobs).
+   * If digests differ or manifest is not cached, re-sync manifest and blobs.
+   * For blobs, skip if already cached locally (blob content is immutable by digest).
+   *
+   * Full mode (default): always re-sync by deleting cache + invalidating negative cache + dispatching GET.
+   */
+  private List<SyncTaskInfo.SyncFileDetail> syncDockerTag(
+      final Repository repo, final String image, final String tag, final boolean incremental) throws Exception
+  {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
 
-    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {})", image, tag, manifestPath);
+    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {}, incremental: {})", image, tag, manifestPath, incremental);
+
+    // Incremental check: compare remote manifest digest with local cached digest
+    if (incremental) {
+      String remoteDigest = getRemoteManifestDigest(repo, image, tag);
+      String localDigest = getLocalManifestDigest(repo, manifestPath);
+
+      if (remoteDigest != null && localDigest != null && digestsMatch(remoteDigest, localDigest)) {
+        log.info("[DOCKER-SYNC] Skipping {}:{} (digest match: {})", image, tag, localDigest);
+        SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+        skippedDetail.setStatus("skipped");
+        skippedDetail.setRemoteMd5(remoteDigest);
+        skippedDetail.setLocalMd5(localDigest);
+        details.add(skippedDetail);
+        return details;
+      }
+      else {
+        log.info("[DOCKER-SYNC] Digest differs or missing, syncing {}:{} (remote={}, local={})",
+            image, tag,
+            remoteDigest != null ? remoteDigest.substring(0, Math.min(19, remoteDigest.length())) + "..." : "null",
+            localDigest != null ? localDigest.substring(0, Math.min(19, localDigest.length())) + "..." : "null");
+      }
+    }
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity
     writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
       // Step 1: Sync manifest
-      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath);
+      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath, incremental);
       details.add(manifestDetail);
 
       // Step 2: Read manifest content from local cache to parse blob references
@@ -1968,14 +2021,14 @@ public class DockerService {
             String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
             try {
               // Sync the sub-manifest
-              SyncTaskInfo.SyncFileDetail subDetail = syncDockerAssetInternal(repo, subManifestPath);
+              SyncTaskInfo.SyncFileDetail subDetail = syncDockerAssetInternal(repo, subManifestPath, incremental);
               details.add(subDetail);
 
               // Read and parse the sub-manifest to get its blobs
               String subManifestContent = readManifestContentFromCache(repo, subManifestPath);
               if (subManifestContent != null && !subManifestContent.isEmpty()) {
                 DockerManifestParser.DockerManifest subParsed = DockerManifestParser.parse(subManifestContent, ref.getMediaType());
-                syncBlobsForManifest(repo, image, subParsed, details);
+                syncBlobsForManifest(repo, image, subParsed, details, incremental);
               }
             }
             catch (Exception e) {
@@ -1989,7 +2042,7 @@ public class DockerService {
         }
         else {
           // Single-platform manifest: sync config + layers
-          syncBlobsForManifest(repo, image, parsed, details);
+          syncBlobsForManifest(repo, image, parsed, details, incremental);
         }
       }
       catch (Exception e) {
@@ -2006,7 +2059,7 @@ public class DockerService {
           }
           String blobPath = "v2/" + image + "/blobs/" + digest;
           try {
-            SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+            SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath, incremental);
             details.add(blobDetail);
           }
           catch (Exception ex) {
@@ -2029,6 +2082,16 @@ public class DockerService {
   private void syncBlobsForManifest(final Repository repo, final String image,
                                      final DockerManifestParser.DockerManifest manifest,
                                      final List<SyncTaskInfo.SyncFileDetail> details) {
+    syncBlobsForManifest(repo, image, manifest, details, false);
+  }
+
+  /**
+   * Sync all blobs (config + layers) for a single-platform manifest with incremental support.
+   */
+  private void syncBlobsForManifest(final Repository repo, final String image,
+                                     final DockerManifestParser.DockerManifest manifest,
+                                     final List<SyncTaskInfo.SyncFileDetail> details,
+                                     final boolean incremental) {
     Set<String> blobDigests = manifest.getAllBlobDigests();
     log.info("[DOCKER-SYNC] Syncing {} blobs for image {}", blobDigests.size(), image);
 
@@ -2042,7 +2105,7 @@ public class DockerService {
       String blobPath = "v2/" + image + "/blobs/" + digest;
 
       try {
-        SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+        SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath, incremental);
         details.add(blobDetail);
       }
       catch (Exception e) {
@@ -2059,7 +2122,34 @@ public class DockerService {
    * Internal method to sync a single Docker asset without acquiring lock (called within lock scope).
    */
   private SyncTaskInfo.SyncFileDetail syncDockerAssetInternal(final Repository repo, final String assetPath) throws Exception {
+    return syncDockerAssetInternal(repo, assetPath, false);
+  }
+
+  /**
+   * Internal method to sync a single Docker asset without acquiring lock (called within lock scope).
+   *
+   * Incremental mode: for blobs, check if already cached locally (blob content is immutable by digest).
+   * If cached, skip the sync. For manifests, always re-sync (manifest digest comparison is done at syncDockerTag level).
+   *
+   * Full mode (default): always re-sync by deleting cache + invalidating negative cache + dispatching GET.
+   */
+  private SyncTaskInfo.SyncFileDetail syncDockerAssetInternal(final Repository repo, final String assetPath,
+      final boolean incremental) throws Exception {
     SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, "image");
+
+    // Incremental mode: skip blobs that are already cached locally
+    // Blob content is immutable (identified by digest), so if it exists locally, it's already correct
+    if (incremental && assetPath.contains("/blobs/")) {
+      // Extract digest from blob path (e.g., "v2/myimage/blobs/sha256:abc123" -> "sha256:abc123")
+      int blobsIdx = assetPath.indexOf("/blobs/");
+      String digest = assetPath.substring(blobsIdx + "/blobs/".length());
+
+      if (isDockerBlobCached(repo, assetPath, digest)) {
+        log.debug("[DOCKER-SYNC] Skipping blob {} (already cached)", assetPath);
+        detail.setStatus("skipped");
+        return detail;
+      }
+    }
 
     // Always re-sync: delete cached asset + invalidate negative cache + dispatch GET
     deleteCachedAssetInternal(repo, assetPath);
@@ -2845,6 +2935,248 @@ public class DockerService {
 
   // ==================== MD5 / Cache / Auth Helpers ====================
 
+  /**
+   * Get the digest of a remote Docker manifest via Docker Registry v2 API.
+   * Uses HEAD request to get the Docker-Content-Digest header.
+   * Handles both Basic auth and Bearer token auth.
+   *
+   * @return the manifest digest (e.g., "sha256:abc123...") or null if not available
+   */
+  private String getRemoteManifestDigest(final Repository repo, final String image, final String tag) {
+    HttpURLConnection conn = null;
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null || config.getAttributes() == null || !config.getAttributes().containsKey("proxy")) {
+        return null;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return null;
+      if (!remoteUrl.endsWith("/")) remoteUrl += "/";
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String fullUrl = remoteUrl + "v2/" + image + "/manifests/" + tag;
+
+      conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+      // Must set Accept header for manifest API to return proper content type
+      conn.setRequestProperty("Accept",
+          "application/vnd.docker.distribution.manifest.v2+json," +
+          "application/vnd.docker.distribution.manifest.list.v2+json," +
+          "application/vnd.oci.image.manifest.v1+json," +
+          "application/json");
+
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code == 401) {
+        // Try Docker token auth
+        String wwwAuth = conn.getHeaderField("Www-Authenticate");
+        conn.disconnect();
+        if (wwwAuth != null && wwwAuth.contains("Bearer")) {
+          String token = getDockerRegistryToken(wwwAuth, image, repoAuth);
+          if (token != null) {
+            conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+            SslHelper.applyTrustAllSsl(conn);
+            conn.setRequestMethod("HEAD");
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(30_000);
+            conn.setRequestProperty("Accept",
+                "application/vnd.docker.distribution.manifest.v2+json," +
+                "application/vnd.docker.distribution.manifest.list.v2+json," +
+                "application/vnd.oci.image.manifest.v1+json," +
+                "application/json");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            code = conn.getResponseCode();
+          }
+        }
+      }
+
+      if (code != 200) {
+        if (conn != null) conn.disconnect();
+        return null;
+      }
+
+      String digest = conn.getHeaderField("Docker-Content-Digest");
+      conn.disconnect();
+
+      if (digest != null && !digest.isEmpty()) {
+        log.debug("Found remote manifest digest for {}:{}: {}", image, tag, digest);
+        return digest;
+      }
+
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote manifest digest for {}:{}: {}", image, tag, e.getMessage());
+      if (conn != null) { try { conn.disconnect(); } catch (Exception ignored) {} }
+      return null;
+    }
+  }
+
+  /**
+   * Get Docker registry auth token from Www-Authenticate header.
+   * Handles Bearer token authentication for Docker Hub and private registries.
+   */
+  private String getDockerRegistryToken(final String wwwAuth, final String imageName,
+      final String[] repoAuth) {
+    try {
+      String realm = null;
+      String service = null;
+
+      java.util.regex.Pattern realmPattern = java.util.regex.Pattern.compile("realm=\"([^\"]+)\"");
+      java.util.regex.Matcher realmMatcher = realmPattern.matcher(wwwAuth);
+      if (realmMatcher.find()) {
+        realm = realmMatcher.group(1);
+      }
+
+      java.util.regex.Pattern servicePattern = java.util.regex.Pattern.compile("service=\"([^\"]+)\"");
+      java.util.regex.Matcher serviceMatcher = servicePattern.matcher(wwwAuth);
+      if (serviceMatcher.find()) {
+        service = serviceMatcher.group(1);
+      }
+
+      if (realm == null) return null;
+
+      String tokenUrl = realm + "?service=" + java.net.URLEncoder.encode(service != null ? service : "", "UTF-8")
+          + "&scope=repository:" + imageName + ":pull";
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(tokenUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      String json = readResponse(conn);
+      String token = ServiceUtils.extractJsonValue(json, "token");
+      if (token == null) {
+        token = ServiceUtils.extractJsonValue(json, "access_token");
+      }
+      return token;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get Docker registry token: {}", e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get the digest of a locally cached Docker manifest.
+   * Tries to get SHA256 checksum from the asset, which corresponds to the Docker-Content-Digest.
+   *
+   * @return the manifest digest (e.g., "sha256:abc123...") or null if not cached
+   */
+  private String getLocalManifestDigest(final Repository repo, final String manifestPath) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return null;
+
+      Asset asset = tx.findAssetWithProperty("name", manifestPath, bucket);
+      if (asset == null && !manifestPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
+      }
+      if (asset == null) return null;
+
+      // Method 1: Try SHA256 checksum (matches Docker-Content-Digest format)
+      try {
+        HashCode sha256Hash = asset.getChecksum(HashAlgorithm.SHA256);
+        if (sha256Hash != null) {
+          String sha256 = sha256Hash.toString();
+          if (!sha256.isEmpty()) {
+            if (!sha256.startsWith("sha256:")) {
+              sha256 = "sha256:" + sha256;
+            }
+            return sha256;
+          }
+        }
+      }
+      catch (Exception ignored) {}
+
+      // Method 2: Try blob headers for Content-Hash-SHA256
+      try {
+        if (asset.requireBlobRef() != null) {
+          Blob blob = tx.requireBlob(asset.requireBlobRef());
+          if (blob != null) {
+            Map<String, String> headers = blob.getHeaders();
+            String sha256 = headers.get("Content-Hash-SHA256");
+            if (sha256 == null || sha256.isEmpty()) {
+              sha256 = headers.get("content-hash-sha256");
+            }
+            if (sha256 != null && !sha256.isEmpty()) {
+              if (!sha256.startsWith("sha256:")) {
+                sha256 = "sha256:" + sha256;
+              }
+              return sha256;
+            }
+          }
+        }
+      }
+      catch (Exception ignored) {}
+    }
+    catch (Exception e) {
+      log.debug("Failed to get local manifest digest for {}/{}: {}", repo.getName(), manifestPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) { try { tx.close(); } catch (Exception ignored) {} }
+    }
+    return null;
+  }
+
+  /**
+   * Compare two Docker digests for equality.
+   * Supports both "sha256:hex" and plain hex formats.
+   */
+  private boolean digestsMatch(final String digest1, final String digest2) {
+    if (digest1 == null || digest2 == null) return false;
+    if (digest1.equalsIgnoreCase(digest2)) return true;
+
+    // Handle "sha256:abc" vs "sha256:abc" or "abc" vs "sha256:abc"
+    String hex1 = extractDigestHex(digest1);
+    String hex2 = extractDigestHex(digest2);
+    if (hex1 != null && hex2 != null) {
+      return hex1.equalsIgnoreCase(hex2);
+    }
+    return false;
+  }
+
+  /**
+   * Extract the hex part from a digest string.
+   * "sha256:abc123" -> "abc123"
+   * "abc123" -> "abc123"
+   */
+  private String extractDigestHex(final String digest) {
+    if (digest == null) return null;
+    int colonIdx = digest.indexOf(':');
+    if (colonIdx >= 0 && (digest.startsWith("sha256:") || digest.startsWith("sha1:"))) {
+      return digest.substring(colonIdx + 1);
+    }
+    return digest;
+  }
+
   private String getAssetMd5(final String repoName, final String assetPath) {
     try {
       Repository repo = repositoryManager.get(repoName);
@@ -2904,7 +3236,36 @@ public class DockerService {
       }
       if (asset != null) {
         log.debug("Deleting cached Docker asset: {}", assetPath);
-        tx.deleteAsset(asset);
+
+        // Try to find and delete the associated component if this is the only asset under it.
+        // This prevents "component already exists" errors when ViewFacet.dispatch() re-creates it.
+        boolean componentDeleted = false;
+        try {
+          org.sonatype.nexus.common.entity.EntityId componentId = asset.componentId();
+          if (componentId != null) {
+            Component component = tx.findComponentInBucket(componentId, bucket);
+            if (component != null) {
+              int assetCount = 0;
+              for (Asset a : tx.browseAssets(component)) {
+                assetCount++;
+              }
+
+              if (assetCount <= 1) {
+                log.debug("Deleting component {} along with its last asset {}", component.name(), assetPath);
+                tx.deleteComponent(component);
+                componentDeleted = true;
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Could not check component for Docker asset {}, will delete asset only: {}", assetPath, e.getMessage());
+        }
+
+        if (!componentDeleted) {
+          tx.deleteAsset(asset);
+        }
+
         tx.commit();
       }
     }

@@ -12,7 +12,6 @@ import org.sonatype.nexus.scheduling.TaskSupport;
 
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
-import com.nexus.artifacts.promotion.service.IncrementalSyncService;
 import com.nexus.artifacts.promotion.service.SyncService;
 
 /**
@@ -39,16 +38,13 @@ public class ProxySyncTask
   private static final Logger log = LoggerFactory.getLogger(ProxySyncTask.class);
 
   private final SyncService syncService;
-  private final IncrementalSyncService incrementalSyncService;
   private final RepositoryManager repositoryManager;
 
   @Inject
   public ProxySyncTask(final SyncService syncService,
-                       final IncrementalSyncService incrementalSyncService,
                        final RepositoryManager repositoryManager)
   {
     this.syncService = syncService;
-    this.incrementalSyncService = incrementalSyncService;
     this.repositoryManager = repositoryManager;
   }
 
@@ -92,7 +88,7 @@ public class ProxySyncTask
     // Pass the task context so sync can check for cancellation
     SyncTaskInfo result;
     if (incremental) {
-      result = incrementalSyncService.syncScheduledIncremental(request, this);
+      result = syncService.syncScheduled(request, this, true);
     }
     else {
       result = syncService.syncScheduled(request, this);

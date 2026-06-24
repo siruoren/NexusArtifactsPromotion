@@ -72,7 +72,6 @@ public class SyncService {
   private final SecurityHelper securityHelper;
   private final FileWriteLockManager writeLockManager;
   private final DockerService dockerService;
-  private final IncrementalSyncService incrementalSyncService;
 
   private final Map<String, SyncTaskInfo> taskInfos = new ConcurrentHashMap<>();
 
@@ -86,8 +85,7 @@ public class SyncService {
                       final PermissionChecker permissionChecker,
                       final SecurityHelper securityHelper,
                       final FileWriteLockManager writeLockManager,
-                      final DockerService dockerService,
-                      final IncrementalSyncService incrementalSyncService)
+                      final DockerService dockerService)
   {
     this.repositoryManager = repositoryManager;
     this.taskExecutor = taskExecutor;
@@ -96,7 +94,6 @@ public class SyncService {
     this.securityHelper = securityHelper;
     this.writeLockManager = writeLockManager;
     this.dockerService = dockerService;
-    this.incrementalSyncService = incrementalSyncService;
   }
 
   /**
@@ -495,8 +492,8 @@ public class SyncService {
 
     // Delegate Docker format syncs to DockerService (synchronous, asset-based approach)
     if ("docker".equalsIgnoreCase(request.getFormat())) {
-      log.info("Delegating Docker scheduled sync to DockerService for repository: {}", request.getRepositoryName());
-      return dockerService.syncDockerImageScheduled(request, task);
+      log.info("Delegating Docker scheduled incremental sync to DockerService for repository: {}", request.getRepositoryName());
+      return dockerService.syncDockerImageScheduled(request, task, true);
     }
 
     Repository repo = repositoryManager.get(request.getRepositoryName());
@@ -706,6 +703,13 @@ public class SyncService {
    * Execute incremental sync of a proxy repository path.
    * Only syncs assets whose MD5 differs from the locally cached version.
    *
+   * Flow:
+   * 1. Get remote asset list with MD5 via Nexus Search API or HTTP directory listing
+   * 2. Build local asset MD5 map from the proxy repository's blob store
+   * 3. For each remote asset:
+   *    - If local MD5 matches remote MD5 -> skip
+   *    - If MD5 mismatch or asset missing locally -> sync via ContentFacet
+   *
    * @param repo the proxy repository
    * @param directoryPath the path to sync (empty for full repository)
    * @param task the Nexus task instance for cancellation support (may be null)
@@ -714,10 +718,182 @@ public class SyncService {
   public List<SyncTaskInfo.SyncFileDetail> incrementalSyncDirectory(
       final Repository repo,
       final String directoryPath,
-      final com.nexus.artifacts.promotion.task.ProxySyncTask task)
-  {
-    // Delegate to IncrementalSyncService which handles all MD5 comparison logic
-    return incrementalSyncService.incrementalSyncDirectory(repo, directoryPath, task);
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
+
+    List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
+
+    try {
+      boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
+      log.info("Starting incremental {} for {}:{}",
+          isFullSync ? "full repository sync" : "directory sync",
+          repo.getName(), isFullSync ? "/" : directoryPath);
+
+      // Step 1: Get remote assets with MD5 checksums
+      Map<String, String> remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
+      log.info("Incremental sync: found {} remote assets for {}:{}",
+          remoteMd5Map.size(), repo.getName(), isFullSync ? "/" : directoryPath);
+
+      if (remoteMd5Map.isEmpty()) {
+        log.warn("Incremental sync: no remote assets found for {}:{}", repo.getName(), directoryPath);
+        return details;
+      }
+
+      // Step 2: Build local MD5 map for comparison
+      Map<String, String> localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
+      log.info("Incremental sync: found {} local cached assets for {}:{}",
+          localMd5Map.size(), repo.getName(), isFullSync ? "/" : directoryPath);
+
+      // Step 3: Compare and sync only changed/missing assets
+      String[] repoAuth = extractAuthFromRepo(repo);
+      int syncedCount = 0;
+      int skippedCount = 0;
+
+      for (Map.Entry<String, String> entry : remoteMd5Map.entrySet()) {
+        // Check for task cancellation before each file
+        if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+          log.warn("Incremental sync cancelled for {}:{}, {} files processed before cancellation",
+              repo.getName(), directoryPath, details.size());
+          return details;
+        }
+
+        String assetPath = entry.getKey();
+        String remoteMd5 = entry.getValue();
+
+        // Skip directory entries
+        if (assetPath.endsWith("/")) {
+          continue;
+        }
+
+        SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, determineType(assetPath));
+        detail.setRemoteMd5(remoteMd5);
+
+        try {
+          String localMd5 = localMd5Map.get(assetPath);
+          detail.setLocalMd5(localMd5);
+
+          // Incremental decision logic:
+          // 1. Both MD5s available and match -> skip (unchanged)
+          // 2. Both MD5s available and differ -> sync (changed)
+          // 3. remoteMd5 null, localMd5 exists -> try per-asset HEAD to get MD5, then compare
+          // 4. localMd5 null (asset not cached) -> sync (missing)
+          // 5. Both null -> sync (unknown state)
+
+          if (localMd5 != null && remoteMd5 != null && checksumsMatch(remoteMd5, localMd5)) {
+            // Case 1: MD5 match, asset unchanged
+            detail.setStatus("skipped");
+            skippedCount++;
+            log.info("Incremental sync: SKIP {} (MD5 match: remote={}, local={})", assetPath, remoteMd5, localMd5);
+          }
+          else if (localMd5 != null && remoteMd5 == null) {
+            // Case 3: Remote MD5 not available from batch listing, try per-asset HEAD request
+            String fallbackMd5 = getRemoteAssetMd5(repo, assetPath);
+            detail.setRemoteMd5(fallbackMd5);
+
+            if (fallbackMd5 != null && checksumsMatch(fallbackMd5, localMd5)) {
+              detail.setStatus("skipped");
+              skippedCount++;
+              log.info("Incremental sync: SKIP {} (fallback MD5 match: remote={}, local={})", assetPath, fallbackMd5, localMd5);
+            }
+            else {
+              log.info("Incremental sync: SYNC {} (remote MD5 unavailable, local={}, cannot confirm unchanged)", assetPath, localMd5);
+              RetryableOperation.executeRun("incremental sync asset " + assetPath,
+                  () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
+              detail.setStatus("success");
+              syncedCount++;
+            }
+          }
+          else if (localMd5 == null) {
+            // Case 4/5: Asset not in local cache or both MD5s null -> must sync
+            log.info("Incremental sync: SYNC {} (not in local cache, remote={})", assetPath, remoteMd5);
+            RetryableOperation.executeRun("incremental sync asset " + assetPath,
+                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
+            detail.setStatus("success");
+            syncedCount++;
+          }
+          else {
+            // Case 2: MD5 mismatch -> sync (changed)
+            log.info("Incremental sync: SYNC {} (MD5 mismatch: remote={}, local={})", assetPath, remoteMd5, localMd5);
+            RetryableOperation.executeRun("incremental sync asset " + assetPath,
+                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
+            detail.setStatus("success");
+            syncedCount++;
+          }
+        }
+        catch (Exception e) {
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Incremental sync cancelled while syncing asset {}, stopping", assetPath);
+            return details;
+          }
+          log.error("Incremental sync: failed to sync asset {}: {}", assetPath, e.getMessage());
+          detail.setStatus("failed");
+          detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+        }
+
+        details.add(detail);
+      }
+
+      log.info("Incremental sync completed for {}:{} - {} synced, {} skipped, {} failed",
+          repo.getName(), isFullSync ? "/" : directoryPath, syncedCount, skippedCount,
+          details.stream().filter(d -> "failed".equals(d.getStatus())).count());
+    }
+    catch (Exception e) {
+      log.error("Failed incremental sync for {}:{}: {}", repo.getName(), directoryPath, e.getMessage(), e);
+      throw new RuntimeException("Incremental sync failed", e);
+    }
+
+    return details;
+  }
+
+  /**
+   * Preview incremental sync: count assets that would need syncing (dry-run).
+   * Does not perform any sync, only compares MD5s.
+   */
+  public SyncPreviewResult previewIncrementalSync(final String repositoryName, final String directoryPath) {
+    Repository repo = repositoryManager.get(repositoryName);
+    if (repo == null) {
+      throw new IllegalArgumentException("Repository not found: " + repositoryName);
+    }
+    if (!"proxy".equals(repo.getType().getValue())) {
+      throw new IllegalArgumentException("Repository is not a proxy type: " + repositoryName);
+    }
+
+    Map<String, String> remoteMd5Map = listRemoteAssetsWithMd5(repo, directoryPath);
+    Map<String, String> localMd5Map = buildLocalAssetMd5Map(repo, directoryPath);
+
+    SyncPreviewResult preview = new SyncPreviewResult();
+    for (Map.Entry<String, String> entry : remoteMd5Map.entrySet()) {
+      String assetPath = entry.getKey();
+      if (assetPath.endsWith("/")) {
+        continue;
+      }
+      preview.totalAssets++;
+      String remoteMd5 = entry.getValue();
+      String localMd5 = localMd5Map.get(assetPath);
+
+      if (localMd5 != null && remoteMd5 != null && checksumsMatch(remoteMd5, localMd5)) {
+        preview.skippedAssets++;
+      }
+      else {
+        preview.syncedAssets++;
+      }
+    }
+    return preview;
+  }
+
+  /**
+   * Result of an incremental sync preview.
+   */
+  public static class SyncPreviewResult {
+    public int totalAssets;
+    public int syncedAssets;
+    public int skippedAssets;
+    public int failedAssets;
+
+    @Override
+    public String toString() {
+      return String.format("SyncPreviewResult{total=%d, synced=%d, skipped=%d, failed=%d}",
+          totalAssets, syncedAssets, skippedAssets, failedAssets);
+    }
   }
 
   /**
@@ -758,6 +934,9 @@ public class SyncService {
    * Flow:
    * 1. Get remote file list (from remote repo REST API or HTTP directory listing)
    * 2. For each file, call ContentFacet.get(path) to sync from remote
+   *
+   * Note: For incremental sync (MD5 comparison), use incrementalSyncDirectory() instead,
+   * which batch-fetches remote MD5s for better efficiency.
    */
   private List<SyncTaskInfo.SyncFileDetail> syncDirectory(final Repository repo, final String directoryPath,
       final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
@@ -781,7 +960,7 @@ public class SyncService {
       for (String rawAssetPath : remoteAssets) {
         // Check for task cancellation/interruption before starting next file
         if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
-          log.warn("Sync task cancelled, stopping directory sync for {}:{}, {} files synced before cancellation", 
+          log.warn("Sync task cancelled, stopping directory sync for {}:{}, {} files synced before cancellation",
               repo.getName(), directoryPath, details.size());
           return details;
         }
@@ -829,6 +1008,9 @@ public class SyncService {
 
   /**
    * Sync a single file from remote using ContentFacet.
+   *
+   * Note: For incremental sync (MD5 comparison), use incrementalSyncDirectory() instead,
+   * which batch-fetches remote MD5s for better efficiency.
    */
   private List<SyncTaskInfo.SyncFileDetail> syncFile(final Repository repo, final String filePath,
       final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
@@ -871,7 +1053,7 @@ public class SyncService {
   /**
    * Get MD5 of a locally cached asset by its path.
    */
-  private String getLocalAssetMd5(final Repository repo, final String assetPath) {
+  String getLocalAssetMd5(final Repository repo, final String assetPath) {
     StorageTx tx = null;
     try {
       tx = repo.facet(StorageFacet.class).txSupplier().get();
@@ -1499,7 +1681,7 @@ public class SyncService {
    * This extracts MD5 from the same Search API response that lists assets,
    * avoiding the need for a separate getRemoteAssetMd5() call per asset.
    */
-  private Map<String, String> listRemoteAssetsWithMd5(final Repository repo, final String directoryPath) {
+  Map<String, String> listRemoteAssetsWithMd5(final Repository repo, final String directoryPath) {
     Map<String, String> assetMd5Map = new java.util.LinkedHashMap<>();
     try {
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
@@ -2557,7 +2739,42 @@ public class SyncService {
 
       if (asset != null) {
         log.debug("Asset {} exists in cache, deleting to force fresh download", assetPath);
-        tx.deleteAsset(asset);
+
+        // Try to find and delete the associated component if this is the only asset under it.
+        // This prevents "component already exists" errors when ViewFacet.dispatch() re-creates it.
+        // Use componentId() to look up the component, then check if it's the last asset.
+        boolean componentDeleted = false;
+        try {
+          org.sonatype.nexus.common.entity.EntityId componentId = asset.componentId();
+          if (componentId != null) {
+            Component component = tx.findComponentInBucket(componentId, bucket);
+            if (component != null) {
+              // Count assets under this component
+              int assetCount = 0;
+              for (Asset a : tx.browseAssets(component)) {
+                assetCount++;
+              }
+
+              if (assetCount <= 1) {
+                // This is the only (or last) asset under the component — delete the whole component
+                // which cascades to assets, preventing "component already exists" on re-sync
+                log.debug("Deleting component {} (group={}) along with its last asset {}",
+                    component.name(), component.group(), assetPath);
+                tx.deleteComponent(component);
+                componentDeleted = true;
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          // componentId() or component lookup may fail for some formats (e.g. raw proxy without components)
+          log.debug("Could not check component for asset {}, will delete asset only: {}", assetPath, e.getMessage());
+        }
+
+        if (!componentDeleted) {
+          tx.deleteAsset(asset);
+        }
+
         tx.commit();
       }
       else {
@@ -2702,9 +2919,45 @@ public class SyncService {
   // ========================================================================
 
   /**
+   * Compare two checksums for equality.
+   * Supports both MD5 (hex string) and Docker digest (sha256:hex) formats.
+   * For Docker digests, compares the hex part after the algorithm prefix.
+   */
+  boolean checksumsMatch(final String checksum1, final String checksum2) {
+    if (checksum1 == null || checksum2 == null) return false;
+
+    // Direct case-insensitive comparison
+    if (checksum1.equalsIgnoreCase(checksum2)) return true;
+
+    // Handle Docker digest format: "sha256:abc" vs "sha256:abc" or "abc" vs "sha256:abc"
+    String hex1 = extractDigestHex(checksum1);
+    String hex2 = extractDigestHex(checksum2);
+
+    if (hex1 != null && hex2 != null) {
+      return hex1.equalsIgnoreCase(hex2);
+    }
+
+    return false;
+  }
+
+  /**
+   * Extract the hex part from a checksum string.
+   * "sha256:abc123" -> "abc123"
+   * "abc123" -> "abc123"
+   */
+  private String extractDigestHex(final String checksum) {
+    if (checksum == null) return null;
+    int colonIdx = checksum.indexOf(':');
+    if (colonIdx >= 0 && (checksum.startsWith("sha256:") || checksum.startsWith("sha1:"))) {
+      return checksum.substring(colonIdx + 1);
+    }
+    return checksum;
+  }
+
+  /**
    * Build a map of asset path -> MD5 for all locally cached assets under a directory.
    */
-  private Map<String, String> buildLocalAssetMd5Map(final Repository repo, final String directoryPath) {
+  Map<String, String> buildLocalAssetMd5Map(final Repository repo, final String directoryPath) {
     Map<String, String> md5Map = new HashMap<>();
     StorageTx tx = null;
     try {
@@ -2759,7 +3012,7 @@ public class SyncService {
   /**
    * Get MD5 checksum from an asset's attributes.
    */
-  private String getAssetMd5(final Asset asset) {
+  String getAssetMd5(final Asset asset) {
     try {
       // Method 1: Use Asset.getChecksum(HashAlgorithm.MD5) — Nexus 3.7+
       try {
@@ -2792,7 +3045,7 @@ public class SyncService {
    * Get MD5 checksum of a remote asset by querying the Nexus Search API or Components API.
    * For non-Nexus remotes, falls back to HTTP HEAD request to get Content-MD5 or ETag.
    */
-  private String getRemoteAssetMd5(final Repository repo, final String assetPath) {
+  String getRemoteAssetMd5(final Repository repo, final String assetPath) {
     try {
       org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
       if (config == null) {
