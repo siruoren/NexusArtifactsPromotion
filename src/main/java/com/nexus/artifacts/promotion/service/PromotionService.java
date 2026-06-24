@@ -235,7 +235,7 @@ public class PromotionService {
           result.setEndTime(System.currentTimeMillis());
 
           long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long promotedCount = promotedItems.size() - skippedCount;
+          long promotedCount = promotedItems.stream().filter(f -> "success".equals(f.getStatus())).count();
           long durationMs = result.getEndTime() - result.getStartTime();
           log.info("Promotion task {} completed - source={}, target={}, totalFiles={}, success={}, skipped={}, duration={}ms",
               taskId, request.getSourceRepository(), request.getTargetRepository(),
@@ -549,6 +549,17 @@ public class PromotionService {
           items.add(item);
         }
         catch (Exception e) {
+          // If task was cancelled, mark current file and stop
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Promotion task cancelled while promoting {}, stopping", assetName);
+            PromotionTaskResult.FileItem cancelledItem = new PromotionTaskResult.FileItem(
+                assetName, determineType(assetName));
+            cancelledItem.setStatus("cancelled");
+            cancelledItem.setErrorMessage("Task cancelled");
+            items.add(cancelledItem);
+            updateTaskProgress(taskResult, items);
+            throw new RuntimeException("Promotion task cancelled");
+          }
           log.error("Failed to promote {}: {}", assetName, e.getMessage());
           PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(
               assetName, determineType(assetName));

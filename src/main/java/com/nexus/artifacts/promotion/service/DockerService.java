@@ -994,7 +994,7 @@ public class DockerService {
           result.setEndTime(System.currentTimeMillis());
 
           long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long promotedCount = promotedItems.size() - skippedCount;
+          long promotedCount = promotedItems.stream().filter(f -> "success".equals(f.getStatus())).count();
           log.debug("Docker promotion task {} completed: {} items promoted, {} skipped, image={}",
               taskId, promotedCount, skippedCount, request.getImage());
         }
@@ -1630,7 +1630,7 @@ public class DockerService {
 
       long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
       long failedCount = syncedFiles.stream().filter(f -> "failed".equals(f.getStatus())).count();
-      long syncedCount = syncedFiles.size() - skippedCount - failedCount;
+      long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
       taskInfo.setResult("Synced " + syncedCount + " items" +
           (skippedCount > 0 ? ", skipped " + skippedCount : "") +
           (failedCount > 0 ? ", failed " + failedCount : ""));
@@ -1907,7 +1907,7 @@ public class DockerService {
           taskInfo.setEndTime(System.currentTimeMillis());
 
           long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long syncedCount = syncedFiles.size() - skippedCount;
+          long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
           taskInfo.setResult("Synced " + syncedCount + " items" +
               (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
 
