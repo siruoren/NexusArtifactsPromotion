@@ -915,7 +915,7 @@ public class SyncService {
    * 2. Invalidate negative cache so previously 404'd assets can be retried
    * 3. Dispatch GET request through ViewFacet -> Nexus auto-fetches from remote if not cached
    */
-  private void syncAssetViaContentFacet(final Repository repo, final String assetPath,
+  void syncAssetViaContentFacet(final Repository repo, final String assetPath,
       final String[] repoAuth) throws Exception {
     // For file extensions that are essentially zip archives but have specific MIME types,
     // ViewFacet.dispatch() will store the specific type (e.g. application/x-xpinstall for .xpi),
@@ -1401,7 +1401,7 @@ public class SyncService {
    * 1. If remote URL points to a local Nexus repo, use REST API to list assets
    * 2. Otherwise, fall back to HTTP directory listing
    */
-  private List<String> listRemoteAssets(final Repository repo, final String directoryPath) {
+  List<String> listRemoteAssets(final Repository repo, final String directoryPath) {
     try {
       boolean isFullSync = (directoryPath == null || directoryPath.trim().isEmpty());
 
@@ -2137,7 +2137,7 @@ public class SyncService {
    * Extract repository name from a Nexus repository URL.
    * URL pattern: http://host:port/repository/<repo-name>/
    */
-  private String extractRepoNameFromUrl(final String remoteUrl) {
+  String extractRepoNameFromUrl(final String remoteUrl) {
     try {
       java.net.URL url = new java.net.URL(remoteUrl);
       String path = url.getPath();
@@ -2625,7 +2625,7 @@ public class SyncService {
 
   // ========================================================================
 
-  private String determineType(final String path) {
+  String determineType(final String path) {
     if (path == null) return "file";
     if (path.contains("/blobs/") || path.contains("/manifests/") || path.endsWith(".manifest")) {
       return "image";
@@ -2636,7 +2636,7 @@ public class SyncService {
     return "file";
   }
 
-  private String[] extractAuthFromRepo(final Repository repo) {
+  String[] extractAuthFromRepo(final Repository repo) {
     return ServiceUtils.extractAuthFromRepo(repo);
   }
 
@@ -3105,7 +3105,7 @@ public class SyncService {
    * For other formats: uses the parent directory path as-is.
    *   e.g. "some/dir/file.txt" → "some/dir"
    */
-  private String extractGroupFromPath(final String assetPath, final String format) {
+  String extractGroupFromPath(final String assetPath, final String format) {
     if (assetPath == null || assetPath.isEmpty()) return null;
     int lastSlash = assetPath.lastIndexOf('/');
     if (lastSlash <= 0) {
@@ -3145,7 +3145,7 @@ public class SyncService {
    * For non-Maven paths, use the parent directory name.
    * e.g. "some/dir/file.txt" → "dir"
    */
-  private String extractComponentNameFromPath(final String assetPath) {
+  String extractComponentNameFromPath(final String assetPath) {
     if (assetPath == null || assetPath.isEmpty()) return null;
     int lastSlash = assetPath.lastIndexOf('/');
     if (lastSlash < 0) {
@@ -3166,7 +3166,7 @@ public class SyncService {
    * e.g. "com/example/artifact/1.0/artifact-1.0.jar" → "artifact-1.0.jar"
    * e.g. "1/test_network_daemon.sh" → "test_network_daemon.sh"
    */
-  private String extractFileName(final String assetPath) {
+  String extractFileName(final String assetPath) {
     if (assetPath == null || assetPath.isEmpty()) return null;
     int lastSlash = assetPath.lastIndexOf('/');
     return lastSlash >= 0 ? assetPath.substring(lastSlash + 1) : assetPath;

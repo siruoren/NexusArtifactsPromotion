@@ -389,10 +389,10 @@ public class IncrementalSyncService {
     try {
       // Method 1: Use Asset.getChecksum(HashAlgorithm.MD5) — Nexus 3.7+
       try {
-        org.sonatype.nexus.common.hash.HashAlgorithm md5Algo = org.sonatype.nexus.common.hash.HashAlgorithm.MD5;
-        String checksum = asset.getChecksum(md5Algo);
-        if (checksum != null && !checksum.isEmpty()) {
-          return checksum;
+        com.google.common.hash.HashCode md5Hash = asset.getChecksum(org.sonatype.nexus.common.hash.HashAlgorithm.MD5);
+        if (md5Hash != null) {
+          String md5 = md5Hash.toString();
+          if (!md5.isEmpty()) return md5;
         }
       }
       catch (Exception ignored) {
