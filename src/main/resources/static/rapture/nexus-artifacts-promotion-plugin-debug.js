@@ -786,7 +786,14 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
             {
               text: _t('sync.queue.table.refresh'),
               iconCls: 'x-fa fa-refresh',
-              handler: function () { me.allDataStore.reload(); }
+              handler: function () {
+                me.allDataStore.load({
+                  callback: function () {
+                    me.applyFilters();
+                    me.checkAllFinished();
+                  }
+                });
+              }
             },
             {
               text: _t('sync.queue.status.running') + ': 0',
@@ -850,7 +857,12 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
             method: 'POST',
             success: function(response) {
               Ext.Msg.alert(_t('sync.queue.table.terminate'), _t('sync.queue.table.terminateSuccess'));
-              me.allDataStore.reload();
+              me.allDataStore.load({
+                callback: function () {
+                  me.applyFilters();
+                  me.checkAllFinished();
+                }
+              });
             },
             failure: function(response) {
               var msg = _t('sync.queue.table.terminateFailed');
@@ -871,7 +883,12 @@ Ext.define('NX.artifactsPromotion.view.SyncQueue', {
 
     me._queuePollInterval = setInterval(function () {
       if (!me.destroyed) {
-        me.allDataStore.reload();
+        me.allDataStore.load({
+          callback: function () {
+            me.applyFilters();
+            me.checkAllFinished();
+          }
+        });
       } else {
         clearInterval(me._queuePollInterval);
       }
