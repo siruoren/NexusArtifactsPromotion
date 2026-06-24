@@ -744,6 +744,7 @@ public class SyncService {
 
       // Step 3: Compare and sync only changed/missing assets
       String[] repoAuth = extractAuthFromRepo(repo);
+      java.util.Set<String> potentiallyOrphanedComponents = new java.util.HashSet<>();
 
       for (Map.Entry<String, String> entry : remoteMd5Map.entrySet()) {
         // Check for task cancellation before each file
@@ -792,7 +793,7 @@ public class SyncService {
             else {
               log.info("Incremental sync: SYNC {} (remote MD5 unavailable, local={}, cannot confirm unchanged)", assetPath, localMd5);
               RetryableOperation.executeRun("incremental sync asset " + assetPath,
-                  () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
+                  () -> syncAssetViaContentFacet(repo, assetPath, repoAuth, potentiallyOrphanedComponents), 3);
               detail.setStatus("success");
             }
           }
@@ -800,14 +801,14 @@ public class SyncService {
             // Case 4/5: Asset not in local cache or both MD5s null -> must sync
             log.info("Incremental sync: SYNC {} (not in local cache, remote={})", assetPath, remoteMd5);
             RetryableOperation.executeRun("incremental sync asset " + assetPath,
-                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
+                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth, potentiallyOrphanedComponents), 3);
             detail.setStatus("success");
           }
           else {
             // Case 2: MD5 mismatch -> sync (changed)
             log.info("Incremental sync: SYNC {} (MD5 mismatch: remote={}, local={})", assetPath, remoteMd5, localMd5);
             RetryableOperation.executeRun("incremental sync asset " + assetPath,
-                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
+                () -> syncAssetViaContentFacet(repo, assetPath, repoAuth, potentiallyOrphanedComponents), 3);
             detail.setStatus("success");
           }
         }
@@ -832,6 +833,9 @@ public class SyncService {
       long failedCount = details.stream().filter(d -> "failed".equals(d.getStatus())).count();
       log.info("Incremental sync completed for {}:{} - {} synced, {} skipped, {} failed",
           repo.getName(), isFullSync ? "/" : directoryPath, syncedCount, skippedCount, failedCount);
+
+      // Clean up orphaned components (components with 0 assets) after sync
+      cleanupOrphanedComponents(repo, potentiallyOrphanedComponents);
     }
     catch (Exception e) {
       log.error("Failed incremental sync for {}:{}: {}", repo.getName(), directoryPath, e.getMessage(), e);
@@ -947,6 +951,7 @@ public class SyncService {
 
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
+      java.util.Set<String> potentiallyOrphanedComponents = new java.util.HashSet<>();
 
       // Step 1: Get remote file list
       List<String> remoteAssets = listRemoteAssets(repo, directoryPath);
@@ -977,7 +982,7 @@ public class SyncService {
           // Sync the asset
           log.info("Syncing asset: {}/{}", repo.getName(), assetPath);
           RetryableOperation.executeRun("sync asset " + assetPath,
-              () -> syncAssetViaContentFacet(repo, assetPath, repoAuth),
+              () -> syncAssetViaContentFacet(repo, assetPath, repoAuth, potentiallyOrphanedComponents),
               SYNC_RETRY_ATTEMPTS);
           detail.setStatus("success");
         }
@@ -997,6 +1002,9 @@ public class SyncService {
 
         details.add(detail);
       }
+
+      // Clean up orphaned components (components with 0 assets) after sync
+      cleanupOrphanedComponents(repo, potentiallyOrphanedComponents);
     }
     catch (Exception e) {
       log.error("Failed to sync directory {}: {}", directoryPath, e.getMessage(), e);
@@ -1025,6 +1033,7 @@ public class SyncService {
 
       // Extract auth from proxy repo configuration
       String[] repoAuth = extractAuthFromRepo(repo);
+      java.util.Set<String> potentiallyOrphanedComponents = new java.util.HashSet<>();
 
       SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(
           filePath, determineType(filePath));
@@ -1032,7 +1041,7 @@ public class SyncService {
       try {
         // Sync the file
         log.info("Syncing file: {}/{}", repo.getName(), filePath);
-        syncAssetViaContentFacet(repo, filePath, repoAuth);
+        syncAssetViaContentFacet(repo, filePath, repoAuth, potentiallyOrphanedComponents);
         detail.setStatus("success");
       }
       catch (Exception e) {
@@ -1046,6 +1055,9 @@ public class SyncService {
       }
 
       details.add(detail);
+
+      // Clean up orphaned components after sync
+      cleanupOrphanedComponents(repo, potentiallyOrphanedComponents);
     }
     catch (Exception e) {
       log.error("Failed to sync file {}: {}", filePath, e.getMessage(), e);
@@ -1103,7 +1115,7 @@ public class SyncService {
    *    c. Commit (or rollback on failure)
    */
   void syncAssetViaContentFacet(final Repository repo, final String assetPath,
-      final String[] repoAuth) throws Exception {
+      final String[] repoAuth, final java.util.Set<String> potentiallyOrphanedComponents) throws Exception {
     // Use direct HTTP sync for all assets to ensure atomicity:
     // delete existing asset/component and create new one in the same transaction.
     // ViewFacet.dispatch() manages its own transactions internally, so we cannot
@@ -1117,7 +1129,7 @@ public class SyncService {
         invalidateNegativeCache(repo, assetPath);
 
         // Direct HTTP sync: delete + create in the same StorageTx transaction
-        boolean result = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
+        boolean result = syncAssetViaDirectHttp(repo, assetPath, repoAuth, potentiallyOrphanedComponents);
         if (!result) {
           throw new RuntimeException("Failed to sync asset " + assetPath + " via direct HTTP");
         }
@@ -1145,7 +1157,7 @@ public class SyncService {
    * @return true if the asset was successfully synced, false otherwise
    */
   private boolean syncAssetViaDirectHttp(final Repository repo, final String assetPath,
-      final String[] repoAuth) throws Exception {
+      final String[] repoAuth, final java.util.Set<String> potentiallyOrphanedComponents) throws Exception {
     // Get remote URL from repository configuration
     org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
     if (config == null) {
@@ -1252,16 +1264,17 @@ public class SyncService {
       }
 
       // Store the downloaded content directly via StorageTx
-      // Two-phase approach to avoid BrowseNodeCollisionException:
-      //   Phase 1: Delete existing asset + component in one transaction and commit
-      //   Phase 2: Create new component + asset in a separate transaction
-      // This ensures browse nodes are fully cleaned up before re-creation.
+      // Two-phase approach with delay:
+      //   Phase 1: Delete existing asset + component (if last asset) → commit
+      //   Delay: 1s after deleting component for browse node cleanup
+      //   Phase 2: Create new component + asset → commit
 
       String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
       String group = extractGroupFromPath(assetPath, format);
       String componentName = extractComponentNameFromPath(assetPath);
 
-      // Phase 1: Delete existing asset and component
+      // Phase 1: Delete existing asset and component in one transaction
+      boolean deletedComponent = false;
       StorageTx deleteTx = null;
       try {
         deleteTx = repo.facet(StorageFacet.class).txSupplier().get();
@@ -1280,73 +1293,76 @@ public class SyncService {
         }
 
         if (existingAsset != null) {
-          boolean shouldDeleteComponent = false;
-          Component existingComponent = null;
-
+          // Try to delete component along with asset if this is the only asset
           try {
-            org.sonatype.nexus.common.entity.EntityId componentId = existingAsset.componentId();
-            if (componentId != null) {
-              existingComponent = deleteTx.findComponentInBucket(componentId, bucket);
-              if (existingComponent != null) {
+            org.sonatype.nexus.common.entity.EntityId compId = existingAsset.componentId();
+            if (compId != null) {
+              Component existingComp = deleteTx.findComponentInBucket(compId, bucket);
+              if (existingComp != null) {
                 int assetCount = 0;
-                for (Asset a : deleteTx.browseAssets(existingComponent)) {
+                for (Asset a : deleteTx.browseAssets(existingComp)) {
                   assetCount++;
                 }
                 if (assetCount <= 1) {
-                  shouldDeleteComponent = true;
+                  // Delete component (cascades to delete all its assets)
+                  log.debug("Direct HTTP sync: deleting component group='{}' name='{}' along with asset {}",
+                      existingComp.group(), existingComp.name(), assetPath);
+                  deleteTx.deleteComponent(existingComp);
+                  deletedComponent = true;
                 }
               }
             }
           } catch (Exception e) {
-            log.debug("Could not check component for asset {}, will delete asset only: {}", assetPath, e.getMessage());
+            log.debug("Could not check/delete component for asset {}, will delete asset only: {}", assetPath, e.getMessage());
           }
 
-          // For zip-based extensions with mismatched content type, also force delete component
-          if (!shouldDeleteComponent && isZipBasedExtension(assetPath)) {
-            String existingContentType = existingAsset.contentType();
-            if (existingContentType != null && !existingContentType.isEmpty()) {
-              boolean isZipType = "application/zip".equals(existingContentType)
-                  || "application/x-zip-compressed".equals(existingContentType);
-              if (!isZipType) {
-                log.info("Direct HTTP sync: force deleting asset {} with mismatched content type {} (should be zip-based)",
-                    assetPath, existingContentType);
-                if (existingComponent == null) {
-                  existingComponent = deleteTx.findComponentWithProperty("name", componentName, bucket);
-                }
-                if (existingComponent != null && group.equals(existingComponent.group())) {
-                  shouldDeleteComponent = true;
+          if (!deletedComponent) {
+            log.debug("Direct HTTP sync: deleting existing asset {} (component has other assets)", assetPath);
+            deleteTx.deleteAsset(existingAsset);
+            // Track component for orphan cleanup
+            try {
+              org.sonatype.nexus.common.entity.EntityId compId = existingAsset.componentId();
+              if (compId != null) {
+                Component existingComp = deleteTx.findComponentInBucket(compId, bucket);
+                if (existingComp != null) {
+                  String compKey = existingComp.group() + ":" + existingComp.name();
+                  if (potentiallyOrphanedComponents != null) {
+                    potentiallyOrphanedComponents.add(compKey);
+                  }
                 }
               }
+            } catch (Exception e) {
+              log.debug("Could not track component for orphan cleanup: {}", e.getMessage());
             }
-          }
-
-          if (shouldDeleteComponent && existingComponent != null) {
-            log.debug("Direct HTTP sync: deleting component {} (group={}) along with asset {}",
-                existingComponent.name(), existingComponent.group(), assetPath);
-            deleteTx.deleteComponent(existingComponent);
-          } else {
-            log.debug("Direct HTTP sync: deleting existing asset {} before re-sync", assetPath);
-            deleteTx.deleteAsset(existingAsset);
           }
         }
 
         deleteTx.commit();
-        log.debug("Direct HTTP sync: phase 1 (cleanup) completed for {}", assetPath);
+        log.debug("Direct HTTP sync: phase 1 (delete) completed for {}", assetPath);
       } catch (Exception e) {
         if (e instanceof InterruptedException) {
           Thread.currentThread().interrupt();
           throw e;
         }
-        log.error("Direct HTTP sync: phase 1 (cleanup) failed for {}: {}", assetPath, e.getMessage());
+        log.error("Direct HTTP sync: phase 1 (delete) failed for {}: {}", assetPath, e.getMessage());
         try { if (deleteTx != null) deleteTx.rollback(); } catch (Exception ignored) {}
         return false;
       } finally {
-        if (deleteTx != null) {
-          try { deleteTx.close(); } catch (Exception ignored) {}
+        if (deleteTx != null) { try { deleteTx.close(); } catch (Exception ignored) {} }
+      }
+
+      // Delay after deleting component to let browse nodes clean up
+      if (deletedComponent) {
+        try {
+          log.debug("Direct HTTP sync: waiting 1s after deleting component for browse node cleanup");
+          Thread.sleep(1000);
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw e;
         }
       }
 
-      // Phase 2: Create new component and asset
+      // Phase 2: Create new component and asset in one transaction
       StorageTx createTx = null;
       try {
         createTx = repo.facet(StorageFacet.class).txSupplier().get();
@@ -1356,26 +1372,7 @@ public class SyncService {
         String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
 
         // Find or create Component
-        Component component = null;
-        try {
-          if (createTx.componentExists(group, componentName, null, repo)) {
-            Component existingComp = createTx.findComponentWithProperty("name", componentName, bucket);
-            if (existingComp != null && group.equals(existingComp.group())) {
-              component = existingComp;
-              log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}'", group, componentName);
-            }
-          }
-        } catch (Exception e) {
-          log.debug("componentExists check failed, will create new: {}", e.getMessage());
-        }
-
-        if (component == null) {
-          component = createTx.createComponent(bucket, repo.getFormat())
-              .group(group)
-              .name(componentName);
-          createTx.saveComponent(component);
-          log.debug("Direct HTTP sync: created component group='{}' name='{}'", group, componentName);
-        }
+        Component component = findOrCreateComponent(createTx, bucket, repo, group, componentName);
 
         // Create Asset under the Component
         Asset asset = createTx.createAsset(bucket, component);
@@ -1441,11 +1438,138 @@ public class SyncService {
   }
 
   /**
-   * Check if the file extension indicates a format that is essentially a zip archive
-   * but has a specific MIME type. These files cause Content-Type mismatch errors
-   * when synced via ViewFacet.dispatch() because Nexus stores the specific MIME type
-   * (e.g. application/x-xpinstall for .xpi) but detects application/zip on download.
+   * Find an existing component or create a new one.
+   * Uses multiple lookup strategies to handle index latency and race conditions:
+   * 1. Lookup by "name" property + group match
+   * 2. If not found, try componentExists check then lookup
+   * 3. If creation fails (component already exists), retry lookup
    */
+  private Component findOrCreateComponent(final StorageTx tx, final Bucket bucket,
+      final Repository repo, final String group, final String componentName) {
+    // Strategy 1: Direct lookup by name property
+    Component component = findComponentByNameAndGroup(tx, bucket, group, componentName);
+    if (component != null) {
+      log.debug("Direct HTTP sync: reusing existing component group='{}' name='{}'", group, componentName);
+      return component;
+    }
+
+    // Strategy 2: Try componentExists before creating
+    try {
+      if (tx.componentExists(group, componentName, null, repo)) {
+        component = findComponentByNameAndGroup(tx, bucket, group, componentName);
+        if (component != null) {
+          log.debug("Direct HTTP sync: reusing existing component (found via componentExists) group='{}' name='{}'", group, componentName);
+          return component;
+        }
+      }
+    } catch (Exception e) {
+      log.debug("componentExists check failed: {}", e.getMessage());
+    }
+
+    // Strategy 3: Create new component, handle race condition
+    try {
+      component = tx.createComponent(bucket, repo.getFormat())
+          .group(group)
+          .name(componentName);
+      tx.saveComponent(component);
+      log.debug("Direct HTTP sync: created component group='{}' name='{}'", group, componentName);
+      return component;
+    } catch (Exception e) {
+      // Component might have been created by a concurrent transaction
+      log.debug("Component creation failed, retrying lookup: {}", e.getMessage());
+    }
+
+    // Strategy 4: Final retry - component was created by another transaction
+    component = findComponentByNameAndGroup(tx, bucket, group, componentName);
+    if (component != null) {
+      log.debug("Direct HTTP sync: reusing existing component (found after creation failure) group='{}' name='{}'", group, componentName);
+      return component;
+    }
+
+    // Last resort: try creating again
+    component = tx.createComponent(bucket, repo.getFormat())
+        .group(group)
+        .name(componentName);
+    tx.saveComponent(component);
+    log.debug("Direct HTTP sync: created component (retry) group='{}' name='{}'", group, componentName);
+    return component;
+  }
+
+  /**
+   * Find a component by name and group. Handles the case where findComponentWithProperty
+   * returns a component with a different group by iterating results.
+   */
+  private Component findComponentByNameAndGroup(final StorageTx tx, final Bucket bucket,
+      final String group, final String componentName) {
+    try {
+      Component comp = tx.findComponentWithProperty("name", componentName, bucket);
+      if (comp != null && group.equals(comp.group())) {
+        return comp;
+      }
+    } catch (Exception e) {
+      log.debug("findComponentWithProperty failed for name='{}': {}", componentName, e.getMessage());
+    }
+    return null;
+  }
+
+  /**
+   * Clean up orphaned components that were left without assets during sync.
+   * Only checks components tracked in potentiallyOrphanedComponents (group:name keys).
+   * Each component deletion is in its own transaction to avoid BrowseNodeCollisionException.
+   */
+  private void cleanupOrphanedComponents(final Repository repo,
+      final java.util.Set<String> potentiallyOrphanedComponents) {
+    if (potentiallyOrphanedComponents == null || potentiallyOrphanedComponents.isEmpty()) {
+      return;
+    }
+
+    try {
+      log.debug("Checking {} potentially orphaned component(s) in repo {}",
+          potentiallyOrphanedComponents.size(), repo.getName());
+
+      for (String compKey : potentiallyOrphanedComponents) {
+        String[] parts = compKey.split(":", 2);
+        if (parts.length != 2) continue;
+        String group = parts[0];
+        String name = parts[1];
+
+        StorageTx tx = null;
+        try {
+          tx = repo.facet(StorageFacet.class).txSupplier().get();
+          tx.begin();
+          Bucket bucket = tx.findBucket(repo);
+
+          // Find the component by name and verify group
+          Component component = tx.findComponentWithProperty("name", name, bucket);
+          if (component != null && group.equals(component.group())) {
+            // Check if it's truly orphaned (0 assets)
+            int assetCount = 0;
+            for (Asset a : tx.browseAssets(component)) {
+              assetCount++;
+            }
+            if (assetCount == 0) {
+              log.info("Deleting orphaned component: group='{}' name='{}'", group, name);
+              tx.deleteComponent(component);
+              tx.commit();
+            } else {
+              tx.rollback();
+            }
+          } else {
+            tx.rollback();
+          }
+        } catch (Exception e) {
+          log.debug("Failed to check/delete orphaned component group='{}' name='{}': {}",
+              group, name, e.getMessage());
+          if (tx != null) { try { tx.rollback(); } catch (Exception ignored) {} }
+        } finally {
+          if (tx != null) { try { tx.close(); } catch (Exception ignored) {} }
+        }
+      }
+    } catch (Exception e) {
+      log.debug("Orphaned component cleanup skipped for repo {}: {}", repo.getName(), e.getMessage());
+    }
+  }
+
   private boolean isZipBasedExtension(final String assetPath) {
     if (assetPath == null) return false;
     String lower = assetPath.toLowerCase();
