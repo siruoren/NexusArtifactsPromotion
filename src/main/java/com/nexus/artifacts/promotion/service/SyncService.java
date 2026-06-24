@@ -248,9 +248,9 @@ public class SyncService {
 
           taskInfo.setFileDetails(syncedFiles);
           
-          // Count skipped vs actually synced items
+          // Count by status - only "success" counts as synced
+          long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
           long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long syncedCount = syncedFiles.size() - skippedCount;
           
           // Check if task was cancelled during sync
           boolean taskCancelled = Thread.currentThread().isInterrupted();
@@ -420,9 +420,10 @@ public class SyncService {
       if (taskCancelled) {
         taskInfo.setStatus(TaskStatus.CANCELLED);
         taskInfo.setEndTime(System.currentTimeMillis());
+        long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
         long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-        long syncedCount = syncedFiles.size() - skippedCount;
-        taskInfo.setResult("Cancelled: " + syncedCount + " items synced");
+        taskInfo.setResult("Cancelled: " + syncedCount + " items synced" +
+            (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
         // Clean up task cache on cancellation
         cacheManager.cleanupTask(taskId);
         log.info("Scheduled sync task cancelled, cache cleaned up: {}", taskId);
@@ -430,15 +431,16 @@ public class SyncService {
         taskInfo.setStatus(TaskStatus.COMPLETED);
         taskInfo.setEndTime(System.currentTimeMillis());
 
-        // Count skipped vs actually synced items
+        // Count by status - only "success" counts as synced
+        long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
         long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-        long syncedCount = syncedFiles.size() - skippedCount;
         taskInfo.setResult("Synced " + syncedCount + " items" +
             (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
       }
 
+      long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
       log.info("Scheduled sync task {}: {} items synced from {}:{}",
-          taskCancelled ? "cancelled" : "completed", syncedFiles.size(), request.getRepositoryName(),
+          taskCancelled ? "cancelled" : "completed", syncedCount, request.getRepositoryName(),
           isFullSync ? "/" : request.getPath());
     }
     catch (Exception e) {
@@ -535,9 +537,10 @@ public class SyncService {
       if (taskCancelled) {
         taskInfo.setStatus(TaskStatus.CANCELLED);
         taskInfo.setEndTime(System.currentTimeMillis());
+        long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
         long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-        long syncedCount = syncedFiles.size() - skippedCount;
-        taskInfo.setResult("Cancelled (incremental): " + syncedCount + " items synced");
+        taskInfo.setResult("Cancelled (incremental): " + syncedCount + " items synced" +
+            (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
         cacheManager.cleanupTask(taskId);
         log.info("Scheduled incremental sync task cancelled, cache cleaned up: {}", taskId);
       }
@@ -741,8 +744,6 @@ public class SyncService {
 
       // Step 3: Compare and sync only changed/missing assets
       String[] repoAuth = extractAuthFromRepo(repo);
-      int syncedCount = 0;
-      int skippedCount = 0;
 
       for (Map.Entry<String, String> entry : remoteMd5Map.entrySet()) {
         // Check for task cancellation before each file
@@ -777,7 +778,6 @@ public class SyncService {
           if (localMd5 != null && remoteMd5 != null && checksumsMatch(remoteMd5, localMd5)) {
             // Case 1: MD5 match, asset unchanged
             detail.setStatus("skipped");
-            skippedCount++;
             log.info("Incremental sync: SKIP {} (MD5 match: remote={}, local={})", assetPath, remoteMd5, localMd5);
           }
           else if (localMd5 != null && remoteMd5 == null) {
@@ -787,7 +787,6 @@ public class SyncService {
 
             if (fallbackMd5 != null && checksumsMatch(fallbackMd5, localMd5)) {
               detail.setStatus("skipped");
-              skippedCount++;
               log.info("Incremental sync: SKIP {} (fallback MD5 match: remote={}, local={})", assetPath, fallbackMd5, localMd5);
             }
             else {
@@ -795,7 +794,6 @@ public class SyncService {
               RetryableOperation.executeRun("incremental sync asset " + assetPath,
                   () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
               detail.setStatus("success");
-              syncedCount++;
             }
           }
           else if (localMd5 == null) {
@@ -804,7 +802,6 @@ public class SyncService {
             RetryableOperation.executeRun("incremental sync asset " + assetPath,
                 () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
             detail.setStatus("success");
-            syncedCount++;
           }
           else {
             // Case 2: MD5 mismatch -> sync (changed)
@@ -812,12 +809,14 @@ public class SyncService {
             RetryableOperation.executeRun("incremental sync asset " + assetPath,
                 () -> syncAssetViaContentFacet(repo, assetPath, repoAuth), 3);
             detail.setStatus("success");
-            syncedCount++;
           }
         }
         catch (Exception e) {
           if (Thread.currentThread().isInterrupted()) {
             log.warn("Incremental sync cancelled while syncing asset {}, stopping", assetPath);
+            detail.setStatus("cancelled");
+            detail.setErrorMessage("Task cancelled");
+            details.add(detail);
             return details;
           }
           log.error("Incremental sync: failed to sync asset {}: {}", assetPath, e.getMessage());
@@ -828,9 +827,11 @@ public class SyncService {
         details.add(detail);
       }
 
+      long syncedCount = details.stream().filter(d -> "success".equals(d.getStatus())).count();
+      long skippedCount = details.stream().filter(d -> "skipped".equals(d.getStatus())).count();
+      long failedCount = details.stream().filter(d -> "failed".equals(d.getStatus())).count();
       log.info("Incremental sync completed for {}:{} - {} synced, {} skipped, {} failed",
-          repo.getName(), isFullSync ? "/" : directoryPath, syncedCount, skippedCount,
-          details.stream().filter(d -> "failed".equals(d.getStatus())).count());
+          repo.getName(), isFullSync ? "/" : directoryPath, syncedCount, skippedCount, failedCount);
     }
     catch (Exception e) {
       log.error("Failed incremental sync for {}:{}: {}", repo.getName(), directoryPath, e.getMessage(), e);
@@ -981,9 +982,12 @@ public class SyncService {
           detail.setStatus("success");
         }
         catch (Exception e) {
-          // If task was cancelled, stop immediately
+          // If task was cancelled, mark and stop immediately
           if (Thread.currentThread().isInterrupted()) {
             log.warn("Sync task cancelled while syncing asset {}, stopping", assetPath);
+            detail.setStatus("cancelled");
+            detail.setErrorMessage("Task cancelled");
+            details.add(detail);
             return details;
           }
           log.error("Failed to sync asset {}: {}", assetPath, e.getMessage());
@@ -1032,8 +1036,13 @@ public class SyncService {
         detail.setStatus("success");
       }
       catch (Exception e) {
-        detail.setStatus("failed");
-        detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+        if (Thread.currentThread().isInterrupted()) {
+          detail.setStatus("cancelled");
+          detail.setErrorMessage("Task cancelled");
+        } else {
+          detail.setStatus("failed");
+          detail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+        }
       }
 
       details.add(detail);
