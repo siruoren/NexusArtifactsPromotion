@@ -1365,17 +1365,13 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       var hasPermission = result.hasPermission === true;
       var hasDeletePerm = result.hasDeletePermission === true;
       btn.setDisabled(!hasPermission || !hasDeletePerm);
-      if (!hasPermission) {
-        btn.setTooltip(_t('sync.permission.denied'));
-      } else if (!hasDeletePerm) {
-        btn.setTooltip(_t('sync.permission.disabled.tooltip'));
-      }
+      // Removed tooltip display for sync button
     })
     .catch(function () {
       // API failed - check if we know it's proxy from local state
       if (panel.destroyed || btn.destroyed) return;
       if (me.isProxyRepository(repoName)) {
-        btn.setTooltip(_t('sync.permission.denied.admin'));
+        // Removed tooltip display for sync button
       } else {
         // Not a known proxy repo - remove sync button
         btn.destroy();
@@ -1451,13 +1447,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       btnText = _t('docker.sync.button');
     }
 
-    var btnTooltip = tooltip || (disabled ? _t('sync.permission.disabled.tooltip') : '');
     var btn = Ext.create('Ext.button.Button', {
       text: btnText,
       iconCls: 'x-fa fa-sync',
       cls: 'sync-btn',
       disabled: !!disabled,
-      tooltip: btnTooltip,
+      tooltip: '',
       handler: function () {
         me.handleSyncClick(repoName, path, isDirectory, format);
       }
