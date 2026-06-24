@@ -1300,6 +1300,7 @@ public class PromotionService {
     copy.setStartTime(src.getStartTime());
     copy.setEndTime(src.getEndTime());
     copy.setErrorMessage(src.getErrorMessage());
+    copy.setRequestedPath(src.getRequestedPath());
     if (src.getItems() != null) {
       List<PromotionTaskResult.FileItem> itemsCopy = new ArrayList<>();
       for (PromotionTaskResult.FileItem item : src.getItems()) {
