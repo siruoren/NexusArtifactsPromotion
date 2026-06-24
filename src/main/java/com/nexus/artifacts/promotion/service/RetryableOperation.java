@@ -82,14 +82,17 @@ public class RetryableOperation {
       try {
         return callable.call();
       }
-      catch (InterruptedException e) {
-        // Re-interrupt and propagate - task was cancelled
-        Thread.currentThread().interrupt();
-        log.warn("[RETRY] {} interrupted during attempt {}/{}", operationName, attempt + 1, maxRetries + 1);
-        throw e;
-      }
       catch (Exception e) {
         lastException = e;
+
+        // Check for task cancellation/interruption immediately after catching exception
+        // This ensures that cancelled tasks stop retrying even if the exception is retryable
+        if (Thread.currentThread().isInterrupted()) {
+          log.warn("[RETRY] {} cancelled after exception (attempt {}/{})", 
+              operationName, attempt + 1, maxRetries + 1);
+          Thread.currentThread().interrupt(); // Restore interrupted status
+          throw new InterruptedException("Operation cancelled: " + operationName);
+        }
 
         if (!isRetryable(e) || attempt >= maxRetries) {
           if (attempt > 0) {
@@ -107,7 +110,8 @@ public class RetryableOperation {
         if (Thread.currentThread().isInterrupted()) {
           log.warn("[RETRY] {} cancelled before retry sleep (attempt {}/{})", 
               operationName, attempt + 1, maxRetries + 1);
-          throw new InterruptedException("Operation cancelled during retry delay: " + operationName);
+          Thread.currentThread().interrupt(); // Restore interrupted status
+          throw lastException; // Throw original exception instead of InterruptedException
         }
         
         Thread.sleep(delay);

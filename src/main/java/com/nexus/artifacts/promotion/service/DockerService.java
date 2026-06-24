@@ -1475,6 +1475,7 @@ public class DockerService {
     taskInfo.setUsername("system");
     taskInfo.setStartTime(System.currentTimeMillis());
     taskInfo.setStatus(TaskStatus.RUNNING);
+    taskInfo.setTaskType("sync");
 
     syncTaskInfos.put(taskId, taskInfo);
 
@@ -1701,6 +1702,7 @@ public class DockerService {
     initialInfo.setUsername(username);
     initialInfo.setStatus(TaskStatus.PENDING);
     initialInfo.setStartTime(System.currentTimeMillis());
+    initialInfo.setTaskType("sync");
     syncTaskInfos.put(preTaskId, initialInfo);
 
     log.info("Docker sync task {} created for {} by {}", preTaskId, request.getSourceRepository(), username);
@@ -1719,6 +1721,7 @@ public class DockerService {
         taskInfo.setUsername(username);
         taskInfo.setStartTime(System.currentTimeMillis());
         taskInfo.setStatus(TaskStatus.RUNNING);
+        taskInfo.setTaskType("sync");
 
         try {
           Repository repo = repositoryManager.get(request.getSourceRepository());
@@ -2558,6 +2561,9 @@ public class DockerService {
     List<SyncTaskInfo> tasks = new ArrayList<>();
     for (Map.Entry<String, SyncTaskInfo> entry : syncTaskInfos.entrySet()) {
       SyncTaskInfo info = entry.getValue();
+      if (info.getTaskType() == null) {
+        info.setTaskType("sync");
+      }
       TaskStatus status = taskExecutor.getSyncTaskStatus(entry.getKey());
       if (status != null) {
         info.setStatus(status);
@@ -2883,24 +2889,7 @@ public class DockerService {
   }
 
   private String[] extractAuthFromRepo(final Repository repo) {
-    try {
-      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
-      if (config == null) return null;
-      Map<String, Map<String, Object>> attributes = config.getAttributes();
-      if (attributes == null || !attributes.containsKey("httpclient")) return null;
-      @SuppressWarnings("unchecked")
-      Map<String, Object> httpClientAttrs = attributes.get("httpclient");
-      @SuppressWarnings("unchecked")
-      Map<String, Object> authAttrs = (Map<String, Object>) httpClientAttrs.get("authentication");
-      if (authAttrs == null) return null;
-      String username = (String) authAttrs.get("username");
-      String password = (String) authAttrs.get("password");
-      if (username != null && password != null) return new String[]{username, password};
-    }
-    catch (Exception e) {
-      log.debug("Failed to extract auth from repo {}: {}", repo.getName(), e.getMessage());
-    }
-    return null;
+    return ServiceUtils.extractAuthFromRepo(repo);
   }
 
   private void setAuthHeaders(final HttpURLConnection conn, final String cookieHeader, final String csrfToken) {
@@ -3041,8 +3030,7 @@ public class DockerService {
   }
 
   private String sanitizeErrorMessage(final String message) {
-    if (message == null) return "Unknown error";
-    return message.replaceAll("(?i)(password|token|secret|credential)\\s*[:=]\\s*\\S+", "$1:***");
+    return ServiceUtils.sanitizeErrorMessage(message);
   }
 
   private PromotionTaskResult copyPromotionResult(final PromotionTaskResult src) {
