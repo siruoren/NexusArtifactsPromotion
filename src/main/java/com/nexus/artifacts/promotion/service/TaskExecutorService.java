@@ -133,6 +133,20 @@ public class TaskExecutorService {
                                      final String taskId,
                                      final String username)
   {
+    return submitPromotionTask(task, taskDescription, taskId, username, null, null, null);
+  }
+
+  /**
+   * Submit a promotion task with full context (source/target repo and path).
+   */
+  public String submitPromotionTask(final Callable<PromotionTaskCallback> task,
+                                     final String taskDescription,
+                                     final String taskId,
+                                     final String username,
+                                     final String sourceRepository,
+                                     final String sourcePath,
+                                     final String targetRepository)
+  {
     log.info("Submitting promotion task {}: {}", taskId, taskDescription);
 
     // Check promotion queue capacity to prevent OOM
@@ -147,7 +161,8 @@ public class TaskExecutorService {
 
     try {
       Future<PromotionTaskCallback> future = promotionExecutor.submit(wrappedTask);
-      TaskHandle handle = new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis());
+      TaskHandle handle = new TaskHandle(taskId, future, TaskStatus.RUNNING, System.currentTimeMillis(),
+          sourceRepository, sourcePath, targetRepository);
       handle.username = username;
       promotionTasks.put(taskId, handle);
       return taskId;

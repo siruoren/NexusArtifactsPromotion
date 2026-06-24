@@ -271,7 +271,8 @@ public class PromotionService {
         }
       }
     }, String.format("Promote %s from %s to %s", request.getPath(),
-        request.getSourceRepository(), request.getTargetRepository()), taskId, username);
+        request.getSourceRepository(), request.getTargetRepository()), taskId, username,
+        request.getSourceRepository(), request.getPath(), request.getTargetRepository());
   }
 
   /**
@@ -311,6 +312,8 @@ public class PromotionService {
       String taskId = entry.getKey();
       // Skip if already in taskResults
       if (taskResults.containsKey(taskId)) continue;
+      // Skip Docker promotion tasks (handled by DockerService)
+      if (taskId.startsWith("docker-promo-")) continue;
 
       TaskExecutorService.TaskHandle handle = entry.getValue();
       SyncTaskInfo info = new SyncTaskInfo();

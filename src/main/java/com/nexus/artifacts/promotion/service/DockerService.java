@@ -1020,7 +1020,10 @@ public class DockerService {
         if (threadState != null) { threadState.clear(); }
       }
     }, String.format("Docker promote %s from %s to %s", request.getImage(),
-        request.getSourceRepository(), request.getTargetRepository()), taskId);
+        request.getSourceRepository(), request.getTargetRepository()), taskId, username,
+        request.getSourceRepository(),
+        request.isAllImages() ? "v2/" : (request.isPrefixMode() ? "v2/" + request.getImagePrefix() : "v2/" + request.getImage()),
+        request.getTargetRepository());
   }
 
   /**
@@ -2678,6 +2681,8 @@ public class DockerService {
       String taskId = entry.getKey();
       // Skip if already in promotionTaskResults
       if (promotionTaskResults.containsKey(taskId)) continue;
+      // Skip non-Docker promotion tasks (handled by PromotionService)
+      if (!taskId.startsWith("docker-promo-")) continue;
 
       TaskExecutorService.TaskHandle handle = entry.getValue();
       SyncTaskInfo info = new SyncTaskInfo();
