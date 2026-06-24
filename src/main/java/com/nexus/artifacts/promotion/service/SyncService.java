@@ -1264,118 +1264,60 @@ public class SyncService {
       }
 
       // Store the downloaded content directly via StorageTx
-      // Two-phase approach with delay:
-      //   Phase 1: Delete existing asset + component (if last asset) → commit
-      //   Delay: 1s after deleting component for browse node cleanup
-      //   Phase 2: Create new component + asset → commit
+      // Single transaction: delete old asset only (keep component) + find/create component + create new asset
+      // NEVER delete a component that will be reused - this avoids BrowseNodeCollisionException.
+      // Orphaned components (0 assets) are cleaned up after the entire sync completes.
 
       String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
       String group = extractGroupFromPath(assetPath, format);
       String componentName = extractComponentNameFromPath(assetPath);
 
-      // Phase 1: Delete existing asset and component in one transaction
-      boolean deletedComponent = false;
-      StorageTx deleteTx = null;
+      StorageTx tx = null;
       try {
-        deleteTx = repo.facet(StorageFacet.class).txSupplier().get();
-        deleteTx.begin();
+        tx = repo.facet(StorageFacet.class).txSupplier().get();
+        tx.begin();
 
-        Bucket bucket = deleteTx.findBucket(repo);
+        Bucket bucket = tx.findBucket(repo);
         if (bucket == null) {
           log.warn("Bucket not found for repository: {}", repo.getName());
           return false;
         }
 
         String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
-        Asset existingAsset = deleteTx.findAssetWithProperty("name", assetName, bucket);
+
+        // Step 1: Delete existing asset only - NEVER delete the component
+        // Deleting and re-creating the same component causes BrowseNodeCollisionException
+        // because browse nodes are updated asynchronously and may not clean up in time.
+        Asset existingAsset = tx.findAssetWithProperty("name", assetName, bucket);
         if (existingAsset == null && !assetPath.startsWith("/")) {
-          existingAsset = deleteTx.findAssetWithProperty("name", assetPath, bucket);
+          existingAsset = tx.findAssetWithProperty("name", assetPath, bucket);
         }
 
         if (existingAsset != null) {
-          // Try to delete component along with asset if this is the only asset
+          // Track component for orphan cleanup after sync
           try {
             org.sonatype.nexus.common.entity.EntityId compId = existingAsset.componentId();
             if (compId != null) {
-              Component existingComp = deleteTx.findComponentInBucket(compId, bucket);
+              Component existingComp = tx.findComponentInBucket(compId, bucket);
               if (existingComp != null) {
-                int assetCount = 0;
-                for (Asset a : deleteTx.browseAssets(existingComp)) {
-                  assetCount++;
-                }
-                if (assetCount <= 1) {
-                  // Delete component (cascades to delete all its assets)
-                  log.debug("Direct HTTP sync: deleting component group='{}' name='{}' along with asset {}",
-                      existingComp.group(), existingComp.name(), assetPath);
-                  deleteTx.deleteComponent(existingComp);
-                  deletedComponent = true;
+                String compKey = existingComp.group() + ":" + existingComp.name();
+                if (potentiallyOrphanedComponents != null) {
+                  potentiallyOrphanedComponents.add(compKey);
                 }
               }
             }
           } catch (Exception e) {
-            log.debug("Could not check/delete component for asset {}, will delete asset only: {}", assetPath, e.getMessage());
+            log.debug("Could not track component for orphan cleanup: {}", e.getMessage());
           }
-
-          if (!deletedComponent) {
-            log.debug("Direct HTTP sync: deleting existing asset {} (component has other assets)", assetPath);
-            deleteTx.deleteAsset(existingAsset);
-            // Track component for orphan cleanup
-            try {
-              org.sonatype.nexus.common.entity.EntityId compId = existingAsset.componentId();
-              if (compId != null) {
-                Component existingComp = deleteTx.findComponentInBucket(compId, bucket);
-                if (existingComp != null) {
-                  String compKey = existingComp.group() + ":" + existingComp.name();
-                  if (potentiallyOrphanedComponents != null) {
-                    potentiallyOrphanedComponents.add(compKey);
-                  }
-                }
-              }
-            } catch (Exception e) {
-              log.debug("Could not track component for orphan cleanup: {}", e.getMessage());
-            }
-          }
+          log.debug("Direct HTTP sync: deleting existing asset {} (keeping component for reuse)", assetPath);
+          tx.deleteAsset(existingAsset);
         }
 
-        deleteTx.commit();
-        log.debug("Direct HTTP sync: phase 1 (delete) completed for {}", assetPath);
-      } catch (Exception e) {
-        if (e instanceof InterruptedException) {
-          Thread.currentThread().interrupt();
-          throw e;
-        }
-        log.error("Direct HTTP sync: phase 1 (delete) failed for {}: {}", assetPath, e.getMessage());
-        try { if (deleteTx != null) deleteTx.rollback(); } catch (Exception ignored) {}
-        return false;
-      } finally {
-        if (deleteTx != null) { try { deleteTx.close(); } catch (Exception ignored) {} }
-      }
+        // Step 2: Find or create Component (reuse existing to avoid browse node collision)
+        Component component = findOrCreateComponent(tx, bucket, repo, group, componentName);
 
-      // Delay after deleting component to let browse nodes clean up
-      if (deletedComponent) {
-        try {
-          log.debug("Direct HTTP sync: waiting 1s after deleting component for browse node cleanup");
-          Thread.sleep(1000);
-        } catch (InterruptedException e) {
-          Thread.currentThread().interrupt();
-          throw e;
-        }
-      }
-
-      // Phase 2: Create new component and asset in one transaction
-      StorageTx createTx = null;
-      try {
-        createTx = repo.facet(StorageFacet.class).txSupplier().get();
-        createTx.begin();
-
-        Bucket bucket = createTx.findBucket(repo);
-        String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
-
-        // Find or create Component
-        Component component = findOrCreateComponent(createTx, bucket, repo, group, componentName);
-
-        // Create Asset under the Component
-        Asset asset = createTx.createAsset(bucket, component);
+        // Step 3: Create Asset under the Component
+        Asset asset = tx.createAsset(bucket, component);
         asset.name(assetName);
 
         // Set blob using InputStreamSupplier-based setBlob
@@ -1390,9 +1332,9 @@ public class SyncService {
 
         java.util.Map<String, String> headers = new java.util.LinkedHashMap<>();
 
-        createTx.setBlob(asset, assetName, streamSupplier, hashAlgos, headers, effectiveContentType, true);
-        createTx.saveAsset(asset);
-        createTx.commit();
+        tx.setBlob(asset, assetName, streamSupplier, hashAlgos, headers, effectiveContentType, true);
+        tx.saveAsset(asset);
+        tx.commit();
         log.info("Direct HTTP sync: stored asset {} with content type {} ({} bytes)", assetPath, effectiveContentType, fileSize);
         return true;
       }
@@ -1401,10 +1343,10 @@ public class SyncService {
           Thread.currentThread().interrupt();
           throw e;
         }
-        log.error("Direct HTTP sync: phase 2 (create) failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
+        log.error("Direct HTTP sync: store failed for {}: [{}] {}", assetPath, e.getClass().getSimpleName(), e.getMessage(), e);
         try {
-          if (createTx != null) {
-            createTx.rollback();
+          if (tx != null) {
+            tx.rollback();
           }
         } catch (Exception rbEx) {
           log.debug("Rollback failed for {}: {}", assetPath, rbEx.getMessage());
@@ -1412,8 +1354,8 @@ public class SyncService {
         return false;
       }
       finally {
-        if (createTx != null) {
-          try { createTx.close(); } catch (Exception ignored) {}
+        if (tx != null) {
+          try { tx.close(); } catch (Exception ignored) {}
         }
       }
     }
