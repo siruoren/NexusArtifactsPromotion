@@ -1342,55 +1342,44 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
   addSyncButtonIfProxy: function (panel, repoName, path, format, isDirectory) {
     var me = this;
 
-    // Quick synchronous check first
-    if (me.isProxyRepository(repoName)) {
-      // Always show sync button for proxy repos, check permissions via API
-      apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
-      .then(function (result) {
-        if (panel.destroyed || panel.query('button[cls=sync-btn]').length > 0) return;
-        var hasPermission = result.hasPermission === true;
-        var hasDeletePerm = result.hasDeletePermission === true;
-        // Disable if no sync permission; also disable if no delete permission
-        var disabled = !hasPermission || !hasDeletePerm;
-        var tooltip = '';
-        if (!hasPermission) {
-          tooltip = _t('sync.permission.denied');
-        } else if (!hasDeletePerm) {
-          tooltip = _t('sync.permission.disabled.tooltip');
-        }
-        me.addSyncButton(panel, repoName, path, format, isDirectory, disabled, tooltip);
-      })
-      .catch(function () {
-        // API failed (not logged in or error) - add disabled button
-        if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
-          me.addSyncButton(panel, repoName, path, format, isDirectory, true, _t('sync.permission.denied.admin'));
-        }
-      });
-      return;
+    // Docker format: show Docker-specific button text
+    var btnText = isDirectory ? _t('sync.button.text.directory') : _t('sync.button.text');
+    if (format === 'docker') {
+      btnText = _t('docker.sync.button');
     }
 
-    // Async API check as fallback - call /sync/permission directly to get isProxy
+    // Add button synchronously (disabled placeholder) to fix position order
+    var btn = me.createSyncButton(panel, repoName, path, format, isDirectory, true, '');
+    if (!btn) return;
+
+    // Async: check if proxy and update button state
     apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
     .then(function (result) {
-      var isProxy = result.isProxy === true;
-      if (isProxy) {
-        // Check panel still exists and no sync button already
-        if (!panel.destroyed && panel.query('button[cls=sync-btn]').length === 0) {
-          var hasPermission = result.hasPermission === true;
-          var hasDeletePerm = result.hasDeletePermission === true;
-          var disabled = !hasPermission || !hasDeletePerm;
-          var tooltip = '';
-          if (!hasPermission) {
-            tooltip = _t('sync.permission.denied');
-          } else if (!hasDeletePerm) {
-            tooltip = _t('sync.permission.disabled.tooltip');
-          }
-          me.addSyncButton(panel, repoName, path, format, isDirectory, disabled, tooltip);
-        }
+      if (panel.destroyed || btn.destroyed) return;
+      var isProxy = me.isProxyRepository(repoName) || result.isProxy === true;
+      if (!isProxy) {
+        // Not a proxy repo - remove sync button
+        btn.destroy();
+        return;
+      }
+      var hasPermission = result.hasPermission === true;
+      var hasDeletePerm = result.hasDeletePermission === true;
+      btn.setDisabled(!hasPermission || !hasDeletePerm);
+      if (!hasPermission) {
+        btn.setTooltip(_t('sync.permission.denied'));
+      } else if (!hasDeletePerm) {
+        btn.setTooltip(_t('sync.permission.disabled.tooltip'));
       }
     })
     .catch(function () {
-      // API failed (not logged in or error) - don't add sync button for non-proxy
+      // API failed - check if we know it's proxy from local state
+      if (panel.destroyed || btn.destroyed) return;
+      if (me.isProxyRepository(repoName)) {
+        btn.setTooltip(_t('sync.permission.denied.admin'));
+      } else {
+        // Not a known proxy repo - remove sync button
+        btn.destroy();
+      }
     });
   },
 
@@ -1406,61 +1395,51 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       btnText = _t('docker.promote.button');
     }
 
-    // Check promotion permission via API first
+    // Add button synchronously (disabled placeholder) to fix position order
+    var btn = Ext.create('Ext.button.Button', {
+      text: btnText,
+      iconCls: 'x-fa fa-arrow-up',
+      cls: 'promotion-btn',
+      disabled: true,
+      tooltip: '',
+      handler: function () {
+        me.handlePromotionClick(repoName, path, isDirectory, format);
+      }
+    });
+
+    if (panel.destroyed) return;
+
+    // Add button to existing nx-actions toolbar (dockedItems)
+    var actions = panel.down('nx-actions');
+    if (actions) {
+      actions.add(btn);
+    } else {
+      panel.addDocked({
+        xtype: 'toolbar',
+        dock: 'top',
+        items: [btn]
+      });
+    }
+
+    // Async: check promotion permission and update button state
     apiRequest('GET', '/promotion/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
     .then(function (result) {
+      if (panel.destroyed || btn.destroyed) return;
       var hasPermission = result.hasPermission === true;
-      var btn = Ext.create('Ext.button.Button', {
-        text: btnText,
-        iconCls: 'x-fa fa-arrow-up',
-        cls: 'promotion-btn',
-        disabled: !hasPermission,
-        tooltip: !hasPermission ? _t('promotion.permission.denied') : '',
-        handler: function () {
-          me.handlePromotionClick(repoName, path, isDirectory, format);
-        }
-      });
-
-      if (panel.destroyed) return;
-
-      // Add button to existing nx-actions toolbar (dockedItems)
-      var actions = panel.down('nx-actions');
-      if (actions) {
-        actions.add(btn);
-      } else {
-        panel.addDocked({
-          xtype: 'toolbar',
-          dock: 'top',
-          items: [btn]
-        });
+      btn.setDisabled(!hasPermission);
+      if (!hasPermission) {
+        btn.setTooltip(_t('promotion.permission.denied'));
       }
     })
     .catch(function () {
-      // API failed (not logged in or error) - add disabled button
-      if (panel.destroyed) return;
-      var btn = Ext.create('Ext.button.Button', {
-        text: btnText,
-        iconCls: 'x-fa fa-arrow-up',
-        cls: 'promotion-btn',
-        disabled: true,
-        tooltip: _t('promotion.permission.denied.admin'),
-        handler: function () {}
-      });
-
-      var actions = panel.down('nx-actions');
-      if (actions) {
-        actions.add(btn);
-      } else {
-        panel.addDocked({
-          xtype: 'toolbar',
-          dock: 'top',
-          items: [btn]
-        });
+      // API failed (not logged in or error) - keep button disabled
+      if (!panel.destroyed && !btn.destroyed) {
+        btn.setTooltip(_t('promotion.permission.denied.admin'));
       }
     });
   },
 
-  addSyncButton: function (panel, repoName, path, format, isDirectory, disabled, tooltip) {
+  createSyncButton: function (panel, repoName, path, format, isDirectory, disabled, tooltip) {
     var me = this;
     if (typeof isDirectory === 'undefined') {
       isDirectory = path && path.endsWith('/');
@@ -1484,6 +1463,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       }
     });
 
+    if (panel.destroyed) return null;
+
     var actions = panel.down('nx-actions');
     if (actions) {
       actions.add(btn);
@@ -1500,6 +1481,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         });
       }
     }
+    return btn;
   },
 
   handlePromotionClick: function (repoName, path, isDirectory, format) {
