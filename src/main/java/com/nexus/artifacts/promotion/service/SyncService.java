@@ -31,10 +31,6 @@ import org.sonatype.nexus.repository.storage.Bucket;
 import org.sonatype.nexus.repository.storage.Component;
 import org.sonatype.nexus.repository.storage.StorageFacet;
 import org.sonatype.nexus.repository.storage.StorageTx;
-import org.sonatype.nexus.repository.view.Content;
-import org.sonatype.nexus.repository.view.Request;
-import org.sonatype.nexus.repository.view.Response;
-import org.sonatype.nexus.repository.view.ViewFacet;
 
 import org.apache.shiro.subject.Subject;
 import org.apache.shiro.subject.support.SubjectThreadState;
@@ -1084,99 +1080,47 @@ public class SyncService {
   }
 
   /**
-   * Sync a single asset by dispatching a GET request through the repository's view facet.
+   * Sync a single asset by directly downloading from remote and storing via StorageTx.
    *
-   * Using ViewFacet.dispatch() routes the request through the full Nexus routing pipeline,
-   * which properly sets up TokenMatcher.State and other context attributes that
-   * ProxyFacet.get() requires. This avoids the "Missing: TokenMatcher$State" error.
+   * Uses direct HTTP download + StorageTx to ensure atomicity: delete existing asset/component
+   * and create new ones in the same transaction. Either both succeed or both roll back.
    *
    * Flow:
-   * 1. Check if asset exists in local cache
-   *    - If exists: delete it to force fresh download from remote
-   *    - If not exists: skip deletion, just fetch from remote
-   * 2. Invalidate negative cache so previously 404'd assets can be retried
-   * 3. Dispatch GET request through ViewFacet -> Nexus auto-fetches from remote if not cached
+   * 1. Invalidate negative cache so previously 404'd assets can be retried
+   * 2. Download file from remote via HTTP
+   * 3. In a single StorageTx transaction:
+   *    a. Delete existing asset (and component if last asset) if present
+   *    b. Create new component and asset with downloaded content
+   *    c. Commit (or rollback on failure)
    */
   void syncAssetViaContentFacet(final Repository repo, final String assetPath,
       final String[] repoAuth) throws Exception {
-    // For file extensions that are essentially zip archives but have specific MIME types,
-    // ViewFacet.dispatch() will store the specific type (e.g. application/x-xpinstall for .xpi),
-    // but Nexus's content validation on download will detect application/zip and reject it.
-    // Bypass ViewFacet.dispatch() for these files and use direct HTTP sync instead.
-    if (isZipBasedExtension(assetPath)) {
-      log.debug("Asset {} has zip-based extension, using direct HTTP sync to avoid Content-Type mismatch", assetPath);
-      boolean result = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
-      if (!result) {
-        throw new RuntimeException("Failed to sync asset " + assetPath + " via direct HTTP (zip-based extension)");
-      }
-      return;
-    }
-
-    log.debug("Syncing asset {} via ViewFacet.dispatch()", assetPath);
+    // Use direct HTTP sync for all assets to ensure atomicity:
+    // delete existing asset/component and create new one in the same transaction.
+    // ViewFacet.dispatch() manages its own transactions internally, so we cannot
+    // combine the delete and create into a single atomic operation with it.
+    log.debug("Syncing asset {} via direct HTTP (atomic delete+create)", assetPath);
 
     // Use file write lock to prevent concurrent sync of the same asset in the same repo
     writeLockManager.executeWithFileLockVoid(repo.getName(), assetPath, () -> {
       try {
-        // Step 1: Delete cached asset if it exists, using internal StorageTx API
-        deleteCachedAssetInternal(repo, assetPath);
-
-        // Step 2: Invalidate negative cache so previously 404'd assets can be retried
+        // Invalidate negative cache so previously 404'd assets can be retried
         invalidateNegativeCache(repo, assetPath);
 
-        // Step 3: Use ViewFacet.dispatch() - routes through full Nexus pipeline
-        ViewFacet viewFacet = repo.facet(ViewFacet.class);
-        if (viewFacet != null) {
-          Request request = new Request.Builder()
-              .action("GET")
-              .path("/" + assetPath)
-              .build();
-
-          Response response = viewFacet.dispatch(request);
-
-          if (response.getStatus().getCode() >= 200 && response.getStatus().getCode() < 300) {
-            log.info("Successfully synced asset {} from remote (HTTP {})",
-                assetPath, response.getStatus().getCode());
-          }
-          else {
-            int httpCode = response.getStatus().getCode();
-            // Attempt direct HTTP download fallback for Content-Type mismatch errors
-            // Nexus returns 404 when InvalidContentException prevents caching
-            if (httpCode == 404 || httpCode == 400) {
-              log.warn("ViewFacet.dispatch() returned HTTP {} for {}, attempting direct HTTP download fallback", httpCode, assetPath);
-              boolean fallbackResult = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
-              if (fallbackResult) {
-                log.info("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
-                return;
-              }
-              log.warn("Direct HTTP fallback also failed for {}", assetPath);
-            }
-            throw new RuntimeException("Failed to sync asset " + assetPath + ": HTTP " + httpCode);
-          }
-        }
-        else {
-          log.warn("Repository {} does not have ViewFacet, skipping sync", repo.getName());
+        // Direct HTTP sync: delete + create in the same StorageTx transaction
+        boolean result = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
+        if (!result) {
+          throw new RuntimeException("Failed to sync asset " + assetPath + " via direct HTTP");
         }
       }
       catch (Exception e) {
         // Check if the exception is caused by thread interruption (task cancellation)
-        if (e instanceof java.nio.channels.ClosedByInterruptException || 
+        if (e instanceof java.nio.channels.ClosedByInterruptException ||
             (e.getCause() instanceof java.nio.channels.ClosedByInterruptException)) {
           Thread.currentThread().interrupt();
           throw new RuntimeException("Task cancelled during sync of " + assetPath, e);
         }
-        
-        // Check if the exception is caused by Content-Type mismatch
-        String errorMsg = e.getMessage();
-        if (errorMsg != null && errorMsg.contains("InvalidContentException")) {
-          log.warn("Content-Type mismatch for {}, attempting direct HTTP download fallback", assetPath);
-          boolean fallbackResult = syncAssetViaDirectHttp(repo, assetPath, repoAuth);
-          if (fallbackResult) {
-          log.debug("Successfully synced asset {} via direct HTTP fallback (bypassed Content-Type check)", assetPath);
-          return;
-        }
-        log.warn("Direct HTTP fallback also failed for {} after InvalidContentException", assetPath);
-        }
-        log.error("Failed to sync asset {} via ViewFacet: {}", assetPath, e.getMessage());
+        log.error("Failed to sync asset {}: {}", assetPath, e.getMessage());
         throw new RuntimeException("Failed to sync from remote: " + e.getMessage(), e);
       }
     });
@@ -1324,34 +1268,54 @@ public class SyncService {
           existingAsset = tx.findAssetWithProperty("name", assetPath, bucket);
         }
         if (existingAsset != null) {
-          // For zip-based extensions, check if the existing asset has mismatched content type
-          // If so, force delete the component (which cascades to asset) to fix the content type
-          boolean forceDeleteComponent = false;
-          if (isZipBasedExtension(assetPath)) {
+          // Determine whether to delete the entire component (cascades to assets) or just the asset.
+          // If this is the last asset under the component, delete the component to prevent
+          // "component already exists" errors when re-creating. All in the same transaction
+          // to ensure atomicity: either both delete and create succeed, or both roll back.
+          boolean shouldDeleteComponent = false;
+          Component existingComponent = null;
+
+          try {
+            org.sonatype.nexus.common.entity.EntityId componentId = existingAsset.componentId();
+            if (componentId != null) {
+              existingComponent = tx.findComponentInBucket(componentId, bucket);
+              if (existingComponent != null) {
+                int assetCount = 0;
+                for (Asset a : tx.browseAssets(existingComponent)) {
+                  assetCount++;
+                }
+                if (assetCount <= 1) {
+                  shouldDeleteComponent = true;
+                  log.debug("Direct HTTP sync: will delete component {} (group={}) along with its last asset {}",
+                      existingComponent.name(), existingComponent.group(), assetPath);
+                }
+              }
+            }
+          } catch (Exception e) {
+            log.debug("Could not check component for asset {}, will delete asset only: {}", assetPath, e.getMessage());
+          }
+
+          // For zip-based extensions with mismatched content type, also force delete component
+          if (!shouldDeleteComponent && isZipBasedExtension(assetPath)) {
             String existingContentType = existingAsset.contentType();
             if (existingContentType != null && !existingContentType.isEmpty()) {
               boolean isZipType = "application/zip".equals(existingContentType)
                   || "application/x-zip-compressed".equals(existingContentType);
               if (!isZipType) {
-                log.info("Direct HTTP sync: force deleting asset {} with mismatched content type {} (should be zip-based)", 
+                log.info("Direct HTTP sync: force deleting asset {} with mismatched content type {} (should be zip-based)",
                     assetPath, existingContentType);
-                forceDeleteComponent = true;
+                if (existingComponent == null) {
+                  existingComponent = tx.findComponentWithProperty("name", componentName, bucket);
+                }
+                if (existingComponent != null && group.equals(existingComponent.group())) {
+                  shouldDeleteComponent = true;
+                }
               }
             }
           }
-          
-          if (forceDeleteComponent) {
-            // Delete the entire component (which cascades to assets) in the same transaction
-            // to ensure atomicity: either both delete and create succeed, or both roll back
-            Component existingComponent = tx.findComponentWithProperty("name", componentName, bucket);
-            if (existingComponent != null && group.equals(existingComponent.group())) {
-              log.debug("Direct HTTP sync: deleting component {} along with asset {} in same transaction", existingComponent.name(), assetPath);
-              tx.deleteComponent(existingComponent);
-            } else {
-              tx.deleteAsset(existingAsset);
-            }
-            // Do NOT commit here - keep everything in the same transaction
-            // so that if asset creation fails, the delete is also rolled back
+
+          if (shouldDeleteComponent && existingComponent != null) {
+            tx.deleteComponent(existingComponent);
           } else {
             log.debug("Direct HTTP sync: deleting existing asset {} before re-sync", assetPath);
             tx.deleteAsset(existingAsset);
@@ -1507,48 +1471,6 @@ public class SyncService {
         || lower.endsWith(".pptx")
         || lower.endsWith(".odt")
         || lower.endsWith(".ods");
-  }
-
-  /**
-   * Check if a cached asset has a content_type that will cause InvalidContentException on download.
-   * This happens when the asset was stored with a specific MIME type (e.g. application/x-xpinstall)
-   * but the actual content is detected as application/zip by Nexus's content validation.
-   */
-  private boolean hasMismatchedContentType(final Repository repo, final String assetPath) {
-    StorageTx tx = null;
-    try {
-      tx = repo.facet(StorageFacet.class).txSupplier().get();
-      tx.begin();
-
-      Bucket bucket = tx.findBucket(repo);
-      if (bucket == null) return false;
-
-      String assetName = assetPath.startsWith("/") ? assetPath.substring(1) : assetPath;
-      Asset asset = tx.findAssetWithProperty("name", assetName, bucket);
-      if (asset == null && !assetPath.startsWith("/")) {
-        asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
-      }
-      if (asset == null) return false;
-
-      String contentType = asset.contentType();
-      if (contentType != null && !contentType.isEmpty()) {
-        // If the stored content_type is NOT application/zip but the file is a zip-based extension,
-        // it means the content_type was set to a specific type (e.g. application/x-xpinstall)
-        // which will conflict with Nexus's content detection on download.
-        boolean isZipType = "application/zip".equals(contentType)
-            || "application/x-zip-compressed".equals(contentType);
-        return !isZipType;
-      }
-    }
-    catch (Exception e) {
-      log.debug("Failed to check content type for {}: {}", assetPath, e.getMessage());
-    }
-    finally {
-      if (tx != null) {
-        try { tx.close(); } catch (Exception ignored) { }
-      }
-    }
-    return false;
   }
 
   /**
@@ -2716,89 +2638,8 @@ public class SyncService {
   }
 
   // ========================================================================
-  // Cache management: delete local cache + invalidate negative cache
+  // Cache management: invalidate negative cache
   // ========================================================================
-
-  /**
-   * Delete a locally cached asset using Nexus internal StorageTx API.
-   * If the asset exists in the repository's local cache, it is deleted to force
-   * a fresh download from remote during the subsequent ViewFacet.dispatch().
-   */
-  private void deleteCachedAssetInternal(final Repository repo, final String assetPath) {
-    StorageTx tx = null;
-    try {
-      tx = repo.facet(StorageFacet.class).txSupplier().get();
-      tx.begin();
-      Bucket bucket = tx.findBucket(repo);
-      Asset asset = tx.findAssetWithProperty("name", assetPath, bucket);
-
-      // Fallback: try with leading slash
-      if (asset == null && !assetPath.startsWith("/")) {
-        asset = tx.findAssetWithProperty("name", "/" + assetPath, bucket);
-      }
-
-      if (asset != null) {
-        log.debug("Asset {} exists in cache, deleting to force fresh download", assetPath);
-
-        // Try to find and delete the associated component if this is the only asset under it.
-        // This prevents "component already exists" errors when ViewFacet.dispatch() re-creates it.
-        // Use componentId() to look up the component, then check if it's the last asset.
-        boolean componentDeleted = false;
-        try {
-          org.sonatype.nexus.common.entity.EntityId componentId = asset.componentId();
-          if (componentId != null) {
-            Component component = tx.findComponentInBucket(componentId, bucket);
-            if (component != null) {
-              // Count assets under this component
-              int assetCount = 0;
-              for (Asset a : tx.browseAssets(component)) {
-                assetCount++;
-              }
-
-              if (assetCount <= 1) {
-                // This is the only (or last) asset under the component — delete the whole component
-                // which cascades to assets, preventing "component already exists" on re-sync
-                log.debug("Deleting component {} (group={}) along with its last asset {}",
-                    component.name(), component.group(), assetPath);
-                tx.deleteComponent(component);
-                componentDeleted = true;
-              }
-            }
-          }
-        }
-        catch (Exception e) {
-          // componentId() or component lookup may fail for some formats (e.g. raw proxy without components)
-          log.debug("Could not check component for asset {}, will delete asset only: {}", assetPath, e.getMessage());
-        }
-
-        if (!componentDeleted) {
-          tx.deleteAsset(asset);
-        }
-
-        tx.commit();
-      }
-      else {
-        log.debug("Asset {} not in cache, will fetch fresh from remote", assetPath);
-      }
-    }
-    catch (Exception e) {
-      // Handle InterruptedException specially - thread is being cancelled
-      if (e instanceof InterruptedException) {
-        log.warn("Cleanup interrupted while deleting cached asset {} - thread cancellation in progress", assetPath);
-        Thread.currentThread().interrupt(); // Restore interrupted status
-      } else {
-        log.warn("Failed to delete cached asset {} via internal API: {}", assetPath, e.getMessage());
-      }
-      if (tx != null) {
-        try { tx.rollback(); } catch (Exception ex) { /* ignore */ }
-      }
-    }
-    finally {
-      if (tx != null) {
-        try { tx.close(); } catch (Exception e) { /* ignore */ }
-      }
-    }
-  }
 
   /**
    * Invalidate negative cache entries for a given path.
