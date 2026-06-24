@@ -1462,11 +1462,12 @@ public class SyncService {
   private void cleanupOrphanedComponents(final Repository repo,
       final java.util.Set<String> potentiallyOrphanedComponents) {
     if (potentiallyOrphanedComponents == null || potentiallyOrphanedComponents.isEmpty()) {
+      log.info("No orphaned components to check in repo {}", repo.getName());
       return;
     }
 
     try {
-      log.debug("Checking {} potentially orphaned component(s) in repo {}",
+      log.info("Checking {} potentially orphaned component(s) in repo {}",
           potentiallyOrphanedComponents.size(), repo.getName());
 
       for (String compKey : potentiallyOrphanedComponents) {
@@ -1490,17 +1491,19 @@ public class SyncService {
               assetCount++;
             }
             if (assetCount == 0) {
-              log.info("Deleting orphaned component: group='{}' name='{}'", group, name);
+              log.info("Deleting orphaned component: group='{}' name='{}' (0 assets)", group, name);
               tx.deleteComponent(component);
               tx.commit();
             } else {
+              log.info("Component group='{}' name='{}' still has {} asset(s), not orphaned", group, name, assetCount);
               tx.rollback();
             }
           } else {
+            log.info("Component group='{}' name='{}' not found or group mismatch, skipping", group, name);
             tx.rollback();
           }
         } catch (Exception e) {
-          log.debug("Failed to check/delete orphaned component group='{}' name='{}': {}",
+          log.info("Failed to check/delete orphaned component group='{}' name='{}': {}",
               group, name, e.getMessage());
           if (tx != null) { try { tx.rollback(); } catch (Exception ignored) {} }
         } finally {
@@ -1508,7 +1511,7 @@ public class SyncService {
         }
       }
     } catch (Exception e) {
-      log.debug("Orphaned component cleanup skipped for repo {}: {}", repo.getName(), e.getMessage());
+      log.info("Orphaned component cleanup skipped for repo {}: {}", repo.getName(), e.getMessage());
     }
   }
 
