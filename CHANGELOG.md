@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2026-06-24
+
+### Added
+
+- **Incremental Sync (MD5 Comparison)**: proxy repository sync now compares remote/local MD5 checksums to skip unchanged assets, significantly reducing sync time and bandwidth
+  - Non-Docker: compares remote MD5 (from search API or HTTP HEAD) with local asset MD5; skips matching files
+  - Docker: compares remote manifest Docker-Content-Digest with locally cached SHA256; skips matching blobs and manifests
+  - Fallback: when remote MD5 is unavailable, attempts HTTP HEAD to retrieve checksum; if still unavailable, performs full sync
+  - All MD5 comparison results are logged at INFO level for audit and troubleshooting
+
+### Changed
+
+- **Removed IncrementalSyncService**: inlined incremental sync logic into `SyncService` to eliminate Guice circular dependency (`IncrementalSyncService → SyncService → IncrementalSyncService`)
+- **Task Queue Refresh**: replaced `allDataStore.reload()` with `allDataStore.load({ callback })` to ensure UI updates after data refresh
+
+### Fixed
+
+- **Component Already Exists Error**: when deleting cached assets before re-sync, the associated Component was not deleted, causing "component already exists" errors on re-upload
+  - `deleteCachedAssetInternal()` in both `SyncService` and `DockerService` now cascades to delete the associated Component when it's the last asset
+- **Duplicate Promotion Tasks in Queue**: promotion tasks appeared twice in the task queue — one with empty source/path/result, one normal
+  - Root cause: `TaskExecutorService.TaskHandle` was created without source/path/target context
+  - Fix: added `submitPromotionTask` overload that accepts `sourceRepository`, `sourcePath`, `targetRepository` and stores them in `TaskHandle`
+  - `PromotionService` filters out Docker promotion tasks (`taskId.startsWith("docker-promo-")`)
+  - `DockerService` filters out non-Docker promotion tasks
+- **Promotion Path Display Error**: Docker promotion path showed `a/manifests/sha256:xxxxx` instead of the user-clicked image path; directory promotion showed a child file name instead of the directory path
+  - Root cause: `PromotionService.copyResult()` did not copy `requestedPath`, causing fallback to first item's path
+  - Fix: added `copy.setRequestedPath(src.getRequestedPath())` in `copyResult()`
+  - Docker promotion now stores `requestedPath` as `v2/<image>` (user-clicked path), not the manifest blob path
+
 ## [2.0.2] - 2026-06-22
 
 ### Changed
