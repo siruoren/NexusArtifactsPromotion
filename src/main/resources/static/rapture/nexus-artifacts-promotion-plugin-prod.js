@@ -1423,15 +1423,9 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       if (panel.destroyed || btn.destroyed) return;
       var hasPermission = result.hasPermission === true;
       btn.setDisabled(!hasPermission);
-      if (!hasPermission) {
-        btn.setTooltip(_t('promotion.permission.denied'));
-      }
     })
     .catch(function () {
       // API failed (not logged in or error) - keep button disabled
-      if (!panel.destroyed && !btn.destroyed) {
-        btn.setTooltip(_t('promotion.permission.denied.admin'));
-      }
     });
   },
 

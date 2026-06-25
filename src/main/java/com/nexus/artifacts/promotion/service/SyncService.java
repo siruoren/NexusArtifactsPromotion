@@ -1264,13 +1264,14 @@ public class SyncService {
       }
 
       // Store the downloaded content directly via StorageTx
-      // Single transaction: delete old asset only (keep component) + find/create component + create new asset
+      // For raw format: create asset WITHOUT component to avoid Nexus "Analyse application" issue
+      //   (zip-based files like docx/xlsx get analyzed as applications when they have a component)
+      // For other formats: create asset with component as usual
       // NEVER delete a component that will be reused - this avoids BrowseNodeCollisionException.
       // Orphaned components (0 assets) are cleaned up after the entire sync completes.
 
       String format = repo.getFormat() != null ? repo.getFormat().getValue() : "";
-      String group = extractGroupFromPath(assetPath, format);
-      String componentName = extractComponentNameFromPath(assetPath);
+      boolean isRawFormat = "raw".equals(format);
 
       StorageTx tx = null;
       try {
@@ -1313,11 +1314,19 @@ public class SyncService {
           tx.deleteAsset(existingAsset);
         }
 
-        // Step 2: Find or create Component (reuse existing to avoid browse node collision)
-        Component component = findOrCreateComponent(tx, bucket, repo, group, componentName);
-
-        // Step 3: Create Asset under the Component
-        Asset asset = tx.createAsset(bucket, component);
+        // Step 2: Create Asset
+        Asset asset;
+        if (isRawFormat) {
+          // Raw format: create asset WITHOUT component
+          // This prevents Nexus from analyzing zip-based files (docx, xlsx, etc.) as applications
+          asset = tx.createAsset(bucket, repo.getFormat());
+        } else {
+          // Other formats: find or create component, then create asset under it
+          String group = extractGroupFromPath(assetPath, format);
+          String componentName = extractComponentNameFromPath(assetPath);
+          Component component = findOrCreateComponent(tx, bucket, repo, group, componentName);
+          asset = tx.createAsset(bucket, component);
+        }
         asset.name(assetName);
 
         // Set blob using InputStreamSupplier-based setBlob
