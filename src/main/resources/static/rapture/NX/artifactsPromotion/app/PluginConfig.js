@@ -1391,12 +1391,12 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
       btnText = _t('docker.promote.button');
     }
 
-    // Add button synchronously (disabled placeholder) to fix position order
+    // Promotion button is always enabled; target repositories are filtered by delete permission
     var btn = Ext.create('Ext.button.Button', {
       text: btnText,
       iconCls: 'x-fa fa-arrow-up',
       cls: 'promotion-btn',
-      disabled: true,
+      disabled: false,
       tooltip: '',
       handler: function () {
         me.handlePromotionClick(repoName, path, isDirectory, format);
@@ -1416,17 +1416,6 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         items: [btn]
       });
     }
-
-    // Async: check promotion permission and update button state
-    apiRequest('GET', '/promotion/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
-    .then(function (result) {
-      if (panel.destroyed || btn.destroyed) return;
-      var hasPermission = result.hasPermission === true;
-      btn.setDisabled(!hasPermission);
-    })
-    .catch(function () {
-      // API failed (not logged in or error) - keep button disabled
-    });
   },
 
   createSyncButton: function (panel, repoName, path, format, isDirectory, disabled, tooltip) {

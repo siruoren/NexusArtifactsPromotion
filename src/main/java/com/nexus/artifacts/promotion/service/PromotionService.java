@@ -98,7 +98,7 @@ public class PromotionService {
   // ==================== Public API ====================
 
   /**
-   * List target repositories where the current user has write permission.
+   * List target repositories where the current user has delete permission.
    */
   public TargetRepositoryList listTargetRepositories(final String sourceRepository, final String format) {
     Repository sourceRepo = repositoryManager.get(sourceRepository);
@@ -118,7 +118,7 @@ public class PromotionService {
       // Skip remote/proxy repositories - cannot upload to them via promotion
       String repoType = repo.getType().getValue();
       if ("proxy".equals(repoType)) continue;
-      if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) continue;
+      if (!permissionChecker.hasRepositoryDeletePermission(repo.getName())) continue;
       targets.add(new TargetRepositoryList.TargetRepository(
           repo.getName(), repo.getFormat().getValue(), repo.getType().getValue(), repo.getUrl()));
     }
