@@ -114,13 +114,15 @@ public class PromotionService {
     List<TargetRepositoryList.TargetRepository> targets = new ArrayList<>();
     for (Repository repo : repositoryManager.browse()) {
       if (repo.getName().equals(sourceRepository)) continue;
+      // Same-type check: match by format only (raw hosted/proxy/group are all same type;
+      // docker, maven2, etc. also match by their own format)
       if (!actualFormat.equals(repo.getFormat().getValue())) continue;
-      // Skip remote/proxy repositories - cannot upload to them via promotion
+      // Exclude proxy repositories - cannot promote to remote/proxy repos
       String repoType = repo.getType().getValue();
       if ("proxy".equals(repoType)) continue;
       if (!permissionChecker.hasRepositoryDeletePermission(repo.getName())) continue;
       targets.add(new TargetRepositoryList.TargetRepository(
-          repo.getName(), repo.getFormat().getValue(), repo.getType().getValue(), repo.getUrl()));
+          repo.getName(), repo.getFormat().getValue(), repoType, repo.getUrl()));
     }
 
     result.setRepositories(targets);
