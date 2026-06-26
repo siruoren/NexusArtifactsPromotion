@@ -527,13 +527,6 @@ function apiRequest(method, path, data) {
 
 // ==================== Permission Check ====================
 
-function checkPromotionPermission(repository, format) {
-  return apiRequest('GET', '/promotion/permission?repository=' +
-    encodeURIComponent(repository) + '&format=' + encodeURIComponent(format))
-    .then(function (result) { return result.hasPermission === true; })
-    .catch(function () { return false; });
-}
-
 function checkSyncPermission(repository, format) {
   return apiRequest('GET', '/sync/permission?repository=' +
     encodeURIComponent(repository) + '&format=' + encodeURIComponent(format))

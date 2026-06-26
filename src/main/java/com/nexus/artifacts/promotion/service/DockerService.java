@@ -855,7 +855,7 @@ public class DockerService {
     if (request.getTargetRepository() == null || request.getTargetRepository().trim().isEmpty()) {
       throw new IllegalArgumentException("targetRepository is required for promotion");
     }
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
+    permissionChecker.checkTargetDeletePermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
     final String taskId = "docker-promo-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();

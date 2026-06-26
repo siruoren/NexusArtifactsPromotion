@@ -135,7 +135,7 @@ public class PromotionService {
    */
   public FilePreviewResponse previewPromotion(final PromotionRequest request, final String nexusBaseUrl) {
     request.validate();
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
+    permissionChecker.checkTargetDeletePermission(request.getTargetRepository());
 
     FilePreviewResponse preview = new FilePreviewResponse();
     preview.setSourceRepository(request.getSourceRepository());
@@ -190,7 +190,7 @@ public class PromotionService {
                          final String nexusBaseUrl)
   {
     request.validate();
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
+    permissionChecker.checkTargetDeletePermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
 

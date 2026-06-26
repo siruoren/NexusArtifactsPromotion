@@ -90,71 +90,13 @@ public class PermissionChecker {
   }
 
   /**
-   * Check if the current user has promotion permission for a source repository.
-   * For source repo, we only need read permission (user can see the asset).
-   */
-  public boolean hasPromotionPermission(final String repositoryName, final String format) {
-    return hasRepositoryReadPermission(repositoryName, format);
-  }
-
-  /**
-   * Check if the current user has promotion permission for a target repository.
-   * For target repo, we need write (edit) permission.
-   */
-  public boolean hasPromotionPermissionForTarget(final String sourceRepository,
-                                                  final String targetRepository,
-                                                  final String format)
-  {
-    return hasRepositoryReadPermission(sourceRepository, format)
-        && hasRepositoryWritePermission(targetRepository, format);
-  }
-
-  /**
-   * Assert write permission on target repository, throwing exception if not authorized.
+   * Assert delete permission on target repository, throwing exception if not authorized.
    * Reads the format from the repository directly.
    */
-  public void checkTargetWritePermission(final String targetRepository) {
-    if (!hasRepositoryWritePermission(targetRepository)) {
+  public void checkTargetDeletePermission(final String targetRepository) {
+    if (!hasRepositoryDeletePermission(targetRepository)) {
       String username = getCurrentUsername();
-      throw new PermissionDeniedException("edit", username, targetRepository);
-    }
-  }
-
-  /**
-   * Assert write permission on target repository, throwing exception if not authorized.
-   * The exception includes username and repository name for UI display.
-   */
-  public void checkTargetWritePermission(final String targetRepository, final String format) {
-    if (!hasRepositoryWritePermission(targetRepository, format)) {
-      String username = getCurrentUsername();
-      throw new PermissionDeniedException("edit", username, targetRepository);
-    }
-  }
-
-  /**
-   * Assert promotion permission for source repository (read access).
-   */
-  public void checkPromotionPermission(final String repositoryName, final String format) {
-    if (!hasRepositoryReadPermission(repositoryName, format)) {
-      String username = getCurrentUsername();
-      throw new PermissionDeniedException("read", username, repositoryName);
-    }
-  }
-
-  /**
-   * Assert promotion permission for both source and target.
-   */
-  public void checkPromotionPermissionForTarget(final String sourceRepository,
-                                                  final String targetRepository,
-                                                  final String format)
-  {
-    if (!hasRepositoryReadPermission(sourceRepository, format)) {
-      String username = getCurrentUsername();
-      throw new PermissionDeniedException("read", username, sourceRepository);
-    }
-    if (!hasRepositoryWritePermission(targetRepository, format)) {
-      String username = getCurrentUsername();
-      throw new PermissionDeniedException("edit", username, targetRepository);
+      throw new PermissionDeniedException("delete", username, targetRepository);
     }
   }
 

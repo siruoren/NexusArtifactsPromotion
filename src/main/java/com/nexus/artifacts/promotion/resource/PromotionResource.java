@@ -60,38 +60,8 @@ public class PromotionResource implements Resource {
   }
 
   /**
-   * Check if the current user has write permission on a repository.
-   * Used by UI to determine whether to show the promotion button.
-   */
-  @GET
-  @Path("/permission")
-  @Produces(MediaType.APPLICATION_JSON)
-  @ApiOperation("Check write permission for a repository")
-  @ApiResponses({
-      @ApiResponse(code = 200, message = "Permission check result"),
-      @ApiResponse(code = 403, message = "No permission")
-  })
-  public Response checkPermission(@QueryParam("repository") final String repository,
-                                   @QueryParam("format") final String format)
-  {
-    try {
-      boolean hasPermission = permissionChecker.hasRepositoryWritePermission(repository, format);
-      return Response.ok()
-          .entity("{\"hasPermission\":" + hasPermission + ",\"repository\":\""
-              + ServiceUtils.jsonEscape(repository) + "\",\"format\":\"" + ServiceUtils.jsonEscape(format) + "\"}")
-          .build();
-    }
-    catch (Exception e) {
-      log.error("Permission check failed: {}", e.getMessage());
-      return Response.status(Response.Status.INTERNAL_SERVER_ERROR)
-          .entity("{\"error\":\"Permission check failed\"}")
-          .build();
-    }
-  }
-
-  /**
    * List target repositories available for promotion.
-   * Only returns repositories of the same format where the user has write permission.
+   * Only returns repositories of the same format where the user has delete permission.
    */
   @GET
   @Path("/targets")
