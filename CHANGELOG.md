@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [2.1.0] - 2026-06-24
+## [2.1.0] - 2026-06-25
 
 ### Added
 
@@ -16,9 +16,25 @@ All notable changes to this project will be documented in this file.
 
 - **Removed IncrementalSyncService**: inlined incremental sync logic into `SyncService` to eliminate Guice circular dependency (`IncrementalSyncService → SyncService → IncrementalSyncService`)
 - **Task Queue Refresh**: replaced `allDataStore.reload()` with `allDataStore.load({ callback })` to ensure UI updates after data refresh
+- **Promotion Button Always Enabled**: promotion button is no longer gated by frontend permission check; target repository list is filtered by user's `edit` + `delete` permissions on the backend
+- **Promotion Target Repository Filtering**: target repositories are now filtered by same format (e.g. raw-hosted, raw-proxy, raw-group are all "raw"), excluding proxy repositories, and requiring both `edit` and `delete` permissions
+- **Sync Button Permission Simplified**: sync button now only requires `delete` permission (previously required both `edit` and `delete`)
+- **Promotion Permission Check**: added `checkTargetPromotionPermission` that verifies both `edit` (for uploading files) and `delete` (for deleting files) permissions on target repository
+- **Raw Format Asset Creation**: raw format repositories now create assets without Component association to prevent Nexus from triggering "Analyse application" on zip-based files (docx, xlsx, pptx, etc.)
 
 ### Fixed
 
+- **Docx File "Analyse Application" on Delete**: when deleting a directory containing docx files via Nexus UI, docx files would enter "Analyse application" state and become undeletable
+  - Root cause: Nexus automatically analyzes zip-based files (docx, xlsx, etc.) that have an associated Component
+  - Fix: raw format repositories now create assets without Component association, preventing Nexus auto-analysis
+- **Docker Promotion 403 for Non-Admin Users**: non-admin users with only `delete` permission on target repository would see 403 Forbidden during Docker promotion
+  - Root cause: promotion uploads files via HTTP PUT which requires `edit` permission; previous permission check only verified `delete`
+  - Fix: target repository now requires both `edit` and `delete` permissions
+- **Promotion File Status Incorrect on Failure**: when promotion task failed, remaining files in the progress window showed "cancelled" instead of "failed"
+  - Root cause: task failure and task cancellation were treated identically (both marked remaining items as "cancelled")
+  - Fix: failed tasks now mark remaining items as "failed"; cancelled tasks mark them as "cancelled"
+- **Promotion File Status Defaulted to Success**: items with non-terminal status (e.g. "processing") from backend were incorrectly defaulted to "success" in the progress window
+  - Fix: only definitive terminal statuses (success/failed/skipped/cancelled) from backend are now applied to the status map
 - **Component Already Exists Error**: when deleting cached assets before re-sync, the associated Component was not deleted, causing "component already exists" errors on re-upload
   - `deleteCachedAssetInternal()` in both `SyncService` and `DockerService` now cascades to delete the associated Component when it's the last asset
 - **Duplicate Promotion Tasks in Queue**: promotion tasks appeared twice in the task queue — one with empty source/path/result, one normal

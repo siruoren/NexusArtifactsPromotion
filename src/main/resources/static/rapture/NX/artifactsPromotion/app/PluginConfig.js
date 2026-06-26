@@ -525,15 +525,6 @@ function apiRequest(method, path, data) {
   });
 }
 
-// ==================== Permission Check ====================
-
-function checkSyncPermission(repository, format) {
-  return apiRequest('GET', '/sync/permission?repository=' +
-    encodeURIComponent(repository) + '&format=' + encodeURIComponent(format))
-    .then(function (result) { return result.hasPermission === true; })
-    .catch(function () { return false; });
-}
-
 // ==================== Dialog Helpers ====================
 
 function showAlertDialog(title, message) {
@@ -1345,7 +1336,7 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
     var btn = me.createSyncButton(panel, repoName, path, format, isDirectory, true, '');
     if (!btn) return;
 
-    // Async: check if proxy and update button state
+    // Async: check if proxy and has delete permission, then update button state
     apiRequest('GET', '/sync/permission?repository=' + encodeURIComponent(repoName) + '&format=' + encodeURIComponent(format || ''))
     .then(function (result) {
       if (panel.destroyed || btn.destroyed) return;
@@ -1355,10 +1346,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         btn.destroy();
         return;
       }
-      var hasPermission = result.hasPermission === true;
       var hasDeletePerm = result.hasDeletePermission === true;
-      btn.setDisabled(!hasPermission || !hasDeletePerm);
-      // Removed tooltip display for sync button
+      btn.setDisabled(!hasDeletePerm);
     })
     .catch(function () {
       // API failed - check if we know it's proxy from local state
@@ -1474,46 +1463,17 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
   executeSync: function (repoName, path, isDirectory, format) {
     var me = this;
-    // Docker format: use the same sync mechanism as other formats
-    if (format === 'docker') {
-      checkSyncPermission(repoName, format).then(function (hasPermission) {
-        if (!hasPermission) {
-          showAlertDialog(_t('common.noPermission'), _t('sync.permission.denied'));
-          return;
-        }
-        apiRequest('POST', '/sync/execute', {
-          repositoryName: repoName,
-          path: path,
-          isDirectory: isDirectory,
-          format: format
-        })
-        .then(function (result) {
-          me.showSyncProgressWindow(result, repoName, path, isDirectory);
-        })
-        .catch(function (err) {
-          showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
-        });
-      });
-      return;
-    }
-    // Default: generic sync
-    checkSyncPermission(repoName, format).then(function (hasPermission) {
-      if (!hasPermission) {
-        showAlertDialog(_t('common.noPermission'), _t('sync.permission.denied'));
-        return;
-      }
-      apiRequest('POST', '/sync/execute', {
-        repositoryName: repoName,
-        path: path,
-        isDirectory: isDirectory,
-        format: format
-      })
-      .then(function (result) {
-        me.showSyncProgressWindow(result, repoName, path, isDirectory);
-      })
-      .catch(function (err) {
-        showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
-      });
+    apiRequest('POST', '/sync/execute', {
+      repositoryName: repoName,
+      path: path,
+      isDirectory: isDirectory,
+      format: format
+    })
+    .then(function (result) {
+      me.showSyncProgressWindow(result, repoName, path, isDirectory);
+    })
+    .catch(function (err) {
+      showAlertDialog(_t('sync.execute.failed'), sanitize(err.message));
     });
   },
 
@@ -2066,11 +2026,11 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         for (var i = 0; i < backendItems.length; i++) {
           var item = backendItems[i];
           if (!item.path) continue;
-          var itemStatus = item.status;
-          if (itemStatus !== 'failed' && itemStatus !== 'skipped' && itemStatus !== 'success') {
-            itemStatus = 'success';
+          var itemStatus = (item.status || '').toLowerCase();
+          // Only update if backend has a definitive status
+          if (itemStatus === 'failed' || itemStatus === 'skipped' || itemStatus === 'success' || itemStatus === 'cancelled') {
+            statusMap[item.path] = itemStatus;
           }
-          statusMap[item.path] = itemStatus;
         }
 
         // Sync current page store records from statusMap
@@ -2083,7 +2043,8 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
         });
 
         if (statusStr === 'completed' || statusStr === 'failed' || statusStr === 'cancelled') {
-            var taskFailed = (statusStr === 'failed' || statusStr === 'cancelled');
+            var taskFailed = (statusStr === 'failed');
+            var taskCancelled = (statusStr === 'cancelled');
 
             // Mark any remaining pending/processing items in statusMap
             // If backend processed fewer items than total, remaining items were NOT promoted
@@ -2097,9 +2058,14 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
 
             for (var p in statusMap) {
               if (statusMap[p] !== 'success' && statusMap[p] !== 'failed' && statusMap[p] !== 'skipped' && statusMap[p] !== 'cancelled') {
-                // If task failed/cancelled or there are unprocessed items, mark remaining as cancelled
-                // Only mark as success if task completed AND all items were processed
-                statusMap[p] = (taskFailed || hasUnprocessed) ? 'cancelled' : 'success';
+                // cancelled task -> cancelled; failed task -> failed; completed with unprocessed -> failed
+                if (taskCancelled) {
+                  statusMap[p] = 'cancelled';
+                } else if (taskFailed || hasUnprocessed) {
+                  statusMap[p] = 'failed';
+                } else {
+                  statusMap[p] = 'success';
+                }
               }
             }
 
@@ -2108,7 +2074,13 @@ Ext.define('NX.artifactsPromotion.controller.Promotion', {
             store.each(function (rec) {
               var st = rec.get('status');
               if (st !== 'success' && st !== 'failed' && st !== 'skipped' && st !== 'cancelled') {
-                rec.set('status', (taskFailed || hasUnprocessed) ? 'cancelled' : 'success');
+                if (taskCancelled) {
+                  rec.set('status', 'cancelled');
+                } else if (taskFailed || hasUnprocessed) {
+                  rec.set('status', 'failed');
+                } else {
+                  rec.set('status', 'success');
+                }
               }
             });
 

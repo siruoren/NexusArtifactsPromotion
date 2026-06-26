@@ -120,6 +120,8 @@ public class PromotionService {
       // Exclude proxy repositories - cannot promote to remote/proxy repos
       String repoType = repo.getType().getValue();
       if ("proxy".equals(repoType)) continue;
+      // Target repo needs both edit (to upload files) and delete (to delete files) permissions
+      if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) continue;
       if (!permissionChecker.hasRepositoryDeletePermission(repo.getName())) continue;
       targets.add(new TargetRepositoryList.TargetRepository(
           repo.getName(), repo.getFormat().getValue(), repoType, repo.getUrl()));
@@ -135,7 +137,7 @@ public class PromotionService {
    */
   public FilePreviewResponse previewPromotion(final PromotionRequest request, final String nexusBaseUrl) {
     request.validate();
-    permissionChecker.checkTargetDeletePermission(request.getTargetRepository());
+    permissionChecker.checkTargetPromotionPermission(request.getTargetRepository());
 
     FilePreviewResponse preview = new FilePreviewResponse();
     preview.setSourceRepository(request.getSourceRepository());
@@ -190,7 +192,7 @@ public class PromotionService {
                          final String nexusBaseUrl)
   {
     request.validate();
-    permissionChecker.checkTargetDeletePermission(request.getTargetRepository());
+    permissionChecker.checkTargetPromotionPermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
 

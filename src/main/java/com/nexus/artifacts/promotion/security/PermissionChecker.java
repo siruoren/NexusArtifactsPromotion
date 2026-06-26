@@ -75,25 +75,26 @@ public class PermissionChecker {
   }
 
   /**
-   * Check if the current user has read permission on a repository.
-   * Uses Nexus system permission: nexus:repository-view:{format}:{repoName}:read
-   */
-  public boolean hasRepositoryReadPermission(final String repositoryName, final String format) {
-    Subject subject = SecurityUtils.getSubject();
-    if (subject == null || !subject.isAuthenticated()) {
-      return false;
-    }
-
-    String fmt = (format != null && !format.isEmpty()) ? format : "raw";
-    String permission = "nexus:repository-view:" + fmt + ":" + repositoryName + ":read";
-    return subject.isPermitted(permission);
-  }
-
-  /**
    * Assert delete permission on target repository, throwing exception if not authorized.
    * Reads the format from the repository directly.
    */
   public void checkTargetDeletePermission(final String targetRepository) {
+    if (!hasRepositoryDeletePermission(targetRepository)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("delete", username, targetRepository);
+    }
+  }
+
+  /**
+   * Assert promotion permission on target repository (both edit and delete).
+   * Promotion needs edit to upload files and delete to remove files.
+   * Reads the format from the repository directly.
+   */
+  public void checkTargetPromotionPermission(final String targetRepository) {
+    if (!hasRepositoryWritePermission(targetRepository)) {
+      String username = getCurrentUsername();
+      throw new PermissionDeniedException("edit", username, targetRepository);
+    }
     if (!hasRepositoryDeletePermission(targetRepository)) {
       String username = getCurrentUsername();
       throw new PermissionDeniedException("delete", username, targetRepository);
