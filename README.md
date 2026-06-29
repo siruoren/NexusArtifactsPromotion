@@ -648,4 +648,6 @@ src/main/java/com/nexus/artifacts/promotion/
 ---
 ## Star History
 
+
 [![Star History Chart](https://api.star-history.com/chart?repos=devpassops/NexusArtifactsPromotion&type=date&legend=top-left)](https://www.star-history.com/?repos=devpassops%2FNexusArtifactsPromotion&type=date&legend=top-left)
+
