@@ -27,6 +27,7 @@ import org.sonatype.nexus.repository.Repository;
 import org.sonatype.nexus.repository.manager.RepositoryManager;
 import org.sonatype.nexus.repository.storage.Asset;
 import org.sonatype.nexus.repository.storage.Bucket;
+import org.sonatype.nexus.repository.storage.Component;
 import org.sonatype.nexus.repository.storage.StorageFacet;
 import org.sonatype.nexus.repository.storage.StorageTx;
 import org.sonatype.nexus.repository.view.Request;
@@ -78,64 +79,6 @@ public class DockerService {
   /** Maximum retry attempts for individual blob/manifest operations */
   private static final int DOCKER_RETRY_ATTEMPTS = 3;
 
-  /** Nexus local base URLs for internal API calls - tries HTTPS first, then HTTP */
-  private static final String LOCAL_NEXUS_BASE_HTTPS = "https://localhost:8081";
-  private static final String LOCAL_NEXUS_BASE_HTTP = "http://localhost:8081";
-
-  /** Cached working local base URL */
-  private volatile String cachedLocalNexusBase = null;
-
-  /**
-   * Get the working local Nexus base URL.
-   * Tries HTTPS first (for Nexus with SSL), then falls back to HTTP.
-   * Result is cached after first successful connection.
-   */
-  private String getLocalNexusBase() {
-    if (cachedLocalNexusBase != null) {
-      return cachedLocalNexusBase;
-    }
-
-    // Try HTTPS first
-    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTPS)) {
-      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTPS;
-      log.debug("Local Nexus base URL resolved to HTTPS: {}", cachedLocalNexusBase);
-      return cachedLocalNexusBase;
-    }
-
-    // Fall back to HTTP
-    if (testLocalConnection(LOCAL_NEXUS_BASE_HTTP)) {
-      cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-      log.debug("Local Nexus base URL resolved to HTTP: {}", cachedLocalNexusBase);
-      return cachedLocalNexusBase;
-    }
-
-    // Default to HTTP if both fail (Nexus might not be fully started yet)
-    log.warn("Could not determine local Nexus base URL, defaulting to HTTP");
-    cachedLocalNexusBase = LOCAL_NEXUS_BASE_HTTP;
-    return cachedLocalNexusBase;
-  }
-
-  /**
-   * Test if a local Nexus URL is reachable.
-   */
-  private boolean testLocalConnection(final String baseUrl) {
-    try {
-      URL url = new URL(baseUrl + "/service/rest/v1/status");
-      HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-      SslHelper.applyTrustAllSsl(conn);
-      conn.setRequestMethod("GET");
-      conn.setConnectTimeout(3000);
-      conn.setReadTimeout(3000);
-      int code = conn.getResponseCode();
-      conn.disconnect();
-      return code < 500;
-    }
-    catch (Exception e) {
-      log.debug("Local connection test failed for {}: {}", baseUrl, e.getMessage());
-      return false;
-    }
-  }
-
   /** Set of Docker host repository names configured as release repositories (for promotion) */
   private volatile Set<String> dockerReleaseRepos = new HashSet<>();
 
@@ -169,6 +112,8 @@ public class DockerService {
 
   private final Map<String, PromotionTaskResult> promotionTaskResults = new ConcurrentHashMap<>();
   private final Map<String, SyncTaskInfo> syncTaskInfos = new ConcurrentHashMap<>();
+  /** Tracks running threads for scheduled Docker sync tasks, enabling cancellation via interrupt */
+  private final Map<String, Thread> scheduledTaskThreads = new ConcurrentHashMap<>();
 
   @Inject
   public DockerService(final RepositoryManager repositoryManager,
@@ -327,7 +272,7 @@ public class DockerService {
   private Map<String, DockerImageInfo> listDockerImagesViaLocalApi(final String repositoryName) {
     Map<String, DockerImageInfo> imageMap = new LinkedHashMap<>();
     try {
-      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
       String effectiveAuth = null;
 
@@ -343,7 +288,7 @@ public class DockerService {
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
         conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
 
         int code = conn.getResponseCode();
         if (code != 200) {
@@ -354,7 +299,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerComponents(json, imageMap);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
     }
@@ -417,7 +362,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -431,7 +376,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerSearchApiAssets(json, imageMap);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -472,7 +417,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -484,7 +429,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerComponents(json, imageMap);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -502,18 +447,18 @@ public class DockerService {
    */
   private void parseDockerSearchApiAssets(final String json, final Map<String, DockerImageInfo> imageMap) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       int pos = 0;
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String item = itemsSection.substring(objStart, objEnd + 1);
-        String path = extractJsonValue(item, "path");
+        String path = ServiceUtils.extractJsonValue(item, "path");
 
         if (path != null && path.contains("/manifests/")) {
           // Normalize path: strip leading slash
@@ -709,7 +654,7 @@ public class DockerService {
     List<String> tags = new ArrayList<>();
     try {
       String effectiveAuth = null;
-      String apiUrl = getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
+      String apiUrl = ServiceUtils.getLocalNexusBase() + "/service/rest/v1/components?repository=" + repositoryName;
       String continuationToken = null;
 
       do {
@@ -724,7 +669,7 @@ public class DockerService {
         conn.setConnectTimeout(15_000);
         conn.setReadTimeout(60_000);
         conn.setRequestProperty("Accept", "application/json");
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
 
         if (conn.getResponseCode() != 200) {
           conn.disconnect();
@@ -733,7 +678,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         extractTagsForImage(json, imageName, tags);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
     }
@@ -784,7 +729,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -821,7 +766,7 @@ public class DockerService {
         conn.setRequestProperty("Accept", "application/json");
 
         if (effectiveAuth != null) {
-          conn.setRequestProperty("Authorization", "Basic " + encodeAuth(effectiveAuth));
+          conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
         }
 
         int code = conn.getResponseCode();
@@ -832,7 +777,7 @@ public class DockerService {
 
         String json = readResponse(conn);
         parseDockerTagsFromSearchApi(json, imageName, tags);
-        continuationToken = extractJsonValue(json, "continuationToken");
+        continuationToken = ServiceUtils.extractJsonValue(json, "continuationToken");
       }
       while (continuationToken != null && !continuationToken.isEmpty());
 
@@ -849,7 +794,7 @@ public class DockerService {
    */
   private void parseDockerTagsFromSearchApi(final String json, final String imageName, final List<String> tags) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       String manifestPrefix = "v2/" + imageName + "/manifests/";
@@ -858,11 +803,11 @@ public class DockerService {
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String item = itemsSection.substring(objStart, objEnd + 1);
-        String path = extractJsonValue(item, "path");
+        String path = ServiceUtils.extractJsonValue(item, "path");
 
         if (path != null) {
           String normalizedPath = path.startsWith("/") ? path.substring(1) : path;
@@ -910,7 +855,7 @@ public class DockerService {
     if (request.getTargetRepository() == null || request.getTargetRepository().trim().isEmpty()) {
       throw new IllegalArgumentException("targetRepository is required for promotion");
     }
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
+    permissionChecker.checkTargetPromotionPermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
     final String taskId = "docker-promo-" + UUID.randomUUID().toString().substring(0, 8) + "-" + System.currentTimeMillis();
@@ -929,6 +874,10 @@ public class DockerService {
         result.setStartTime(System.currentTimeMillis());
         result.setTaskId(taskId);
         result.setStatus(TaskStatus.RUNNING.getValue());
+        // Store the original requested path for queue display
+        String requestedPath = request.isAllImages() ? "v2/" :
+            (request.isPrefixMode() ? "v2/" + request.getImagePrefix() : "v2/" + request.getImage());
+        result.setRequestedPath(requestedPath);
         promotionTaskResults.put(taskId, copyPromotionResult(result));
 
         List<PromotionTaskResult.FileItem> promotedItems = new ArrayList<>();
@@ -980,7 +929,7 @@ public class DockerService {
                   String manifestPath = "v2/" + imageName + "/manifests/" + tag;
                   PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
                   failedItem.setStatus("failed");
-                  failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                   promotedItems.add(failedItem);
                 }
                 updatePromotionTaskProgress(result, promotedItems);
@@ -1033,7 +982,7 @@ public class DockerService {
                 String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
                 PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
                 failedItem.setStatus("failed");
-                failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                 promotedItems.add(failedItem);
               }
               updatePromotionTaskProgress(result, promotedItems);
@@ -1045,7 +994,7 @@ public class DockerService {
           result.setEndTime(System.currentTimeMillis());
 
           long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long promotedCount = promotedItems.size() - skippedCount;
+          long promotedCount = promotedItems.stream().filter(f -> "success".equals(f.getStatus())).count();
           log.debug("Docker promotion task {} completed: {} items promoted, {} skipped, image={}",
               taskId, promotedCount, skippedCount, request.getImage());
         }
@@ -1055,7 +1004,7 @@ public class DockerService {
               || (e instanceof InterruptedException)
               || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
           result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
-          result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+          result.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
         }
 
@@ -1071,7 +1020,10 @@ public class DockerService {
         if (threadState != null) { threadState.clear(); }
       }
     }, String.format("Docker promote %s from %s to %s", request.getImage(),
-        request.getSourceRepository(), request.getTargetRepository()), taskId);
+        request.getSourceRepository(), request.getTargetRepository()), taskId, username,
+        request.getSourceRepository(),
+        request.isAllImages() ? "v2/" : (request.isPrefixMode() ? "v2/" + request.getImagePrefix() : "v2/" + request.getImage()),
+        request.getTargetRepository());
   }
 
   /**
@@ -1135,7 +1087,7 @@ public class DockerService {
                 log.error("Failed to promote sub-manifest {} for {}:{}: {}", ref.getDigest(), image, tag, e.getMessage());
                 PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(subManifestPath, "image");
                 failedItem.setStatus("failed");
-                failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                 items.add(failedItem);
               }
             }
@@ -1162,7 +1114,7 @@ public class DockerService {
               log.error("Failed to promote blob {} for {}:{}: {}", digest, image, tag, ex.getMessage());
               PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
               failedItem.setStatus("failed");
-              failedItem.setErrorMessage(sanitizeErrorMessage(ex.getMessage()));
+              failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(ex.getMessage()));
               items.add(failedItem);
             }
           }
@@ -1178,7 +1130,7 @@ public class DockerService {
           log.error("Failed to upload manifest for {}:{}: {}", image, tag, e.getMessage());
           PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(manifestPath, "image");
           failedItem.setStatus("failed");
-          failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           items.add(failedItem);
         }
       });
@@ -1218,7 +1170,7 @@ public class DockerService {
         log.error("Failed to promote blob {} for image {}: {}", digest, image, e.getMessage());
         PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(blobPath, "image");
         failedItem.setStatus("failed");
-        failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
         items.add(failedItem);
       }
     }
@@ -1276,7 +1228,7 @@ public class DockerService {
       log.error("Failed to upload sub-manifest {} for image {}: {}", ref.getDigest(), image, e.getMessage());
       PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(subManifestPath, "image");
       failedItem.setStatus("failed");
-      failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+      failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       items.add(failedItem);
     }
   }
@@ -1451,6 +1403,32 @@ public class DockerService {
    * @return SyncTaskInfo with sync results
    */
   public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request) {
+    return syncDockerImageScheduled(request, null);
+  }
+
+  /**
+   * Execute a scheduled Docker sync task with support for Nexus task cancellation.
+   *
+   * @param request the sync request
+   * @param task the Nexus task instance (may be null for direct API calls)
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request,
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task) {
+    return syncDockerImageScheduled(request, task, false);
+  }
+
+  /**
+   * Execute a scheduled Docker sync task with support for incremental mode.
+   *
+   * @param request the sync request
+   * @param task the Nexus task instance (may be null for direct API calls)
+   * @param incremental if true, skip images/tags whose manifest digest matches local cache
+   * @return SyncTaskInfo with sync results
+   */
+  public SyncTaskInfo syncDockerImageScheduled(final SyncRequest request,
+      final com.nexus.artifacts.promotion.task.ProxySyncTask task,
+      final boolean incremental) {
     String repoName = request.getRepositoryName();
     String syncPath = request.getPath();
     boolean isFullSync = (syncPath == null || syncPath.trim().isEmpty());
@@ -1480,6 +1458,9 @@ public class DockerService {
     syncTaskInfos.put(taskId, taskInfo);
 
     try {
+      // Register thread for cancellation support
+      scheduledTaskThreads.put(taskId, Thread.currentThread());
+
       // Step 1: Parse sync path to determine image and optional tag filter
       String imageFilter = null;
       String tagFilter = null;
@@ -1597,8 +1578,8 @@ public class DockerService {
       // Step 3: Sync each image:tag
       for (Map.Entry<String, List<String>> entry : imageTagsMap.entrySet()) {
         // Check for task cancellation/interruption
-        if (Thread.currentThread().isInterrupted()) {
-          log.warn("Docker scheduled sync task interrupted, stopping sync for {}", repoName);
+        if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+          log.warn("Docker scheduled sync task cancelled, stopping sync for {}", repoName);
           throw new InterruptedException("Task cancelled during Docker sync");
         }
 
@@ -1624,12 +1605,12 @@ public class DockerService {
 
         for (String tag : tags) {
           // Check for task cancellation/interruption before each tag
-          if (Thread.currentThread().isInterrupted()) {
-            log.warn("Docker scheduled sync task interrupted, stopping sync for {}:{}", repoName, imageName);
+          if (Thread.currentThread().isInterrupted() || (task != null && task.isCanceled())) {
+            log.warn("Docker scheduled sync task cancelled, stopping sync for {}:{}", repoName, imageName);
             throw new InterruptedException("Task cancelled during Docker sync");
           }
           try {
-            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag);
+            List<SyncTaskInfo.SyncFileDetail> tagFiles = syncDockerTag(repo, imageName, tag, incremental);
             syncedFiles.addAll(tagFiles);
           }
           catch (Exception e) {
@@ -1637,7 +1618,7 @@ public class DockerService {
             String manifestPath = "v2/" + imageName + "/manifests/" + tag;
             SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
             failedDetail.setStatus("failed");
-            failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+            failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
             syncedFiles.add(failedDetail);
           }
         }
@@ -1649,7 +1630,7 @@ public class DockerService {
 
       long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
       long failedCount = syncedFiles.stream().filter(f -> "failed".equals(f.getStatus())).count();
-      long syncedCount = syncedFiles.size() - skippedCount - failedCount;
+      long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
       taskInfo.setResult("Synced " + syncedCount + " items" +
           (skippedCount > 0 ? ", skipped " + skippedCount : "") +
           (failedCount > 0 ? ", failed " + failedCount : ""));
@@ -1660,15 +1641,19 @@ public class DockerService {
     catch (Exception e) {
       boolean isCancelled = Thread.currentThread().isInterrupted()
           || (e instanceof InterruptedException)
-          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
+          || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException)
+          || (task != null && task.isCanceled());
       if (isCancelled) {
         Thread.currentThread().interrupt();
       }
       log.error(isCancelled ? "Docker scheduled sync task cancelled: {}" : "Docker scheduled sync task failed: {}", e.getMessage(), isCancelled ? null : e);
       taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
-      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
       taskInfo.setEndTime(System.currentTimeMillis());
-      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + sanitizeErrorMessage(e.getMessage()));
+      taskInfo.setResult(isCancelled ? "Cancelled" : "Failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()));
+    }
+    finally {
+      scheduledTaskThreads.remove(taskId);
     }
 
     syncTaskInfos.put(taskId, taskInfo);
@@ -1794,7 +1779,7 @@ public class DockerService {
                   String manifestPath = "v2/" + imageName + "/manifests/" + tag;
                   SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
                   failedDetail.setStatus("failed");
-                  failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                   syncedFiles.add(failedDetail);
                 }
               }
@@ -1860,7 +1845,7 @@ public class DockerService {
                   String manifestPath = "v2/" + imageName + "/manifests/" + tag;
                   SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
                   failedDetail.setStatus("failed");
-                  failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                  failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                   syncedFiles.add(failedDetail);
                 }
               }
@@ -1911,7 +1896,7 @@ public class DockerService {
                 String manifestPath = "v2/" + request.getImage() + "/manifests/" + tag;
                 SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
                 failedDetail.setStatus("failed");
-                failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+                failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
                 syncedFiles.add(failedDetail);
               }
             }
@@ -1922,7 +1907,7 @@ public class DockerService {
           taskInfo.setEndTime(System.currentTimeMillis());
 
           long skippedCount = syncedFiles.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long syncedCount = syncedFiles.size() - skippedCount;
+          long syncedCount = syncedFiles.stream().filter(f -> "success".equals(f.getStatus())).count();
           taskInfo.setResult("Synced " + syncedCount + " items" +
               (skippedCount > 0 ? ", skipped " + skippedCount + " (unchanged)" : ""));
 
@@ -1938,7 +1923,7 @@ public class DockerService {
           }
           log.error(isCancelled ? "Docker sync task cancelled: {}" : "Docker sync task failed: {}", e.getMessage(), isCancelled ? null : e);
           taskInfo.setStatus(isCancelled ? TaskStatus.CANCELLED : TaskStatus.FAILED);
-          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+          taskInfo.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           taskInfo.setEndTime(System.currentTimeMillis());
         }
 
@@ -1969,15 +1954,53 @@ public class DockerService {
   private List<SyncTaskInfo.SyncFileDetail> syncDockerTag(
       final Repository repo, final String image, final String tag) throws Exception
   {
+    return syncDockerTag(repo, image, tag, false);
+  }
+
+  /**
+   * Sync a single Docker image:tag with optional incremental mode.
+   *
+   * Incremental mode: compare remote manifest digest with local cached manifest digest.
+   * If digests match, skip the entire image:tag (manifest + blobs).
+   * If digests differ or manifest is not cached, re-sync manifest and blobs.
+   * For blobs, skip if already cached locally (blob content is immutable by digest).
+   *
+   * Full mode (default): always re-sync by deleting cache + invalidating negative cache + dispatching GET.
+   */
+  private List<SyncTaskInfo.SyncFileDetail> syncDockerTag(
+      final Repository repo, final String image, final String tag, final boolean incremental) throws Exception
+  {
     List<SyncTaskInfo.SyncFileDetail> details = new ArrayList<>();
     String manifestPath = "v2/" + image + "/manifests/" + tag;
 
-    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {})", image, tag, manifestPath);
+    log.info("[DOCKER-SYNC] Syncing {}:{} (manifest path: {}, incremental: {})", image, tag, manifestPath, incremental);
+
+    // Incremental check: compare remote manifest digest with local cached digest
+    if (incremental) {
+      String remoteDigest = getRemoteManifestDigest(repo, image, tag);
+      String localDigest = getLocalManifestDigest(repo, manifestPath);
+
+      if (remoteDigest != null && localDigest != null && digestsMatch(remoteDigest, localDigest)) {
+        log.info("[DOCKER-SYNC] Skipping {}:{} (digest match: {})", image, tag, localDigest);
+        SyncTaskInfo.SyncFileDetail skippedDetail = new SyncTaskInfo.SyncFileDetail(manifestPath, "image");
+        skippedDetail.setStatus("skipped");
+        skippedDetail.setRemoteMd5(remoteDigest);
+        skippedDetail.setLocalMd5(localDigest);
+        details.add(skippedDetail);
+        return details;
+      }
+      else {
+        log.info("[DOCKER-SYNC] Digest differs or missing, syncing {}:{} (remote={}, local={})",
+            image, tag,
+            remoteDigest != null ? remoteDigest.substring(0, Math.min(19, remoteDigest.length())) + "..." : "null",
+            localDigest != null ? localDigest.substring(0, Math.min(19, localDigest.length())) + "..." : "null");
+      }
+    }
 
     // Use image:tag level lock to ensure Manifest + Blob atomicity
     writeLockManager.executeWithFileLockVoid(repo.getName(), manifestPath, () -> {
       // Step 1: Sync manifest
-      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath);
+      SyncTaskInfo.SyncFileDetail manifestDetail = syncDockerAssetInternal(repo, manifestPath, incremental);
       details.add(manifestDetail);
 
       // Step 2: Read manifest content from local cache to parse blob references
@@ -2001,28 +2024,28 @@ public class DockerService {
             String subManifestPath = "v2/" + image + "/manifests/" + ref.getDigest();
             try {
               // Sync the sub-manifest
-              SyncTaskInfo.SyncFileDetail subDetail = syncDockerAssetInternal(repo, subManifestPath);
+              SyncTaskInfo.SyncFileDetail subDetail = syncDockerAssetInternal(repo, subManifestPath, incremental);
               details.add(subDetail);
 
               // Read and parse the sub-manifest to get its blobs
               String subManifestContent = readManifestContentFromCache(repo, subManifestPath);
               if (subManifestContent != null && !subManifestContent.isEmpty()) {
                 DockerManifestParser.DockerManifest subParsed = DockerManifestParser.parse(subManifestContent, ref.getMediaType());
-                syncBlobsForManifest(repo, image, subParsed, details);
+                syncBlobsForManifest(repo, image, subParsed, details, incremental);
               }
             }
             catch (Exception e) {
               log.error("Failed to sync sub-manifest {} for {}:{}: {}", ref.getDigest(), image, tag, e.getMessage());
               SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(subManifestPath, "image");
               failedDetail.setStatus("failed");
-              failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+              failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
               details.add(failedDetail);
             }
           }
         }
         else {
           // Single-platform manifest: sync config + layers
-          syncBlobsForManifest(repo, image, parsed, details);
+          syncBlobsForManifest(repo, image, parsed, details, incremental);
         }
       }
       catch (Exception e) {
@@ -2039,14 +2062,14 @@ public class DockerService {
           }
           String blobPath = "v2/" + image + "/blobs/" + digest;
           try {
-            SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+            SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath, incremental);
             details.add(blobDetail);
           }
           catch (Exception ex) {
             log.error("Failed to sync blob {} for {}:{}: {}", digest, image, tag, ex.getMessage());
             SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
             failedDetail.setStatus("failed");
-            failedDetail.setErrorMessage(sanitizeErrorMessage(ex.getMessage()));
+            failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(ex.getMessage()));
             details.add(failedDetail);
           }
         }
@@ -2062,6 +2085,16 @@ public class DockerService {
   private void syncBlobsForManifest(final Repository repo, final String image,
                                      final DockerManifestParser.DockerManifest manifest,
                                      final List<SyncTaskInfo.SyncFileDetail> details) {
+    syncBlobsForManifest(repo, image, manifest, details, false);
+  }
+
+  /**
+   * Sync all blobs (config + layers) for a single-platform manifest with incremental support.
+   */
+  private void syncBlobsForManifest(final Repository repo, final String image,
+                                     final DockerManifestParser.DockerManifest manifest,
+                                     final List<SyncTaskInfo.SyncFileDetail> details,
+                                     final boolean incremental) {
     Set<String> blobDigests = manifest.getAllBlobDigests();
     log.info("[DOCKER-SYNC] Syncing {} blobs for image {}", blobDigests.size(), image);
 
@@ -2075,14 +2108,14 @@ public class DockerService {
       String blobPath = "v2/" + image + "/blobs/" + digest;
 
       try {
-        SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath);
+        SyncTaskInfo.SyncFileDetail blobDetail = syncDockerAssetInternal(repo, blobPath, incremental);
         details.add(blobDetail);
       }
       catch (Exception e) {
         log.error("Failed to sync blob {} for image {}: {}", digest, image, e.getMessage());
         SyncTaskInfo.SyncFileDetail failedDetail = new SyncTaskInfo.SyncFileDetail(blobPath, "image");
         failedDetail.setStatus("failed");
-        failedDetail.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+        failedDetail.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
         details.add(failedDetail);
       }
     }
@@ -2092,7 +2125,34 @@ public class DockerService {
    * Internal method to sync a single Docker asset without acquiring lock (called within lock scope).
    */
   private SyncTaskInfo.SyncFileDetail syncDockerAssetInternal(final Repository repo, final String assetPath) throws Exception {
+    return syncDockerAssetInternal(repo, assetPath, false);
+  }
+
+  /**
+   * Internal method to sync a single Docker asset without acquiring lock (called within lock scope).
+   *
+   * Incremental mode: for blobs, check if already cached locally (blob content is immutable by digest).
+   * If cached, skip the sync. For manifests, always re-sync (manifest digest comparison is done at syncDockerTag level).
+   *
+   * Full mode (default): always re-sync by deleting cache + invalidating negative cache + dispatching GET.
+   */
+  private SyncTaskInfo.SyncFileDetail syncDockerAssetInternal(final Repository repo, final String assetPath,
+      final boolean incremental) throws Exception {
     SyncTaskInfo.SyncFileDetail detail = new SyncTaskInfo.SyncFileDetail(assetPath, "image");
+
+    // Incremental mode: skip blobs that are already cached locally
+    // Blob content is immutable (identified by digest), so if it exists locally, it's already correct
+    if (incremental && assetPath.contains("/blobs/")) {
+      // Extract digest from blob path (e.g., "v2/myimage/blobs/sha256:abc123" -> "sha256:abc123")
+      int blobsIdx = assetPath.indexOf("/blobs/");
+      String digest = assetPath.substring(blobsIdx + "/blobs/".length());
+
+      if (isDockerBlobCached(repo, assetPath, digest)) {
+        log.debug("[DOCKER-SYNC] Skipping blob {} (already cached)", assetPath);
+        detail.setStatus("skipped");
+        return detail;
+      }
+    }
 
     // Always re-sync: delete cached asset + invalidate negative cache + dispatch GET
     deleteCachedAssetInternal(repo, assetPath);
@@ -2147,7 +2207,7 @@ public class DockerService {
             InputStream is = blob.getInputStream();
             if (is != null) {
               try {
-                return readStream(is);
+                return ServiceUtils.readStream(is);
               }
               finally {
                 try { is.close(); } catch (Exception e) { /* ignore */ }
@@ -2198,7 +2258,7 @@ public class DockerService {
           conn.setRequestProperty("Accept", "application/json");
 
           if (authUsername != null && authPassword != null) {
-            conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+            conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
           }
 
           int code = conn.getResponseCode();
@@ -2268,7 +2328,7 @@ public class DockerService {
       conn.setRequestProperty("Accept", "application/json");
 
       if (authUsername != null && authPassword != null) {
-        conn.setRequestProperty("Authorization", "Basic " + encodeAuth(authUsername + ":" + authPassword));
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(authUsername + ":" + authPassword));
       }
 
       try {
@@ -2344,11 +2404,11 @@ public class DockerService {
       // Find the object after the key
       int objStart = json.indexOf('{', keyIdx + searchKey.length());
       if (objStart < 0) return null;
-      int objEnd = findMatchingBrace(json, objStart);
+      int objEnd = ServiceUtils.findMatchingBrace(json, objStart);
       if (objEnd < 0) return null;
 
       String obj = json.substring(objStart, objEnd + 1);
-      return extractJsonValue(obj, "digest");
+      return ServiceUtils.extractJsonValue(obj, "digest");
     }
     catch (Exception e) {
       return null;
@@ -2361,18 +2421,18 @@ public class DockerService {
   private List<String> extractLayerDigests(final String json) {
     List<String> digests = new ArrayList<>();
     try {
-      String layersArray = extractJsonArray(json, "layers");
+      String layersArray = ServiceUtils.extractJsonArray(json, "layers");
       if (layersArray == null) return digests;
 
       int pos = 0;
       while (pos < layersArray.length()) {
         int objStart = layersArray.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(layersArray, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(layersArray, objStart);
         if (objEnd < 0) break;
 
         String obj = layersArray.substring(objStart, objEnd + 1);
-        String digest = extractJsonValue(obj, "digest");
+        String digest = ServiceUtils.extractJsonValue(obj, "digest");
         if (digest != null && !digest.isEmpty()) {
           digests.add(digest);
         }
@@ -2391,18 +2451,18 @@ public class DockerService {
   private List<String> extractManifestListDigests(final String json) {
     List<String> digests = new ArrayList<>();
     try {
-      String manifestsArray = extractJsonArray(json, "manifests");
+      String manifestsArray = ServiceUtils.extractJsonArray(json, "manifests");
       if (manifestsArray == null) return digests;
 
       int pos = 0;
       while (pos < manifestsArray.length()) {
         int objStart = manifestsArray.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(manifestsArray, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(manifestsArray, objStart);
         if (objEnd < 0) break;
 
         String obj = manifestsArray.substring(objStart, objEnd + 1);
-        String digest = extractJsonValue(obj, "digest");
+        String digest = ServiceUtils.extractJsonValue(obj, "digest");
         if (digest != null && !digest.isEmpty()) {
           digests.add(digest);
         }
@@ -2422,7 +2482,7 @@ public class DockerService {
   private List<String> parseDockerTagsList(final String json) {
     List<String> tags = new ArrayList<>();
     try {
-      String tagsArray = extractJsonArray(json, "tags");
+      String tagsArray = ServiceUtils.extractJsonArray(json, "tags");
       if (tagsArray == null) return tags;
 
       int pos = 0;
@@ -2504,9 +2564,16 @@ public class DockerService {
   }
 
   /**
-   * Cancel a Docker sync task by updating its task info status to CANCELLED.
+   * Cancel a Docker sync task by interrupting its running thread and updating status.
    */
   public void cancelDockerSyncTask(final String taskId) {
+    // Interrupt the running thread first (for scheduled tasks)
+    Thread runningThread = scheduledTaskThreads.get(taskId);
+    if (runningThread != null) {
+      log.info("Interrupting Docker scheduled sync task thread for taskId: {}", taskId);
+      runningThread.interrupt();
+    }
+
     SyncTaskInfo info = syncTaskInfos.get(taskId);
     if (info != null && info.getStatus() != TaskStatus.CANCELLED) {
       log.info("Updating Docker sync task {} info status from {} to CANCELLED", taskId, info.getStatus());
@@ -2574,6 +2641,92 @@ public class DockerService {
       tasks.add(info);
     }
     return tasks;
+  }
+
+  /**
+   * Get all Docker promotion task infos (for queue display).
+   * Called by SyncQueueResource to merge Docker promotion tasks into the unified queue view.
+   */
+  public List<SyncTaskInfo> getAllPromotionTasksAsSyncTaskInfo() {
+    cleanupExpiredPromotionTaskResults();
+    List<SyncTaskInfo> tasks = new ArrayList<>();
+
+    // Get tasks from promotionTaskResults map (completed/failed)
+    for (Map.Entry<String, PromotionTaskResult> entry : promotionTaskResults.entrySet()) {
+      PromotionTaskResult result = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(result.getTaskId());
+      info.setTaskType("promotion");
+      info.setSourceRepository(result.getSourceRepository());
+      info.setTargetRepository(result.getTargetRepository());
+      // Display promotion path as "targetRepo: promoted path"
+      if (result.getTargetRepository() != null) {
+        String promotedPath = extractPromotedPath(result);
+        info.setPath(result.getTargetRepository() + ":" + promotedPath);
+      }
+      info.setStatus(TaskStatus.fromValue(result.getStatus()));
+      info.setStartTime(result.getStartTime());
+      info.setEndTime(result.getEndTime());
+      info.setUsername(result.getUsername());
+      info.setErrorMessage(result.getErrorMessage());
+      if (result.getItems() != null) {
+        info.setResult(result.getItems().size() + " items");
+      }
+      tasks.add(info);
+    }
+
+    // Get running tasks from TaskExecutorService
+    Map<String, TaskExecutorService.TaskHandle> promoTasks = taskExecutor.getPromotionTasks();
+    for (Map.Entry<String, TaskExecutorService.TaskHandle> entry : promoTasks.entrySet()) {
+      String taskId = entry.getKey();
+      // Skip if already in promotionTaskResults
+      if (promotionTaskResults.containsKey(taskId)) continue;
+      // Skip non-Docker promotion tasks (handled by PromotionService)
+      if (!taskId.startsWith("docker-promo-")) continue;
+
+      TaskExecutorService.TaskHandle handle = entry.getValue();
+      SyncTaskInfo info = new SyncTaskInfo();
+      info.setTaskId(handle.taskId);
+      info.setTaskType("promotion");
+      info.setSourceRepository(handle.sourceRepository);
+      info.setTargetRepository(handle.targetRepository);
+      // Display promotion path as "targetRepo: filePath"
+      if (handle.targetRepository != null) {
+        String promotedPath = (handle.sourcePath != null && !handle.sourcePath.isEmpty())
+            ? handle.sourcePath : "";
+        info.setPath(handle.targetRepository + ":" + promotedPath);
+      }
+      info.setStatus(handle.status);
+      info.setStartTime(handle.startTime);
+      info.setEndTime(handle.endTime);
+      info.setUsername(handle.username);
+      tasks.add(info);
+    }
+
+    return tasks;
+  }
+
+  /**
+   * Extract the promoted path from a Docker PromotionTaskResult.
+   * Priority:
+   * 1. Use requestedPath if available (original path clicked by user)
+   * 2. Fallback to first item's path
+   * Returns empty string if no path is available.
+   */
+  private String extractPromotedPath(final PromotionTaskResult result) {
+    // First priority: use the original requested path
+    if (result.getRequestedPath() != null && !result.getRequestedPath().isEmpty()) {
+      return result.getRequestedPath();
+    }
+    
+    // Fallback: use the first item's path
+    if (result.getItems() != null && !result.getItems().isEmpty()) {
+      String firstPath = result.getItems().get(0).getPath();
+      if (firstPath != null && !firstPath.isEmpty()) {
+        return firstPath;
+      }
+    }
+    return "";
   }
 
   /**
@@ -2696,22 +2849,22 @@ public class DockerService {
    */
   private void parseDockerComponents(final String json, final Map<String, DockerImageInfo> imageMap) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       int pos = 0;
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String componentObj = itemsSection.substring(objStart, objEnd + 1);
 
         // For Docker format: group = image name, version = tag
-        String group = extractJsonValue(componentObj, "group");
-        String name = extractJsonValue(componentObj, "name");
-        String version = extractJsonValue(componentObj, "version");
+        String group = ServiceUtils.extractJsonValue(componentObj, "group");
+        String name = ServiceUtils.extractJsonValue(componentObj, "name");
+        String version = ServiceUtils.extractJsonValue(componentObj, "version");
 
         // Docker images: group is the namespace/path, name is the image name
         // Full image name = group + "/" + name (or just name if group is empty)
@@ -2747,21 +2900,21 @@ public class DockerService {
    */
   private void extractTagsForImage(final String json, final String targetImage, final List<String> tags) {
     try {
-      String itemsSection = extractJsonArray(json, "items");
+      String itemsSection = ServiceUtils.extractJsonArray(json, "items");
       if (itemsSection == null) return;
 
       int pos = 0;
       while (pos < itemsSection.length()) {
         int objStart = itemsSection.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(itemsSection, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(itemsSection, objStart);
         if (objEnd < 0) break;
 
         String componentObj = itemsSection.substring(objStart, objEnd + 1);
 
-        String group = extractJsonValue(componentObj, "group");
-        String name = extractJsonValue(componentObj, "name");
-        String version = extractJsonValue(componentObj, "version");
+        String group = ServiceUtils.extractJsonValue(componentObj, "group");
+        String name = ServiceUtils.extractJsonValue(componentObj, "name");
+        String version = ServiceUtils.extractJsonValue(componentObj, "version");
 
         String imageName;
         if (group != null && !group.isEmpty() && !group.equals(name)) {
@@ -2786,6 +2939,248 @@ public class DockerService {
   }
 
   // ==================== MD5 / Cache / Auth Helpers ====================
+
+  /**
+   * Get the digest of a remote Docker manifest via Docker Registry v2 API.
+   * Uses HEAD request to get the Docker-Content-Digest header.
+   * Handles both Basic auth and Bearer token auth.
+   *
+   * @return the manifest digest (e.g., "sha256:abc123...") or null if not available
+   */
+  private String getRemoteManifestDigest(final Repository repo, final String image, final String tag) {
+    HttpURLConnection conn = null;
+    try {
+      org.sonatype.nexus.repository.config.Configuration config = repo.getConfiguration();
+      if (config == null || config.getAttributes() == null || !config.getAttributes().containsKey("proxy")) {
+        return null;
+      }
+
+      @SuppressWarnings("unchecked")
+      Map<String, Object> proxyAttrs = config.getAttributes().get("proxy");
+      String remoteUrl = (String) proxyAttrs.get("remoteUrl");
+      if (remoteUrl == null || remoteUrl.isEmpty()) return null;
+      if (!remoteUrl.endsWith("/")) remoteUrl += "/";
+
+      String[] repoAuth = extractAuthFromRepo(repo);
+      String fullUrl = remoteUrl + "v2/" + image + "/manifests/" + tag;
+
+      conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
+      conn.setRequestMethod("HEAD");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+      // Must set Accept header for manifest API to return proper content type
+      conn.setRequestProperty("Accept",
+          "application/vnd.docker.distribution.manifest.v2+json," +
+          "application/vnd.docker.distribution.manifest.list.v2+json," +
+          "application/vnd.oci.image.manifest.v1+json," +
+          "application/json");
+
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code == 401) {
+        // Try Docker token auth
+        String wwwAuth = conn.getHeaderField("Www-Authenticate");
+        conn.disconnect();
+        if (wwwAuth != null && wwwAuth.contains("Bearer")) {
+          String token = getDockerRegistryToken(wwwAuth, image, repoAuth);
+          if (token != null) {
+            conn = (HttpURLConnection) new URL(fullUrl).openConnection();
+            SslHelper.applyTrustAllSsl(conn);
+            conn.setRequestMethod("HEAD");
+            conn.setConnectTimeout(10_000);
+            conn.setReadTimeout(30_000);
+            conn.setRequestProperty("Accept",
+                "application/vnd.docker.distribution.manifest.v2+json," +
+                "application/vnd.docker.distribution.manifest.list.v2+json," +
+                "application/vnd.oci.image.manifest.v1+json," +
+                "application/json");
+            conn.setRequestProperty("Authorization", "Bearer " + token);
+            code = conn.getResponseCode();
+          }
+        }
+      }
+
+      if (code != 200) {
+        if (conn != null) conn.disconnect();
+        return null;
+      }
+
+      String digest = conn.getHeaderField("Docker-Content-Digest");
+      conn.disconnect();
+
+      if (digest != null && !digest.isEmpty()) {
+        log.debug("Found remote manifest digest for {}:{}: {}", image, tag, digest);
+        return digest;
+      }
+
+      return null;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get remote manifest digest for {}:{}: {}", image, tag, e.getMessage());
+      if (conn != null) { try { conn.disconnect(); } catch (Exception ignored) {} }
+      return null;
+    }
+  }
+
+  /**
+   * Get Docker registry auth token from Www-Authenticate header.
+   * Handles Bearer token authentication for Docker Hub and private registries.
+   */
+  private String getDockerRegistryToken(final String wwwAuth, final String imageName,
+      final String[] repoAuth) {
+    try {
+      String realm = null;
+      String service = null;
+
+      java.util.regex.Pattern realmPattern = java.util.regex.Pattern.compile("realm=\"([^\"]+)\"");
+      java.util.regex.Matcher realmMatcher = realmPattern.matcher(wwwAuth);
+      if (realmMatcher.find()) {
+        realm = realmMatcher.group(1);
+      }
+
+      java.util.regex.Pattern servicePattern = java.util.regex.Pattern.compile("service=\"([^\"]+)\"");
+      java.util.regex.Matcher serviceMatcher = servicePattern.matcher(wwwAuth);
+      if (serviceMatcher.find()) {
+        service = serviceMatcher.group(1);
+      }
+
+      if (realm == null) return null;
+
+      String tokenUrl = realm + "?service=" + java.net.URLEncoder.encode(service != null ? service : "", "UTF-8")
+          + "&scope=repository:" + imageName + ":pull";
+
+      HttpURLConnection conn = (HttpURLConnection) new URL(tokenUrl).openConnection();
+      SslHelper.applyTrustAllSsl(conn);
+      conn.setRequestMethod("GET");
+      conn.setConnectTimeout(10_000);
+      conn.setReadTimeout(30_000);
+
+      String effectiveAuth = (repoAuth != null && repoAuth.length >= 2 && repoAuth[0] != null)
+          ? repoAuth[0] + ":" + repoAuth[1] : null;
+      if (effectiveAuth != null) {
+        conn.setRequestProperty("Authorization", "Basic " + ServiceUtils.encodeAuth(effectiveAuth));
+      }
+
+      int code = conn.getResponseCode();
+      if (code != 200) {
+        conn.disconnect();
+        return null;
+      }
+
+      String json = readResponse(conn);
+      String token = ServiceUtils.extractJsonValue(json, "token");
+      if (token == null) {
+        token = ServiceUtils.extractJsonValue(json, "access_token");
+      }
+      return token;
+    }
+    catch (Exception e) {
+      log.debug("Failed to get Docker registry token: {}", e.getMessage());
+      return null;
+    }
+  }
+
+  /**
+   * Get the digest of a locally cached Docker manifest.
+   * Tries to get SHA256 checksum from the asset, which corresponds to the Docker-Content-Digest.
+   *
+   * @return the manifest digest (e.g., "sha256:abc123...") or null if not cached
+   */
+  private String getLocalManifestDigest(final Repository repo, final String manifestPath) {
+    StorageTx tx = null;
+    try {
+      tx = repo.facet(StorageFacet.class).txSupplier().get();
+      tx.begin();
+      Bucket bucket = tx.findBucket(repo);
+      if (bucket == null) return null;
+
+      Asset asset = tx.findAssetWithProperty("name", manifestPath, bucket);
+      if (asset == null && !manifestPath.startsWith("/")) {
+        asset = tx.findAssetWithProperty("name", "/" + manifestPath, bucket);
+      }
+      if (asset == null) return null;
+
+      // Method 1: Try SHA256 checksum (matches Docker-Content-Digest format)
+      try {
+        HashCode sha256Hash = asset.getChecksum(HashAlgorithm.SHA256);
+        if (sha256Hash != null) {
+          String sha256 = sha256Hash.toString();
+          if (!sha256.isEmpty()) {
+            if (!sha256.startsWith("sha256:")) {
+              sha256 = "sha256:" + sha256;
+            }
+            return sha256;
+          }
+        }
+      }
+      catch (Exception ignored) {}
+
+      // Method 2: Try blob headers for Content-Hash-SHA256
+      try {
+        if (asset.requireBlobRef() != null) {
+          Blob blob = tx.requireBlob(asset.requireBlobRef());
+          if (blob != null) {
+            Map<String, String> headers = blob.getHeaders();
+            String sha256 = headers.get("Content-Hash-SHA256");
+            if (sha256 == null || sha256.isEmpty()) {
+              sha256 = headers.get("content-hash-sha256");
+            }
+            if (sha256 != null && !sha256.isEmpty()) {
+              if (!sha256.startsWith("sha256:")) {
+                sha256 = "sha256:" + sha256;
+              }
+              return sha256;
+            }
+          }
+        }
+      }
+      catch (Exception ignored) {}
+    }
+    catch (Exception e) {
+      log.debug("Failed to get local manifest digest for {}/{}: {}", repo.getName(), manifestPath, e.getMessage());
+    }
+    finally {
+      if (tx != null) { try { tx.close(); } catch (Exception ignored) {} }
+    }
+    return null;
+  }
+
+  /**
+   * Compare two Docker digests for equality.
+   * Supports both "sha256:hex" and plain hex formats.
+   */
+  private boolean digestsMatch(final String digest1, final String digest2) {
+    if (digest1 == null || digest2 == null) return false;
+    if (digest1.equalsIgnoreCase(digest2)) return true;
+
+    // Handle "sha256:abc" vs "sha256:abc" or "abc" vs "sha256:abc"
+    String hex1 = extractDigestHex(digest1);
+    String hex2 = extractDigestHex(digest2);
+    if (hex1 != null && hex2 != null) {
+      return hex1.equalsIgnoreCase(hex2);
+    }
+    return false;
+  }
+
+  /**
+   * Extract the hex part from a digest string.
+   * "sha256:abc123" -> "abc123"
+   * "abc123" -> "abc123"
+   */
+  private String extractDigestHex(final String digest) {
+    if (digest == null) return null;
+    int colonIdx = digest.indexOf(':');
+    if (colonIdx >= 0 && (digest.startsWith("sha256:") || digest.startsWith("sha1:"))) {
+      return digest.substring(colonIdx + 1);
+    }
+    return digest;
+  }
 
   private String getAssetMd5(final String repoName, final String assetPath) {
     try {
@@ -2846,7 +3241,36 @@ public class DockerService {
       }
       if (asset != null) {
         log.debug("Deleting cached Docker asset: {}", assetPath);
-        tx.deleteAsset(asset);
+
+        // Try to find and delete the associated component if this is the only asset under it.
+        // This prevents "component already exists" errors when ViewFacet.dispatch() re-creates it.
+        boolean componentDeleted = false;
+        try {
+          org.sonatype.nexus.common.entity.EntityId componentId = asset.componentId();
+          if (componentId != null) {
+            Component component = tx.findComponentInBucket(componentId, bucket);
+            if (component != null) {
+              int assetCount = 0;
+              for (Asset a : tx.browseAssets(component)) {
+                assetCount++;
+              }
+
+              if (assetCount <= 1) {
+                log.debug("Deleting component {} along with its last asset {}", component.name(), assetPath);
+                tx.deleteComponent(component);
+                componentDeleted = true;
+              }
+            }
+          }
+        }
+        catch (Exception e) {
+          log.debug("Could not check component for Docker asset {}, will delete asset only: {}", assetPath, e.getMessage());
+        }
+
+        if (!componentDeleted) {
+          tx.deleteAsset(asset);
+        }
+
         tx.commit();
       }
     }
@@ -2919,86 +3343,7 @@ public class DockerService {
     return headers;
   }
 
-  // ==================== JSON Parsing Helpers ====================
-
-  private String extractJsonValue(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-    int valueStart = json.indexOf('"', colonIdx + 1);
-    if (valueStart < 0) return null;
-    int valueEnd = valueStart + 1;
-    while (valueEnd < json.length()) {
-      char c = json.charAt(valueEnd);
-      if (c == '"' && json.charAt(valueEnd - 1) != '\\') break;
-      valueEnd++;
-    }
-    if (valueEnd >= json.length()) return null;
-    return json.substring(valueStart + 1, valueEnd).replace("\\\"", "\"").replace("\\\\", "\\");
-  }
-
-  private String extractJsonArray(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-    int arrayStart = json.indexOf('[', colonIdx + 1);
-    if (arrayStart < 0) return null;
-    int arrayEnd = findMatchingBracket(json, arrayStart);
-    if (arrayEnd < 0) return null;
-    return json.substring(arrayStart + 1, arrayEnd);
-  }
-
-  private int findMatchingBracket(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) inString = !inString;
-      if (!inString) {
-        if (c == '[') depth++;
-        else if (c == ']') { depth--; if (depth == 0) return i; }
-      }
-    }
-    return -1;
-  }
-
-  private int findMatchingBrace(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) inString = !inString;
-      if (!inString) {
-        if (c == '{') depth++;
-        else if (c == '}') { depth--; if (depth == 0) return i; }
-      }
-    }
-    return -1;
-  }
-
   // ==================== Utility ====================
-
-  private String readStream(final InputStream input) throws IOException {
-    StringBuilder sb = new StringBuilder();
-    byte[] buffer = new byte[BUFFER_SIZE];
-    int bytesRead;
-    while ((bytesRead = input.read(buffer)) != -1) {
-      sb.append(new String(buffer, 0, bytesRead, "UTF-8"));
-    }
-    return sb.toString();
-  }
-
-  private String readErrorResponse(final HttpURLConnection conn) throws IOException {
-    InputStream errStream = conn.getErrorStream();
-    if (errStream != null) {
-      try { return readStream(errStream); } finally { try { errStream.close(); } catch (Exception e) { /* ignore */ } }
-    }
-    return "";
-  }
 
   private String readResponse(final HttpURLConnection conn) throws IOException {
     StringBuilder sb = new StringBuilder();
@@ -3010,10 +3355,6 @@ public class DockerService {
     return sb.toString();
   }
 
-  private String encodeAuth(final String userPass) {
-    return java.util.Base64.getEncoder().encodeToString(userPass.getBytes());
-  }
-
   private String extractChecksumValue(final String json, final String algo) {
     String checksumsPattern = "\"checksums\"";
     int checksumsIdx = json.indexOf(checksumsPattern);
@@ -3022,15 +3363,11 @@ public class DockerService {
     int objStart = json.indexOf('{', checksumsIdx + checksumsPattern.length());
     if (objStart < 0) return null;
 
-    int objEnd = findMatchingBrace(json, objStart);
+    int objEnd = ServiceUtils.findMatchingBrace(json, objStart);
     if (objEnd < 0) return null;
 
     String checksumsObj = json.substring(objStart, objEnd + 1);
-    return extractJsonValue(checksumsObj, algo);
-  }
-
-  private String sanitizeErrorMessage(final String message) {
-    return ServiceUtils.sanitizeErrorMessage(message);
+    return ServiceUtils.extractJsonValue(checksumsObj, algo);
   }
 
   private PromotionTaskResult copyPromotionResult(final PromotionTaskResult src) {
@@ -3044,6 +3381,7 @@ public class DockerService {
     copy.setStartTime(src.getStartTime());
     copy.setEndTime(src.getEndTime());
     copy.setErrorMessage(src.getErrorMessage());
+    copy.setRequestedPath(src.getRequestedPath());
     if (src.getItems() != null) {
       List<PromotionTaskResult.FileItem> itemsCopy = new ArrayList<>();
       for (PromotionTaskResult.FileItem item : src.getItems()) {

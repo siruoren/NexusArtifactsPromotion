@@ -2,6 +2,51 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0] - 2026-06-25
+
+### Added
+
+- **Incremental Sync (MD5 Comparison)**: proxy repository sync now compares remote/local MD5 checksums to skip unchanged assets, significantly reducing sync time and bandwidth
+  - Non-Docker: compares remote MD5 (from search API or HTTP HEAD) with local asset MD5; skips matching files
+  - Docker: compares remote manifest Docker-Content-Digest with locally cached SHA256; skips matching blobs and manifests
+  - Fallback: when remote MD5 is unavailable, attempts HTTP HEAD to retrieve checksum; if still unavailable, performs full sync
+  - All MD5 comparison results are logged at INFO level for audit and troubleshooting
+
+### Changed
+
+- **Removed IncrementalSyncService**: inlined incremental sync logic into `SyncService` to eliminate Guice circular dependency (`IncrementalSyncService → SyncService → IncrementalSyncService`)
+- **Task Queue Refresh**: replaced `allDataStore.reload()` with `allDataStore.load({ callback })` to ensure UI updates after data refresh
+- **Promotion Button Always Enabled**: promotion button is no longer gated by frontend permission check; target repository list is filtered by user's `edit` + `delete` permissions on the backend
+- **Promotion Target Repository Filtering**: target repositories are now filtered by same format (e.g. raw-hosted, raw-proxy, raw-group are all "raw"), excluding proxy repositories, and requiring both `edit` and `delete` permissions
+- **Sync Button Permission Simplified**: sync button now only requires `delete` permission (previously required both `edit` and `delete`)
+- **Promotion Permission Check**: added `checkTargetPromotionPermission` that verifies both `edit` (for uploading files) and `delete` (for deleting files) permissions on target repository
+- **Raw Format Asset Creation**: raw format repositories now create assets without Component association to prevent Nexus from triggering "Analyse application" on zip-based files (docx, xlsx, pptx, etc.)
+
+### Fixed
+
+- **Docx File "Analyse Application" on Delete**: when deleting a directory containing docx files via Nexus UI, docx files would enter "Analyse application" state and become undeletable
+  - Root cause: Nexus automatically analyzes zip-based files (docx, xlsx, etc.) that have an associated Component
+  - Fix: raw format repositories now create assets without Component association, preventing Nexus auto-analysis
+- **Docker Promotion 403 for Non-Admin Users**: non-admin users with only `delete` permission on target repository would see 403 Forbidden during Docker promotion
+  - Root cause: promotion uploads files via HTTP PUT which requires `edit` permission; previous permission check only verified `delete`
+  - Fix: target repository now requires both `edit` and `delete` permissions
+- **Promotion File Status Incorrect on Failure**: when promotion task failed, remaining files in the progress window showed "cancelled" instead of "failed"
+  - Root cause: task failure and task cancellation were treated identically (both marked remaining items as "cancelled")
+  - Fix: failed tasks now mark remaining items as "failed"; cancelled tasks mark them as "cancelled"
+- **Promotion File Status Defaulted to Success**: items with non-terminal status (e.g. "processing") from backend were incorrectly defaulted to "success" in the progress window
+  - Fix: only definitive terminal statuses (success/failed/skipped/cancelled) from backend are now applied to the status map
+- **Component Already Exists Error**: when deleting cached assets before re-sync, the associated Component was not deleted, causing "component already exists" errors on re-upload
+  - `deleteCachedAssetInternal()` in both `SyncService` and `DockerService` now cascades to delete the associated Component when it's the last asset
+- **Duplicate Promotion Tasks in Queue**: promotion tasks appeared twice in the task queue — one with empty source/path/result, one normal
+  - Root cause: `TaskExecutorService.TaskHandle` was created without source/path/target context
+  - Fix: added `submitPromotionTask` overload that accepts `sourceRepository`, `sourcePath`, `targetRepository` and stores them in `TaskHandle`
+  - `PromotionService` filters out Docker promotion tasks (`taskId.startsWith("docker-promo-")`)
+  - `DockerService` filters out non-Docker promotion tasks
+- **Promotion Path Display Error**: Docker promotion path showed `a/manifests/sha256:xxxxx` instead of the user-clicked image path; directory promotion showed a child file name instead of the directory path
+  - Root cause: `PromotionService.copyResult()` did not copy `requestedPath`, causing fallback to first item's path
+  - Fix: added `copy.setRequestedPath(src.getRequestedPath())` in `copyResult()`
+  - Docker promotion now stores `requestedPath` as `v2/<image>` (user-clicked path), not the manifest blob path
+
 ## [2.0.2] - 2026-06-22
 
 ### Changed

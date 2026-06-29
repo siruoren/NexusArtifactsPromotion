@@ -20,6 +20,7 @@ public class PromotionTaskResult {
   private long startTime;
   private long endTime;
   private String errorMessage;
+  private String requestedPath; // The original path requested for promotion
 
   public PromotionTaskResult() {
     this.items = new ArrayList<>();
@@ -51,6 +52,9 @@ public class PromotionTaskResult {
 
   public String getErrorMessage() { return errorMessage; }
   public void setErrorMessage(String errorMessage) { this.errorMessage = errorMessage; }
+
+  public String getRequestedPath() { return requestedPath; }
+  public void setRequestedPath(String requestedPath) { this.requestedPath = requestedPath; }
 
   /**
    * Represents a single file/directory item in the promotion result.

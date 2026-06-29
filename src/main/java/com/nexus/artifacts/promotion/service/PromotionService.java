@@ -98,7 +98,7 @@ public class PromotionService {
   // ==================== Public API ====================
 
   /**
-   * List target repositories where the current user has write permission.
+   * List target repositories where the current user has delete permission.
    */
   public TargetRepositoryList listTargetRepositories(final String sourceRepository, final String format) {
     Repository sourceRepo = repositoryManager.get(sourceRepository);
@@ -114,13 +114,17 @@ public class PromotionService {
     List<TargetRepositoryList.TargetRepository> targets = new ArrayList<>();
     for (Repository repo : repositoryManager.browse()) {
       if (repo.getName().equals(sourceRepository)) continue;
+      // Same-type check: match by format only (raw hosted/proxy/group are all same type;
+      // docker, maven2, etc. also match by their own format)
       if (!actualFormat.equals(repo.getFormat().getValue())) continue;
-      // Skip remote/proxy repositories - cannot upload to them via promotion
+      // Exclude proxy repositories - cannot promote to remote/proxy repos
       String repoType = repo.getType().getValue();
       if ("proxy".equals(repoType)) continue;
+      // Target repo needs both edit (to upload files) and delete (to delete files) permissions
       if (!permissionChecker.hasRepositoryWritePermission(repo.getName())) continue;
+      if (!permissionChecker.hasRepositoryDeletePermission(repo.getName())) continue;
       targets.add(new TargetRepositoryList.TargetRepository(
-          repo.getName(), repo.getFormat().getValue(), repo.getType().getValue(), repo.getUrl()));
+          repo.getName(), repo.getFormat().getValue(), repoType, repo.getUrl()));
     }
 
     result.setRepositories(targets);
@@ -133,7 +137,7 @@ public class PromotionService {
    */
   public FilePreviewResponse previewPromotion(final PromotionRequest request, final String nexusBaseUrl) {
     request.validate();
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
+    permissionChecker.checkTargetPromotionPermission(request.getTargetRepository());
 
     FilePreviewResponse preview = new FilePreviewResponse();
     preview.setSourceRepository(request.getSourceRepository());
@@ -188,7 +192,7 @@ public class PromotionService {
                          final String nexusBaseUrl)
   {
     request.validate();
-    permissionChecker.checkTargetWritePermission(request.getTargetRepository());
+    permissionChecker.checkTargetPromotionPermission(request.getTargetRepository());
 
     String username = permissionChecker.getCurrentUsername();
 
@@ -211,6 +215,7 @@ public class PromotionService {
         result.setStartTime(System.currentTimeMillis());
         result.setTaskId(taskId);
         result.setStatus(TaskStatus.RUNNING.getValue());
+        result.setRequestedPath(request.getPath()); // Store the original requested path
 
         // Put initial result so frontend can poll immediately
         taskResults.put(taskId, copyResult(result));
@@ -234,7 +239,7 @@ public class PromotionService {
           result.setEndTime(System.currentTimeMillis());
 
           long skippedCount = promotedItems.stream().filter(f -> "skipped".equals(f.getStatus())).count();
-          long promotedCount = promotedItems.size() - skippedCount;
+          long promotedCount = promotedItems.stream().filter(f -> "success".equals(f.getStatus())).count();
           long durationMs = result.getEndTime() - result.getStartTime();
           log.info("Promotion task {} completed - source={}, target={}, totalFiles={}, success={}, skipped={}, duration={}ms",
               taskId, request.getSourceRepository(), request.getTargetRepository(),
@@ -247,7 +252,7 @@ public class PromotionService {
               || (e instanceof InterruptedException)
               || (e instanceof RuntimeException && e.getCause() instanceof InterruptedException);
           result.setStatus(isCancelled ? TaskStatus.CANCELLED.getValue() : TaskStatus.FAILED.getValue());
-          result.setErrorMessage(isCancelled ? "Task cancelled" : sanitizeErrorMessage(e.getMessage()));
+          result.setErrorMessage(isCancelled ? "Task cancelled" : ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           result.setEndTime(System.currentTimeMillis());
           // Clean up task cache on cancellation
           if (isCancelled) {
@@ -270,7 +275,8 @@ public class PromotionService {
         }
       }
     }, String.format("Promote %s from %s to %s", request.getPath(),
-        request.getSourceRepository(), request.getTargetRepository()), taskId, username);
+        request.getSourceRepository(), request.getTargetRepository()), taskId, username,
+        request.getSourceRepository(), request.getPath(), request.getTargetRepository());
   }
 
   /**
@@ -288,6 +294,11 @@ public class PromotionService {
       info.setTaskType("promotion");
       info.setSourceRepository(result.getSourceRepository());
       info.setTargetRepository(result.getTargetRepository());
+      // Display promotion path as "targetRepo: promoted path"
+      if (result.getTargetRepository() != null) {
+        String promotedPath = extractPromotedPath(result);
+        info.setPath(result.getTargetRepository() + ":" + promotedPath);
+      }
       info.setStatus(TaskStatus.fromValue(result.getStatus()));
       info.setStartTime(result.getStartTime());
       info.setEndTime(result.getEndTime());
@@ -305,6 +316,8 @@ public class PromotionService {
       String taskId = entry.getKey();
       // Skip if already in taskResults
       if (taskResults.containsKey(taskId)) continue;
+      // Skip Docker promotion tasks (handled by DockerService)
+      if (taskId.startsWith("docker-promo-")) continue;
 
       TaskExecutorService.TaskHandle handle = entry.getValue();
       SyncTaskInfo info = new SyncTaskInfo();
@@ -312,7 +325,12 @@ public class PromotionService {
       info.setTaskType("promotion");
       info.setSourceRepository(handle.sourceRepository);
       info.setTargetRepository(handle.targetRepository);
-      info.setPath(handle.sourcePath);
+      // Display promotion path as "targetRepo: filePath"
+      if (handle.targetRepository != null) {
+        String promotedPath = (handle.sourcePath != null && !handle.sourcePath.isEmpty())
+            ? handle.sourcePath : "";
+        info.setPath(handle.targetRepository + ":" + promotedPath);
+      }
       info.setStatus(handle.status);
       info.setStartTime(handle.startTime);
       info.setEndTime(handle.endTime);
@@ -321,6 +339,29 @@ public class PromotionService {
     }
 
     return tasks;
+  }
+
+  /**
+   * Extract the promoted path from a PromotionTaskResult.
+   * Priority:
+   * 1. Use requestedPath if available (original path clicked by user)
+   * 2. Fallback to first item's path
+   * Returns empty string if no path is available.
+   */
+  private String extractPromotedPath(final PromotionTaskResult result) {
+    // First priority: use the original requested path
+    if (result.getRequestedPath() != null && !result.getRequestedPath().isEmpty()) {
+      return result.getRequestedPath();
+    }
+    
+    // Fallback: use the first item's path
+    if (result.getItems() != null && !result.getItems().isEmpty()) {
+      String firstPath = result.getItems().get(0).getPath();
+      if (firstPath != null && !firstPath.isEmpty()) {
+        return firstPath;
+      }
+    }
+    return "";
   }
 
   /**
@@ -512,11 +553,22 @@ public class PromotionService {
           items.add(item);
         }
         catch (Exception e) {
+          // If task was cancelled, mark current file and stop
+          if (Thread.currentThread().isInterrupted()) {
+            log.warn("Promotion task cancelled while promoting {}, stopping", assetName);
+            PromotionTaskResult.FileItem cancelledItem = new PromotionTaskResult.FileItem(
+                assetName, determineType(assetName));
+            cancelledItem.setStatus("cancelled");
+            cancelledItem.setErrorMessage("Task cancelled");
+            items.add(cancelledItem);
+            updateTaskProgress(taskResult, items);
+            throw new RuntimeException("Promotion task cancelled");
+          }
           log.error("Failed to promote {}: {}", assetName, e.getMessage());
           PromotionTaskResult.FileItem failedItem = new PromotionTaskResult.FileItem(
               assetName, determineType(assetName));
           failedItem.setStatus("failed");
-          failedItem.setErrorMessage(sanitizeErrorMessage(e.getMessage()));
+          failedItem.setErrorMessage(ServiceUtils.sanitizeErrorMessage(e.getMessage()));
           items.add(failedItem);
         }
 
@@ -550,7 +602,7 @@ public class PromotionService {
     }
     catch (Exception e) {
       log.error("Failed to promote file {}: {}", filePath, e.getMessage(), e);
-      throw new RuntimeException("File promotion failed: " + sanitizeErrorMessage(e.getMessage()), e);
+      throw new RuntimeException("File promotion failed: " + ServiceUtils.sanitizeErrorMessage(e.getMessage()), e);
     }
     return items;
   }
@@ -1022,7 +1074,7 @@ public class PromotionService {
           break;
         }
         if (code == 200) {
-          String json = readStream(conn.getInputStream());
+          String json = ServiceUtils.readStream(conn.getInputStream());
           List<String> pageResults = parseSearchItems(json, pathPrefix);
           
           // Deduplicate results to avoid duplicates across pages
@@ -1034,8 +1086,7 @@ public class PromotionService {
             }
           }
 
-          // Check for continuationToken in the response
-          continuationToken = parseContinuationToken(json);
+          continuationToken = ServiceUtils.parseContinuationToken(json);
           if (continuationToken == null || continuationToken.isEmpty()) {
             // No more pages
             break;
@@ -1083,7 +1134,7 @@ public class PromotionService {
 
         int code = conn.getResponseCode();
         if (code == 200) {
-          String json = readStream(conn.getInputStream());
+          String json = ServiceUtils.readStream(conn.getInputStream());
           List<String> pageResults = parseComponentAssets(json, pathPrefix);
           
           // Deduplicate results to avoid duplicates across pages
@@ -1095,7 +1146,7 @@ public class PromotionService {
             }
           }
 
-          continuationToken = parseContinuationToken(json);
+          continuationToken = ServiceUtils.parseContinuationToken(json);
           if (continuationToken == null || continuationToken.isEmpty()) {
             break;
           }
@@ -1114,40 +1165,6 @@ public class PromotionService {
   }
 
   /**
-   * Parse continuationToken from Nexus API JSON response.
-   * Nexus REST API uses continuationToken for pagination.
-   */
-  private String parseContinuationToken(final String json) {
-    if (json == null || json.isEmpty()) return null;
-    try {
-      // Find "continuationToken" field in JSON
-      String key = "\"continuationToken\"";
-      int idx = json.indexOf(key);
-      if (idx < 0) return null;
-      // Find the colon after the key
-      int colonIdx = json.indexOf(':', idx + key.length());
-      if (colonIdx < 0) return null;
-      // Find the value (could be null or a string)
-      int valueStart = colonIdx + 1;
-      // Skip whitespace
-      while (valueStart < json.length() && json.charAt(valueStart) == ' ') valueStart++;
-      if (valueStart >= json.length()) return null;
-      // Check for null
-      if (json.startsWith("null", valueStart)) return null;
-      // Parse string value
-      if (json.charAt(valueStart) != '"') return null;
-      valueStart++;
-      int valueEnd = json.indexOf('"', valueStart);
-      if (valueEnd < 0) return null;
-      String token = json.substring(valueStart, valueEnd);
-      return token.isEmpty() ? null : token;
-    }
-    catch (Exception e) {
-      return null;
-    }
-  }
-
-  /**
    * Parse Nexus search API response to extract asset names.
    * Simple JSON parser that extracts "name" fields from items array.
    */
@@ -1157,35 +1174,17 @@ public class PromotionService {
 
     // Simple parsing: find "items" array, then extract "name" from each item
     try {
-      int itemsStart = json.indexOf("\"items\"");
-      if (itemsStart < 0) return items;
-
-      // Find the [ after "items"
-      int arrayStart = json.indexOf('[', itemsStart);
-      if (arrayStart < 0) return items;
-
-      // Find matching ]
-      int depth = 0;
-      int pos = arrayStart;
-      while (pos < json.length()) {
-        char c = json.charAt(pos);
-        if (c == '[') depth++;
-        else if (c == ']') {
-          depth--;
-          if (depth == 0) break;
-        }
-        pos++;
-      }
-      String itemsArray = json.substring(arrayStart, pos + 1);
+      String itemsContent = ServiceUtils.extractJsonArray(json, "items");
+      if (itemsContent == null) return items;
 
       // Extract each object and find "name"
       int objStart = 0;
-      while ((objStart = itemsArray.indexOf('{', objStart)) >= 0) {
-        int objEnd = findMatchingBrace(itemsArray, objStart);
+      while ((objStart = itemsContent.indexOf('{', objStart)) >= 0) {
+        int objEnd = ServiceUtils.findMatchingBrace(itemsContent, objStart);
         if (objEnd < 0) break;
-        String obj = itemsArray.substring(objStart, objEnd + 1);
+        String obj = itemsContent.substring(objStart, objEnd + 1);
 
-        String name = extractJsonString(obj, "name");
+        String name = ServiceUtils.extractJsonValue(obj, "name");
         if (name != null && !name.isEmpty()) {
           // Only include files that start with our path prefix
           if (name.startsWith(pathPrefix) && !name.equals(pathPrefix)) {
@@ -1210,67 +1209,33 @@ public class PromotionService {
     if (json == null || json.isEmpty()) return results;
 
     try {
-      int itemsStart = json.indexOf("\"items\"");
-      if (itemsStart < 0) return results;
-
-      int arrayStart = json.indexOf('[', itemsStart);
-      if (arrayStart < 0) return results;
-
-      // Find matching ]
-      int depth = 0;
-      int pos = arrayStart;
-      while (pos < json.length()) {
-        char c = json.charAt(pos);
-        if (c == '[') depth++;
-        else if (c == ']') {
-          depth--;
-          if (depth == 0) break;
-        }
-        pos++;
-      }
-      String itemsArray = json.substring(arrayStart, pos + 1);
+      String itemsContent = ServiceUtils.extractJsonArray(json, "items");
+      if (itemsContent == null) return results;
 
       // Extract each component object
       int objStart = 0;
-      while ((objStart = itemsArray.indexOf('{', objStart)) >= 0) {
-        int objEnd = findMatchingBrace(itemsArray, objStart);
+      while ((objStart = itemsContent.indexOf('{', objStart)) >= 0) {
+        int objEnd = ServiceUtils.findMatchingBrace(itemsContent, objStart);
         if (objEnd < 0) break;
-        String componentObj = itemsArray.substring(objStart, objEnd + 1);
+        String componentObj = itemsContent.substring(objStart, objEnd + 1);
 
         // Find "assets" array inside this component
-        int assetsIdx = componentObj.indexOf("\"assets\"");
-        if (assetsIdx >= 0) {
-          int assetsArrStart = componentObj.indexOf('[', assetsIdx);
-          if (assetsArrStart >= 0) {
-            // Find matching ] for assets array
-            int aDepth = 0;
-            int aPos = assetsArrStart;
-            while (aPos < componentObj.length()) {
-              char c = componentObj.charAt(aPos);
-              if (c == '[') aDepth++;
-              else if (c == ']') {
-                aDepth--;
-                if (aDepth == 0) break;
-              }
-              aPos++;
-            }
-            String assetsArr = componentObj.substring(assetsArrStart, aPos + 1);
+        String assetsContent = ServiceUtils.extractJsonArray(componentObj, "assets");
+        if (assetsContent != null) {
+          // Extract each asset object and get "path"
+          int aObjStart = 0;
+          while ((aObjStart = assetsContent.indexOf('{', aObjStart)) >= 0) {
+            int aObjEnd = ServiceUtils.findMatchingBrace(assetsContent, aObjStart);
+            if (aObjEnd < 0) break;
+            String assetObj = assetsContent.substring(aObjStart, aObjEnd + 1);
 
-            // Extract each asset object and get "path"
-            int aObjStart = 0;
-            while ((aObjStart = assetsArr.indexOf('{', aObjStart)) >= 0) {
-              int aObjEnd = findMatchingBrace(assetsArr, aObjStart);
-              if (aObjEnd < 0) break;
-              String assetObj = assetsArr.substring(aObjStart, aObjEnd + 1);
-
-              String assetPath = extractJsonString(assetObj, "path");
-              if (assetPath != null && !assetPath.isEmpty()
-                  && assetPath.startsWith(pathPrefix)
-                  && !assetPath.equals(pathPrefix)) {
-                results.add(assetPath);
-              }
-              aObjStart = aObjEnd + 1;
+            String assetPath = ServiceUtils.extractJsonValue(assetObj, "path");
+            if (assetPath != null && !assetPath.isEmpty()
+                && assetPath.startsWith(pathPrefix)
+                && !assetPath.equals(pathPrefix)) {
+              results.add(assetPath);
             }
+            aObjStart = aObjEnd + 1;
           }
         }
 
@@ -1281,64 +1246,6 @@ public class PromotionService {
       log.warn("Failed to parse components response: {}", e.getMessage());
     }
     return results;
-  }
-
-  /**
-   * Find matching closing brace.
-   */
-  private int findMatchingBrace(final String s, final int start) {
-    int depth = 0;
-    for (int i = start; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '{') depth++;
-      else if (c == '}') {
-        depth--;
-        if (depth == 0) return i;
-      }
-    }
-    return -1;
-  }
-
-  /**
-   * Extract a string value by key from a JSON object string.
-   */
-  private String extractJsonString(final String json, final String key) {
-    String searchKey = "\"" + key + "\"";
-    int keyIdx = json.indexOf(searchKey);
-    if (keyIdx < 0) return null;
-
-    int colonIdx = json.indexOf(':', keyIdx + searchKey.length());
-    if (colonIdx < 0) return null;
-
-    // Skip whitespace
-    int valStart = colonIdx + 1;
-    while (valStart < json.length() && Character.isWhitespace(json.charAt(valStart))) {
-      valStart++;
-    }
-    if (valStart >= json.length()) return null;
-
-    if (json.charAt(valStart) == '"') {
-      // String value
-      StringBuilder sb = new StringBuilder();
-      int i = valStart + 1;
-      while (i < json.length()) {
-        char c = json.charAt(i);
-        if (c == '\\') {
-          if (i + 1 < json.length()) {
-            sb.append(json.charAt(i + 1));
-            i += 2;
-            continue;
-          }
-        }
-        else if (c == '"') {
-          break;
-        }
-        sb.append(c);
-        i++;
-      }
-      return sb.toString();
-    }
-    return null;
   }
 
   /**
@@ -1393,30 +1300,6 @@ public class PromotionService {
   }
 
   /**
-   * Read error response body from connection.
-   */
-  private String readErrorResponse(final HttpURLConnection conn) throws IOException {
-    InputStream errStream = conn.getErrorStream();
-    if (errStream != null) {
-      return readStream(errStream);
-    }
-    return "";
-  }
-
-  /**
-   * Read entire stream into a string.
-   */
-  private String readStream(final InputStream input) throws IOException {
-    StringBuilder sb = new StringBuilder();
-    byte[] buffer = new byte[BUFFER_SIZE];
-    int bytesRead;
-    while ((bytesRead = input.read(buffer)) != -1) {
-      sb.append(new String(buffer, 0, bytesRead, "UTF-8"));
-    }
-    return sb.toString();
-  }
-
-  /**
    * Create a deep copy of a PromotionTaskResult for thread-safe publishing.
    * Each put into taskResults must use a copy so that the task thread's
    * subsequent mutations don't affect the snapshot seen by polling threads.
@@ -1432,6 +1315,7 @@ public class PromotionService {
     copy.setStartTime(src.getStartTime());
     copy.setEndTime(src.getEndTime());
     copy.setErrorMessage(src.getErrorMessage());
+    copy.setRequestedPath(src.getRequestedPath());
     if (src.getItems() != null) {
       List<PromotionTaskResult.FileItem> itemsCopy = new ArrayList<>();
       for (PromotionTaskResult.FileItem item : src.getItems()) {
@@ -1553,7 +1437,7 @@ public class PromotionService {
 
     int downloadCode = downloadConn.getResponseCode();
     if (downloadCode != 200) {
-      String errorMsg = readErrorResponse(downloadConn);
+      String errorMsg = ServiceUtils.readErrorResponse(downloadConn);
       downloadConn.disconnect();
       throw new IOException("Download manifest from " + sourceRepo + "/" + filePath +
           " failed: HTTP " + downloadCode + " - " + errorMsg);
@@ -1611,7 +1495,7 @@ public class PromotionService {
     int pushCode = pushConn.getResponseCode();
     String pushMsg = "";
     if (pushCode >= 400) {
-      pushMsg = readErrorResponse(pushConn);
+      pushMsg = ServiceUtils.readErrorResponse(pushConn);
     }
     pushConn.disconnect();
 
@@ -1665,7 +1549,7 @@ public class PromotionService {
 
     int initCode = initConn.getResponseCode();
     if (initCode != 202) {
-      String errorMsg = readErrorResponse(initConn);
+      String errorMsg = ServiceUtils.readErrorResponse(initConn);
       initConn.disconnect();
 
       // If blob already exists (HTTP 409 Conflict or 202 Accepted), skip
@@ -1702,7 +1586,7 @@ public class PromotionService {
 
     int downloadCode = downloadConn.getResponseCode();
     if (downloadCode != 200) {
-      String errorMsg = readErrorResponse(downloadConn);
+      String errorMsg = ServiceUtils.readErrorResponse(downloadConn);
       downloadConn.disconnect();
       throw new IOException("Download blob from " + sourceRepo + "/" + filePath +
           " failed: HTTP " + downloadCode + " - " + errorMsg);
@@ -1743,7 +1627,7 @@ public class PromotionService {
     int putCode = putConn.getResponseCode();
     String putMsg = "";
     if (putCode >= 400) {
-      putMsg = readErrorResponse(putConn);
+      putMsg = ServiceUtils.readErrorResponse(putConn);
     }
     putConn.disconnect();
 
@@ -1898,7 +1782,4 @@ public class PromotionService {
     return baos.toByteArray();
   }
 
-  private String sanitizeErrorMessage(final String message) {
-    return ServiceUtils.sanitizeErrorMessage(message);
-  }
 }

@@ -26,6 +26,7 @@ import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.model.TaskStatus;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
 import com.nexus.artifacts.promotion.service.DockerService;
+import com.nexus.artifacts.promotion.service.ServiceUtils;
 
 import io.swagger.annotations.Api;
 import io.swagger.annotations.ApiOperation;
@@ -91,7 +92,7 @@ public class DockerResource implements Resource {
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.NOT_FOUND)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -131,9 +132,9 @@ public class DockerResource implements Resource {
 
       java.util.List<String> tags = dockerService.listDockerTags(repository, image);
       return Response.ok()
-          .entity("{\"repository\":\"" + jsonEscape(repository)
-              + "\",\"image\":\"" + jsonEscape(image)
-              + "\",\"tags\":" + toJsonArray(tags) + "}")
+          .entity("{\"repository\":\"" + ServiceUtils.jsonEscape(repository)
+              + "\",\"image\":\"" + ServiceUtils.jsonEscape(image)
+              + "\",\"tags\":" + ServiceUtils.toJsonArray(tags) + "}")
           .build();
     }
     catch (Exception e) {
@@ -185,26 +186,26 @@ public class DockerResource implements Resource {
       if (csrfToken == null || csrfToken.isEmpty()) {
         csrfToken = httpHeaders.getHeaderString("nx-anti-csrf-token");
       }
-      String nexusBaseUrl = extractNexusBaseUrl(httpRequest);
+      String nexusBaseUrl = ServiceUtils.extractNexusBaseUrl(httpRequest);
 
       String taskId = dockerService.promoteDockerImage(request, cookieHeader, csrfToken, nexusBaseUrl);
       return Response.ok()
-          .entity("{\"taskId\":\"" + jsonEscape(taskId)
+          .entity("{\"taskId\":\"" + ServiceUtils.jsonEscape(taskId)
               + "\",\"status\":\"submitted\""
               + ",\"allImages\":" + request.isAllImages()
-              + ",\"image\":\"" + jsonEscape(request.getImage() != null ? request.getImage() : "") + "\""
-              + ",\"tags\":" + (request.isAllTags() ? "\"all\"" : toJsonArray(request.getTags()))
+              + ",\"image\":\"" + ServiceUtils.jsonEscape(request.getImage() != null ? request.getImage() : "") + "\""
+              + ",\"tags\":" + (request.isAllTags() ? "\"all\"" : ServiceUtils.toJsonArray(request.getTags()))
               + ",\"message\":\"Docker promotion task created\"}")
           .build();
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (SecurityException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -244,28 +245,28 @@ public class DockerResource implements Resource {
       request.validate();
       String taskId = dockerService.syncDockerImage(request);
       return Response.ok()
-          .entity("{\"taskId\":\"" + jsonEscape(taskId)
+          .entity("{\"taskId\":\"" + ServiceUtils.jsonEscape(taskId)
               + "\",\"status\":\"submitted\""
               + ",\"allImages\":" + request.isAllImages()
-              + ",\"repository\":\"" + jsonEscape(request.getSourceRepository()) + "\""
-              + ",\"image\":\"" + jsonEscape(request.getImage() != null ? request.getImage() : "") + "\""
-              + ",\"tags\":" + (request.isAllTags() ? "\"all\"" : toJsonArray(request.getTags()))
+              + ",\"repository\":\"" + ServiceUtils.jsonEscape(request.getSourceRepository()) + "\""
+              + ",\"image\":\"" + ServiceUtils.jsonEscape(request.getImage() != null ? request.getImage() : "") + "\""
+              + ",\"tags\":" + (request.isAllTags() ? "\"all\"" : ServiceUtils.toJsonArray(request.getTags()))
               + ",\"message\":\"Docker sync task created\"}")
           .build();
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (SecurityException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (IllegalStateException e) {
       return Response.status(Response.Status.SERVICE_UNAVAILABLE)
-          .entity("{\"error\":\"" + jsonEscape(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.jsonEscape(e.getMessage()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -286,7 +287,7 @@ public class DockerResource implements Resource {
   public Response getPromotionTaskStatus(@javax.ws.rs.PathParam("taskId") final String taskId)
   {
     try {
-      PromotionTaskResult result = dockerService.getPromotionTaskResult(sanitize(taskId));
+      PromotionTaskResult result = dockerService.getPromotionTaskResult(ServiceUtils.sanitize(taskId));
       if (result == null) {
         return Response.status(Response.Status.NOT_FOUND)
             .entity("{\"error\":\"Task not found\"}")
@@ -312,7 +313,7 @@ public class DockerResource implements Resource {
   public Response getSyncTaskStatus(@javax.ws.rs.PathParam("taskId") final String taskId)
   {
     try {
-      SyncTaskInfo info = dockerService.getSyncTaskInfo(sanitize(taskId));
+      SyncTaskInfo info = dockerService.getSyncTaskInfo(ServiceUtils.sanitize(taskId));
       if (info == null) {
         return Response.status(Response.Status.NOT_FOUND)
             .entity("{\"error\":\"Task not found\"}")
@@ -328,104 +329,4 @@ public class DockerResource implements Resource {
     }
   }
 
-  // ==================== Helpers ====================
-
-  /**
-   * Extract Nexus base URL from incoming HTTP request.
-   * Supports reverse proxies (X-Forwarded-Proto only) and HTTPS with self-signed certs.
-   *
-   * <p>Security: X-Forwarded-Host is NOT used for target host determination to prevent
-   * SSRF attacks. Only X-Forwarded-Proto is allowed (affects scheme only, not target host).
-   * The host is always derived from the request's own server info and validated as local.
-   */
-  private String extractNexusBaseUrl(final HttpServletRequest request) {
-    // Determine scheme - X-Forwarded-Proto is safe for scheme only (http vs https)
-    String scheme = request.getScheme();
-    String forwardedProto = request.getHeader("X-Forwarded-Proto");
-    if (forwardedProto == null || forwardedProto.isEmpty()) {
-      forwardedProto = request.getHeader("X-Forwarded-Scheme");
-    }
-    if (forwardedProto != null && !forwardedProto.isEmpty()) {
-      String proto = forwardedProto.toLowerCase();
-      if ("https".equals(proto) || "http".equals(proto)) {
-        scheme = proto;
-      }
-    }
-
-    // Security: use request's own server info for host, NOT X-Forwarded-Host (SSRF risk)
-    String host = request.getServerName();
-    int port = request.getServerPort();
-
-    // Validate host is local to prevent SSRF
-    if (!isLocalHost(host)) {
-      log.warn("Server host '{}' is not local, using localhost as fallback for internal API calls", host);
-      host = "localhost";
-    }
-
-    // Build URL
-    String baseUrl;
-    if ((scheme.equals("http") && port == 80) || (scheme.equals("https") && port == 443)) {
-      baseUrl = scheme + "://" + host;
-    }
-    else {
-      baseUrl = scheme + "://" + host + ":" + port;
-    }
-
-    log.debug("Extracted Nexus base URL: {}", baseUrl);
-    return baseUrl;
-  }
-
-  /**
-   * Check if a hostname refers to the local machine.
-   * Used to validate that internal API calls only target local addresses.
-   */
-  private boolean isLocalHost(final String host) {
-    if (host == null) return false;
-    return "localhost".equalsIgnoreCase(host)
-        || "127.0.0.1".equals(host)
-        || "[::1]".equals(host)
-        || "0:0:0:0:0:0:0:1".equals(host);
-  }
-
-  private String jsonEscape(final String input) {
-    if (input == null) return "";
-    StringBuilder sb = new StringBuilder(input.length() + 16);
-    for (int i = 0; i < input.length(); i++) {
-      char c = input.charAt(i);
-      switch (c) {
-        case '"':  sb.append("\\\""); break;
-        case '\\': sb.append("\\\\"); break;
-        case '\n': sb.append("\\n"); break;
-        case '\r': sb.append("\\r"); break;
-        case '\t': sb.append("\\t"); break;
-        default:
-          if (c < ' ') {
-            sb.append("\\u");
-            String hex = Integer.toHexString(c);
-            for (int pad = 4 - hex.length(); pad > 0; pad--) sb.append('0');
-            sb.append(hex);
-          }
-          else { sb.append(c); }
-          break;
-      }
-    }
-    return sb.toString();
-  }
-
-  private String sanitize(final String input) {
-    if (input == null) return "";
-    return input.replace("<", "&lt;").replace(">", "&gt;")
-        .replace("\"", "&quot;").replace("'", "&#x27;").replace("&", "&amp;");
-  }
-
-  private String toJsonArray(final java.util.List<String> items) {
-    if (items == null || items.isEmpty()) return "[]";
-    StringBuilder sb = new StringBuilder("[");
-    for (int i = 0; i < items.size(); i++) {
-      if (i > 0) sb.append(",");
-      sb.append("\"").append(jsonEscape(items.get(i))).append("\"");
-    }
-    sb.append("]");
-    return sb.toString();
-  }
 }

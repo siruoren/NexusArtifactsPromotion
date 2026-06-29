@@ -178,7 +178,7 @@ public class DockerManifestParser {
   private static String detectManifestType(final String json) {
     // Check for manifest list (fat manifest) - has "manifests" array at top level
     // and "mediaType" indicating list type
-    String topMediaType = extractJsonValue(json, "mediaType");
+    String topMediaType = ServiceUtils.extractJsonValue(json, "mediaType");
     if (topMediaType != null) {
       if (topMediaType.contains("manifest.list") || topMediaType.contains("image.index")) {
         return topMediaType;
@@ -189,7 +189,7 @@ public class DockerManifestParser {
     }
 
     // Heuristic: if "manifests" array exists at top level, it's a fat manifest
-    String manifestsArray = extractJsonArray(json, "manifests");
+    String manifestsArray = ServiceUtils.extractJsonArray(json, "manifests");
     if (manifestsArray != null && !manifestsArray.trim().isEmpty()) {
       // Check if it also has "config" - if so, it's a single manifest with "manifests" in annotations
       String configDigest = extractConfigDigest(json);
@@ -212,7 +212,7 @@ public class DockerManifestParser {
     manifest.setFatManifest(false);
 
     // Extract schema version
-    String schemaVersion = extractJsonValue(json, "schemaVersion");
+    String schemaVersion = ServiceUtils.extractJsonValue(json, "schemaVersion");
     manifest.setSchemaVersion(schemaVersion);
 
     // Extract config digest
@@ -235,7 +235,7 @@ public class DockerManifestParser {
     manifest.setMediaType(mediaType);
     manifest.setFatManifest(true);
 
-    String schemaVersion = extractJsonValue(json, "schemaVersion");
+    String schemaVersion = ServiceUtils.extractJsonValue(json, "schemaVersion");
     manifest.setSchemaVersion(schemaVersion);
 
     // Extract manifest references (one per platform)
@@ -258,11 +258,11 @@ public class DockerManifestParser {
 
       int objStart = json.indexOf('{', keyIdx + searchKey.length());
       if (objStart < 0) return null;
-      int objEnd = findMatchingBrace(json, objStart);
+      int objEnd = ServiceUtils.findMatchingBrace(json, objStart);
       if (objEnd < 0) return null;
 
       String obj = json.substring(objStart, objEnd + 1);
-      return extractJsonValue(obj, "digest");
+      return ServiceUtils.extractJsonValue(obj, "digest");
     }
     catch (Exception e) {
       return null;
@@ -275,18 +275,18 @@ public class DockerManifestParser {
   private static List<String> extractLayerDigests(final String json) {
     List<String> digests = new ArrayList<>();
     try {
-      String layersArray = extractJsonArray(json, "layers");
+      String layersArray = ServiceUtils.extractJsonArray(json, "layers");
       if (layersArray == null) return digests;
 
       int pos = 0;
       while (pos < layersArray.length()) {
         int objStart = layersArray.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(layersArray, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(layersArray, objStart);
         if (objEnd < 0) break;
 
         String obj = layersArray.substring(objStart, objEnd + 1);
-        String digest = extractJsonValue(obj, "digest");
+        String digest = ServiceUtils.extractJsonValue(obj, "digest");
         if (digest != null && !digest.isEmpty()) {
           digests.add(digest);
         }
@@ -305,21 +305,21 @@ public class DockerManifestParser {
   private static List<ManifestReference> extractManifestReferences(final String json) {
     List<ManifestReference> references = new ArrayList<>();
     try {
-      String manifestsArray = extractJsonArray(json, "manifests");
+      String manifestsArray = ServiceUtils.extractJsonArray(json, "manifests");
       if (manifestsArray == null) return references;
 
       int pos = 0;
       while (pos < manifestsArray.length()) {
         int objStart = manifestsArray.indexOf('{', pos);
         if (objStart < 0) break;
-        int objEnd = findMatchingBrace(manifestsArray, objStart);
+        int objEnd = ServiceUtils.findMatchingBrace(manifestsArray, objStart);
         if (objEnd < 0) break;
 
         String obj = manifestsArray.substring(objStart, objEnd + 1);
-        String digest = extractJsonValue(obj, "digest");
+        String digest = ServiceUtils.extractJsonValue(obj, "digest");
         if (digest != null && !digest.isEmpty()) {
           ManifestReference ref = new ManifestReference(digest);
-          ref.setMediaType(extractJsonValue(obj, "mediaType"));
+          ref.setMediaType(ServiceUtils.extractJsonValue(obj, "mediaType"));
 
           // Extract platform info
           String platformOs = extractPlatformField(obj, "os");
@@ -329,7 +329,7 @@ public class DockerManifestParser {
           ref.setPlatformArch(platformArch);
           ref.setPlatformVariant(platformVariant);
 
-          String sizeStr = extractJsonValue(obj, "size");
+          String sizeStr = ServiceUtils.extractJsonValue(obj, "size");
           if (sizeStr != null) {
             try { ref.setSize(Long.parseLong(sizeStr)); } catch (NumberFormatException e) { /* ignore */ }
           }
@@ -356,75 +356,15 @@ public class DockerManifestParser {
 
       int objStart = manifestRefObj.indexOf('{', platformIdx + platformKey.length());
       if (objStart < 0) return null;
-      int objEnd = findMatchingBrace(manifestRefObj, objStart);
+      int objEnd = ServiceUtils.findMatchingBrace(manifestRefObj, objStart);
       if (objEnd < 0) return null;
 
       String platformObj = manifestRefObj.substring(objStart, objEnd + 1);
-      return extractJsonValue(platformObj, field);
+      return ServiceUtils.extractJsonValue(platformObj, field);
     }
     catch (Exception e) {
       return null;
     }
   }
 
-  // ==================== JSON Utility Methods ====================
-
-  private static String extractJsonValue(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-    int valueStart = json.indexOf('"', colonIdx + 1);
-    if (valueStart < 0) return null;
-    int valueEnd = valueStart + 1;
-    while (valueEnd < json.length()) {
-      char c = json.charAt(valueEnd);
-      if (c == '"' && json.charAt(valueEnd - 1) != '\\') break;
-      valueEnd++;
-    }
-    if (valueEnd >= json.length()) return null;
-    return json.substring(valueStart + 1, valueEnd).replace("\\\"", "\"").replace("\\\\", "\\");
-  }
-
-  private static String extractJsonArray(final String json, final String key) {
-    String pattern = "\"" + key + "\"";
-    int keyIdx = json.indexOf(pattern);
-    if (keyIdx < 0) return null;
-    int colonIdx = json.indexOf(':', keyIdx + pattern.length());
-    if (colonIdx < 0) return null;
-    int arrayStart = json.indexOf('[', colonIdx + 1);
-    if (arrayStart < 0) return null;
-    int arrayEnd = findMatchingBracket(json, arrayStart);
-    if (arrayEnd < 0) return null;
-    return json.substring(arrayStart + 1, arrayEnd);
-  }
-
-  private static int findMatchingBracket(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) inString = !inString;
-      if (!inString) {
-        if (c == '[') depth++;
-        else if (c == ']') { depth--; if (depth == 0) return i; }
-      }
-    }
-    return -1;
-  }
-
-  private static int findMatchingBrace(final String s, final int openPos) {
-    int depth = 0;
-    boolean inString = false;
-    for (int i = openPos; i < s.length(); i++) {
-      char c = s.charAt(i);
-      if (c == '"' && (i == 0 || s.charAt(i - 1) != '\\')) inString = !inString;
-      if (!inString) {
-        if (c == '{') depth++;
-        else if (c == '}') { depth--; if (depth == 0) return i; }
-      }
-    }
-    return -1;
-  }
 }

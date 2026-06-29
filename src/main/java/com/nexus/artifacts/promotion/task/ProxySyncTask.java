@@ -22,6 +22,10 @@ import com.nexus.artifacts.promotion.service.SyncService;
  * - Directory sync: sync a specific path within the proxy repository
  * - Full repository sync: sync the entire proxy repository (when sync path is empty)
  *
+ * Sync modes:
+ * - Full sync (default): sync all assets regardless of local cache state
+ * - Incremental sync: only sync assets whose MD5 differs from local cache
+ *
  * Unlike the REST API sync, this task:
  * - Skips permission checks (tasks are created by administrators)
  * - Executes synchronously within the task's own thread
@@ -49,6 +53,7 @@ public class ProxySyncTask
     TaskConfiguration config = getConfiguration();
     String repositoryName = config.getString(ProxySyncTaskDescriptor.PROP_REPOSITORY_NAME);
     String syncPath = config.getString(ProxySyncTaskDescriptor.PROP_SYNC_PATH);
+    boolean incremental = config.getBoolean(ProxySyncTaskDescriptor.PROP_INCREMENTAL, false);
 
     // Validate repository name
     if (repositoryName == null || repositoryName.trim().isEmpty()) {
@@ -67,7 +72,8 @@ public class ProxySyncTask
     String format = repo.getFormat().getValue();
     boolean isFullSync = (syncPath == null || syncPath.trim().isEmpty());
 
-    log.info("Starting scheduled {} for repository {} (format: {})",
+    log.info("Starting scheduled {} {} for repository {} (format: {})",
+        incremental ? "incremental" : "full",
         isFullSync ? "full repository sync" : "directory sync",
         repositoryName, format);
 
@@ -80,19 +86,27 @@ public class ProxySyncTask
 
     // Execute sync (synchronous, no permission check for scheduled tasks)
     // Pass the task context so sync can check for cancellation
-    SyncTaskInfo result = syncService.syncScheduled(request, this);
+    SyncTaskInfo result;
+    if (incremental) {
+      result = syncService.syncScheduled(request, this, true);
+    }
+    else {
+      result = syncService.syncScheduled(request, this);
+    }
 
     // Build result message based on task status
     String message;
     if (result.getStatus() != null && result.getStatus().name().equals("CANCELLED")) {
-      message = String.format("Scheduled sync cancelled for %s%s",
+      message = String.format("Scheduled %s sync cancelled for %s%s",
+          incremental ? "incremental" : "full",
           repositoryName, isFullSync ? " (full repository)" : ":" + syncPath);
       log.warn(message);
       return message;
     }
 
     if (result.getStatus() != null && result.getStatus().name().equals("FAILED")) {
-      message = String.format("Scheduled sync failed for %s%s - %s",
+      message = String.format("Scheduled %s sync failed for %s%s - %s",
+          incremental ? "incremental" : "full",
           repositoryName,
           isFullSync ? " (full repository)" : ":" + syncPath,
           result.getErrorMessage());
@@ -102,7 +116,8 @@ public class ProxySyncTask
       return message;
     }
 
-    message = String.format("Scheduled sync completed for %s%s - %s",
+    message = String.format("Scheduled %s sync completed for %s%s - %s",
+        incremental ? "incremental" : "full",
         repositoryName,
         isFullSync ? " (full repository)" : ":" + syncPath,
         result.getResult());
@@ -119,14 +134,16 @@ public class ProxySyncTask
     }
     String repoName = config.getString(ProxySyncTaskDescriptor.PROP_REPOSITORY_NAME);
     String syncPath = config.getString(ProxySyncTaskDescriptor.PROP_SYNC_PATH);
+    boolean incremental = config.getBoolean(ProxySyncTaskDescriptor.PROP_INCREMENTAL, false);
     boolean isFullSync = (syncPath == null || syncPath.trim().isEmpty());
 
     if (repoName == null || repoName.isEmpty()) {
       return "Syncing proxy repository";
     }
 
+    String mode = incremental ? "Incremental sync" : "Full sync";
     return isFullSync
-        ? "Full sync of proxy repository " + repoName
-        : "Syncing " + syncPath + " from proxy repository " + repoName;
+        ? mode + " of proxy repository " + repoName
+        : mode + " of " + syncPath + " from proxy repository " + repoName;
   }
 }

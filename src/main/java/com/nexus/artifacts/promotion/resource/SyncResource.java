@@ -21,6 +21,7 @@ import org.sonatype.nexus.rest.Resource;
 import com.nexus.artifacts.promotion.model.SyncRequest;
 import com.nexus.artifacts.promotion.model.SyncTaskInfo;
 import com.nexus.artifacts.promotion.security.PermissionChecker;
+import com.nexus.artifacts.promotion.service.ServiceUtils;
 import com.nexus.artifacts.promotion.service.SyncService;
 
 import io.swagger.annotations.Api;
@@ -73,8 +74,8 @@ public class SyncResource implements Resource {
           .entity("{\"hasPermission\":" + hasPermission
               + ",\"isProxy\":" + isProxy
               + ",\"hasDeletePermission\":" + hasDeletePermission
-              + ",\"repository\":\"" + sanitize(repository) + "\""
-              + ",\"format\":\"" + sanitize(format) + "\"}")
+              + ",\"repository\":\"" + ServiceUtils.sanitize(repository) + "\""
+              + ",\"format\":\"" + ServiceUtils.sanitize(format) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -106,26 +107,26 @@ public class SyncResource implements Resource {
       request.validate();
       String taskId = syncService.sync(request);
       return Response.ok()
-          .entity("{\"taskId\":\"" + sanitize(taskId) + "\",\"status\":\"submitted\","
-              + "\"repository\":\"" + sanitize(request.getRepositoryName()) + "\","
-              + "\"path\":\"" + sanitize(request.getPath()) + "\","
+          .entity("{\"taskId\":\"" + ServiceUtils.sanitize(taskId) + "\",\"status\":\"submitted\","
+              + "\"repository\":\"" + ServiceUtils.sanitize(request.getRepositoryName()) + "\","
+              + "\"path\":\"" + ServiceUtils.sanitize(request.getPath()) + "\","
               + "\"isDirectory\":" + request.isDirectory() + ","
               + "\"message\":\"Sync queue task created\"}")
           .build();
     }
     catch (IllegalArgumentException e) {
       return Response.status(Response.Status.BAD_REQUEST)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.sanitize(e.getMessage()) + "\"}")
           .build();
     }
     catch (SecurityException e) {
       return Response.status(Response.Status.FORBIDDEN)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.sanitize(e.getMessage()) + "\"}")
           .build();
     }
     catch (IllegalStateException e) {
       return Response.status(Response.Status.SERVICE_UNAVAILABLE)
-          .entity("{\"error\":\"" + sanitize(e.getMessage()) + "\"}")
+          .entity("{\"error\":\"" + ServiceUtils.sanitize(e.getMessage()) + "\"}")
           .build();
     }
     catch (Exception e) {
@@ -146,7 +147,7 @@ public class SyncResource implements Resource {
   public Response getTaskStatus(@javax.ws.rs.PathParam("taskId") final String taskId)
   {
     try {
-      SyncTaskInfo info = syncService.getTaskInfo(sanitize(taskId));
+      SyncTaskInfo info = syncService.getTaskInfo(ServiceUtils.sanitize(taskId));
       if (info == null) {
         return Response.status(Response.Status.NOT_FOUND)
             .entity("{\"error\":\"Task not found\"}")
@@ -203,9 +204,9 @@ public class SyncResource implements Resource {
           boolean hasDeletePerm = permissionChecker.hasRepositoryDeletePermission(repo.getName(), format);
 
           json.append("{")
-              .append("\"name\":\"").append(sanitize(repo.getName())).append("\",")
-              .append("\"format\":\"").append(sanitize(format)).append("\",")
-              .append("\"remoteUrl\":\"").append(sanitize(remoteUrl)).append("\",")
+              .append("\"name\":\"").append(ServiceUtils.sanitize(repo.getName())).append("\",")
+              .append("\"format\":\"").append(ServiceUtils.sanitize(format)).append("\",")
+              .append("\"remoteUrl\":\"").append(ServiceUtils.sanitize(remoteUrl)).append("\",")
               .append("\"hasDeletePermission\":").append(hasDeletePerm)
               .append("}");
         }
@@ -221,12 +222,4 @@ public class SyncResource implements Resource {
     }
   }
 
-  private String sanitize(final String input) {
-    if (input == null) return "";
-    return input.replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&#x27;")
-        .replace("&", "&amp;");
-  }
 }
